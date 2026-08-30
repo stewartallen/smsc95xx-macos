@@ -138,11 +138,21 @@ on `idProduct` is therefore matching EEPROM contents rather than silicon, and mu
 One partial auto-load was also observed, presenting `bNumConfigurations = 112` — impossible — which
 left macOS unable to configure the device at all until it was power-cycled.
 
-### Open: MII reads stall in the loaded state
+### The MAC/PHY register block needs a CONFIGURED device
 
-With the device at `0x9905` (auto-load succeeded, `bDeviceProtocol = 1`), MII register reads fail
-with `kIOUSBPipeStalled`. In the `0x9E00` state (`bDeviceProtocol = 255`) they work and return the
-expected `BMCR 0x0000` / `BMSR 0x0805` / PHY ID `0x0007:0x4165`. Not yet investigated.
+Registers at offsets **`>= 0x100`** — `MAC_CR`, `ADDRL/H`, `HASHH/L`, `MII_ADDR/DATA`, `FLOW`,
+`VLAN1`, `COE_CR` — return `kIOUSBPipeStalled` unless the USB device has been configured. Registers
+below `0x100` work regardless.
+
+This is easy to miss because macOS configures the device automatically in some states but not
+others. In the auto-load-failed state (`0x9E00`, `bDeviceProtocol 255`) it configures it, so
+everything works. In the auto-load-succeeded state (`0x9905`, `bDeviceProtocol 1`) it does **not**:
+`GetConfiguration` returns 0, and every MAC/PHY register stalls until `SetConfiguration(1)` is
+issued.
+
+`usb_open_id()` therefore calls `GetConfiguration` and only issues `SetConfiguration(1)` when the
+device is unconfigured. The check is conditional on purpose — re-issuing `SET_CONFIGURATION` resets
+endpoint state, so it should not be done when macOS has already configured the device.
 
 ### What a driver should do
 
