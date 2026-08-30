@@ -54,31 +54,79 @@ characterized — investigate rather than adjusting expectations.
 
 ## Known findings
 
-On the MACH SYSTEMS test unit (`0424:9e00`):
+### EEPROM reads on the MACH unit are intermittently corrupt
 
-- **EEPROM reads as all zeros:** offsets 0–8 all return `0x00`, including offset 0 which should
-  hold the `0xA5` signature on a programmed EEPROM. `ADDRL`/`ADDRH` read their power-on defaults
-  (`0xFFFFFFFF`/`0x0000FFFF`). A `HW_CFG` LRST does not change this.
+**Measured 2026-08-30.** This supersedes two earlier descriptions in this file: first that the
+EEPROM was unreadable, then that it was readable only inside a closing window. Both were
+artifacts of under-sampling. The actual behaviour is *intermittent corruption*.
 
-- **E2P_CMD readback echoes the requested address:** When the tool writes `E2P_CMD = 0x80000001`
-  for an EEPROM read at offset 1, the readback is `0x00000001` (BUSY bit cleared, address bits
-  preserved). The same pattern holds for offsets 2–6: `0x80000002` → `0x00000002`, etc. This
-  proves the write and readback are landing correctly in the hardware. The EEPROM operation
-  completes (BUSY bit clears), but no data is returned — the issue is at the EEPROM level, not
-  the register protocol.
+The MAC is at EEPROM offsets 1–6 and reads `4a:f8:f8:c2:c2:f2` — exactly what
+`reference/mach-init-sequence.txt` shows Linux reading. The register protocol was always
+correct.
 
-- **Discrepancy with reference trace:** `reference/mach-init-sequence.txt` records Linux reading
-  `4A F8 F8 C2 C2 F2` from EEPROM offsets 1–6 on this same dongle. That decode has been
-  re-verified against the raw pcap frames.
+Reading the full MAC 25 times back-to-back per attach, across three plug-in cycles (75 reads):
 
-- **Everything else matches the reference exactly:** `ID_REV 0x9E000002`, `BMCR 0x0000`,
-  `BMSR 0x0805`, PHY ID `0x0007:0x4165`, autoneg not supported.
+| Value returned | Count | What it is |
+|---|---|---|
+| `4a:f8:f8:c2:c2:f2` | 62 | correct |
+| `00:00:00:00:00:00` | 8 | dead read |
+| `4a:f8:1f:c2:c2:f2` | 2 | one byte corrupted |
+| `4a:f8:f8:c2:58:00` | 1 | trailing bytes corrupted |
+| `00:00:f8:c2:c2:f2` | 1 | leading bytes corrupted |
+| `00:00:00:00:00:f2` | 1 | mostly dead |
 
-**Cause: not yet established.** One untested hypothesis worth checking: in the Linux capture the
-EEPROM read completed at ~325.6 s while the dongle's STM32 companion enumerated at ~326.4 s
-(i.e., the EEPROM read happened *before* the STM32 came up). If the STM32 shares or arbitrates
-the EEPROM bus, the access window may only be open right after a fresh plug-in, before the STM32
-boots. This remains speculation without further test data.
+Per-read correctness by cycle (`C` = correct, `x` = anything else), in order:
+
+```
+cycle 1  xCCCCCCCCxxxxxxxxxxCCCCCC
+cycle 2  CCCCCCCCCCCCCCCCCCCCCCCCC
+cycle 3  CxCCCCCCCCxCCCCCCCCCCCCCC
+```
+
+Three properties matter for anything consuming this:
+
+1. **Failures come in bursts as well as singles.** Cycle 1 shows ten consecutive bad reads
+   spanning roughly 370 ms, then full recovery. So a single retry is not enough, and a failed
+   read does not mean the EEPROM is permanently gone.
+2. **Every consecutive run of failures was all-zeros** — which a pattern check catches. The
+   non-zero corruptions were always isolated single reads.
+3. **A wholly plausible wrong address is possible.** A separate run returned
+   `fc:61:79:90:04:56`: not zeros, not all-ones, not multicast, and with the
+   locally-administered bit clear, so it looks like a legitimately assigned address. Pattern
+   validation alone would have accepted it. It was never seen twice in a row.
+
+Timing was also measured (time from enumeration to the first sustained failure): 1.4 s, 2.7 s,
+5.0 s, 7.8 s, 9.9 s across five attaches. Highly variable, and — given the recovery seen in
+cycle 1 — not a hard deadline. Read early anyway; there is no benefit to waiting.
+
+**Cause not confirmed.** The dongle's STM32 companion (`0483:5740`) enumerates at about +0.06 s
+while the EEPROM keeps reading correctly for seconds afterwards, so enumeration is not the
+trigger. Contention for a shared EEPROM/config bus is the natural explanation for corruption
+that is intermittent, bursty, and byte-granular, but that has not been proven.
+
+### Failed register reads return stale data, not errors
+
+`ADDRL` (`0x108`) and `ADDRH` (`0x104`) were observed returning `0x000000F2` — the value of the
+*last EEPROM byte read* — and `0x00000503`, rather than their power-on defaults or an error.
+Meanwhile `ID_REV` kept returning the correct `0x9E000002` and `E2P_CMD` readback kept correctly
+echoing the requested address. The device does not fail cleanly, so `kIOReturnSuccess` is not
+evidence that the data is real.
+
+### What a driver must therefore do
+
+- Read the MAC **early**, in `Start()`.
+- **Require several consecutive identical reads** — three is a reasonable choice, given that no
+  non-zero corruption was ever observed twice in a row across ~100 reads. Two would probably
+  suffice; three costs microseconds.
+- **Also validate the pattern:** reject all-`0x00`, all-`0xFF`, and the multicast bit. Necessary
+  but not sufficient on its own, per property 3 above.
+- **Retry through bursts.** Allow at least ~500 ms of attempts before giving up, since a 370 ms
+  dead burst was observed followed by full recovery.
+- Fail `Start()` rather than invent an address if no stable value emerges.
+
+### Everything else matches the reference exactly
+
+`ID_REV 0x9E000002`, `BMCR 0x0000`, `BMSR 0x0805`, PHY ID `0x0007:0x4165`, autoneg not supported.
 
 The Microchip EVB (`184f:0051`) has never been tested against live hardware. Its support is by
 source code inspection, and the test vectors in `tests/test_proto.c` come from a capture file

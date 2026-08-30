@@ -24,9 +24,10 @@ they are the **same device** — identical endpoints, identical initialization s
 link configuration — differing only in USB ID and MAC address. One implementation covers both;
 only the IOKit matching dictionary needs two entries.
 
-> **Status: pre-implementation.** Both devices have been fully characterized against a working
-> Linux reference (see [`reference/`](reference/)) and the driver architecture is settled. No
-> driver code has been written yet.
+> **Status: M1 complete, driver not started.** Both devices are characterized against a working
+> Linux reference (see [`reference/`](reference/)), the architecture is settled, and
+> [`tools/smsc95xx-probe`](tools/smsc95xx-probe/) validates the register protocol against real
+> hardware from userspace. No DriverKit code has been written yet.
 
 ---
 
@@ -93,7 +94,7 @@ Everything below was measured, not assumed — captured from a Linux host runnin
 | Link | **10 Mb/s half-duplex** | **10 Mb/s half-duplex** | Advertise `10BaseT \| HalfDuplex` only |
 | `BMCR` | `0x0000` | `0x0000` | PHY control left entirely zeroed |
 | `BMSR` | `0x0805` | `0x0805` | Link detection = poll bit 2 |
-| MAC source | EEPROM `0x01`–`0x06` | EEPROM `0x01`–`0x06` | Read it; no MAC generation needed |
+| MAC source | EEPROM `0x01`–`0x06` | EEPROM `0x01`–`0x06` | Read early, and read it repeatedly — see below |
 | MAC | `4a:f8:f8:c2:c2:f2` (local) | `9c:95:6e:b5:9b:62` (OUI) | — |
 | Flow control | Off | Off | `FLOW = 0` |
 
@@ -114,6 +115,22 @@ datasheet; both come from the captured trace.
 **`PM_CTRL` is read-modify-write.** The captured writes differ between devices (`0x1D0` vs
 `0x1D1`) purely because the pre-existing register contents differed (`0x1C0` vs `0x1C1`). Both
 are just setting `PHY_RST` (bit 4). Do not hardcode the literal value.
+
+**EEPROM reads are intermittently corrupt on the MACH unit, and failed register reads return
+stale data rather than errors.** The MAC is at EEPROM offsets 1–6 and reads
+`4a:f8:f8:c2:c2:f2`, matching the Linux capture. But over 75 back-to-back reads across three
+attaches, 62 were correct and 13 were not: one burst of ten consecutive all-zero reads spanning
+~370 ms followed by full recovery, plus isolated single-byte corruptions. A separate run returned
+`fc:61:79:90:04:56` — an address that passes every pattern check, since it is neither zeros nor
+all-ones nor multicast and has the locally-administered bit clear.
+
+Meanwhile `ADDRL`/`ADDRH` were seen returning `0x000000F2` (the last EEPROM byte read) while
+`ID_REV` stayed correct, so a `kIOReturnSuccess` return is not evidence the data is real.
+
+A driver must therefore read the MAC early in `Start()`, require **several consecutive identical
+reads** rather than one, validate the pattern as well, and retry through bursts for at least
+~500 ms before failing `Start()`. Never invent an address. Full measurements in
+[`tools/smsc95xx-probe/README.md`](tools/smsc95xx-probe/README.md).
 
 ### Verified initialization sequence
 
@@ -264,7 +281,7 @@ entirely and also give byte-exact control for validating TX/RX framing.
 | | |
 |---|---|
 | M0 | Repo, README, characterized hardware reference — **done** |
-| M1 | Probe tool reads `ID_REV`, dumps PHY registers, reads EEPROM MAC |
+| M1 | Probe reads `ID_REV`, PHY registers, EEPROM MAC — **done** |
 | M2 | Probe does full init, transmits one frame, receives one frame |
 | M3 | Dext loads and matches the device in `ioreg` |
 | M4 | Interface appears in `ifconfig` with the EEPROM MAC |
