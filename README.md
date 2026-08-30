@@ -9,11 +9,22 @@ driver (CDC-ECM, NCM, or otherwise) will ever bind it. On Linux this hardware is
 the in-tree `smsc95xx` driver; this project is a port of that driver's programming sequence
 to a userspace macOS DriverKit extension.
 
-The immediate motivation is a **10BASE-T1S** dongle (MACH SYSTEMS 10BASET1S-USB-IF) that uses
-a LAN9500A as its USB-Ethernet bridge, but nothing here is T1S-specific beyond the link
-configuration.
+The immediate motivation is **10BASE-T1S** dongles that use a LAN9500A as their USB-Ethernet
+bridge, but nothing here is T1S-specific beyond the link configuration.
 
-> **Status: pre-implementation.** The hardware has been fully characterized against a working
+## Supported devices
+
+| Device | VID:PID | Notes |
+|---|---|---|
+| **MACH SYSTEMS 10BASET1S-USB-IF** | `0424:9e00` | Behind an SMSC hub, with an STM32 CDC control function alongside |
+| **Microchip EVB-LAN8670-USB** (EV08L38A) | `184f:0051` | Single function; Microchip's own 10BASE-T1S reference board |
+
+Both have been captured and verified against the Linux driver. From the driver's point of view
+they are the **same device** — identical endpoints, identical initialization sequence, identical
+link configuration — differing only in USB ID and MAC address. One implementation covers both;
+only the IOKit matching dictionary needs two entries.
+
+> **Status: pre-implementation.** Both devices have been fully characterized against a working
 > Linux reference (see [`reference/`](reference/)) and the driver architecture is settled. No
 > driver code has been written yet.
 
@@ -21,8 +32,9 @@ configuration.
 
 ## Target hardware
 
-The MACH SYSTEMS dongle is a composite device — an SMSC hub fronting two independent
-functions:
+### MACH SYSTEMS 10BASET1S-USB-IF
+
+A composite device — an SMSC hub fronting two independent functions:
 
 ```
 USB host
@@ -38,62 +50,83 @@ This driver targets **only** the `0424:9e00` Ethernet function. T1S and PLCA con
 the STM32's job over its CDC serial port, which macOS already supports via its built-in ACM
 driver — so this driver never touches T1S settings.
 
-### LAN9500A endpoints
+### Microchip EVB-LAN8670-USB
+
+Structurally simpler — one device, no hub, no separate control channel:
+
+```
+USB host
+└── 184f:0051   MCHP "10BASE-T1S"                   (bcdDevice 2.00, serial 0005590)
+                vendor-specific, 3 endpoints
+                └── MII ──> LAN8670 10BASE-T1S PHY (ID 0007:C165)
+```
+
+Since there is no STM32 here, whatever configures its T1S side is either hardware-strapped or
+reached through the PHY. It links up at 10 Mb/s half-duplex with no host intervention, so this
+does not affect basic operation.
+
+### Endpoints (both devices)
 
 | Endpoint | Type | Max packet | Role |
 |---|---|---|---|
 | `0x81` IN | Bulk | 512 B | RX packets |
 | `0x02` OUT | Bulk | 512 B | TX packets |
-| `0x83` IN | Interrupt | 16 B, `bInterval` 1 | PHY / status events |
+| `0x83` IN | Interrupt | 16 B | PHY / status events |
 
-Interface 0, `bInterfaceClass` 255, `bInterfaceProtocol` 255, `MaxPower` 500 mA.
-
-### A note on device disambiguation
-
-The Microchip **EVB-LAN8670-USB** (EV08L38A) reference board is *also* a LAN950x device, and
-the MACH dongle appears to be derived from that reference design with a hub and STM32 added.
-Both may therefore present identical `0424:9e00` descriptors. If you have both attached,
-distinguish them by USB topology (the MACH unit sits behind a `0424:2422` hub alongside the
-STM32 function), not by VID/PID alone.
+Interface 0, `bInterfaceClass` 255, `bInterfaceProtocol` 255. The only descriptor differences
+between the two devices are the interrupt endpoint's `bInterval` (1 on MACH, 4 on EVB) and
+`MaxPower` (500 mA vs 250 mA) — neither matters to the driver.
 
 ---
 
 ## What the hardware actually does
 
 Everything below was measured, not assumed — captured from a Linux host running the in-tree
-`smsc95xx` driver against this exact dongle. Raw artifacts are in [`reference/`](reference/).
+`smsc95xx` driver against both dongles. Raw artifacts are in [`reference/`](reference/).
 
-| Property | Value | Consequence for this driver |
-|---|---|---|
-| `ID_REV` | `0x9E000002` — chip `0x9E00`, rev `0x0002` | Confirms LAN9500A |
-| PHY | **External**, MII address 0, ID `0007:4165` | Internal 10/100 PHY is bypassed |
-| Autonegotiation | **Not supported** (`BMSR` bit 3 clear) | No autoneg state machine needed |
-| Link | **10 Mb/s half-duplex**, fixed | Advertise `10BaseT \| HalfDuplex` only |
-| `BMCR` | `0x0000` | PHY control left entirely zeroed |
-| `BMSR` | `0x0805` — link up, 10 Mb/s HDX capable | Link detection = poll bit 2 |
-| MAC address | **From EEPROM**, offsets `0x01`–`0x06` | Read it; no MAC generation needed |
-| Flow control | Off | `FLOW = 0` |
+| Property | MACH | EVB | Consequence for this driver |
+|---|---|---|---|
+| `ID_REV` | `0x9E000002` | `0x9E000002` | Confirms LAN9500A on both |
+| PHY | **External**, MII addr 0 | **External**, MII addr 0 | Internal 10/100 PHY is bypassed |
+| PHY ID | `0007:4165` | `0007:C165` | See below — do **not** validate against a whitelist |
+| Autonegotiation | **Not supported** | **Not supported** | No autoneg state machine needed |
+| Link | **10 Mb/s half-duplex** | **10 Mb/s half-duplex** | Advertise `10BaseT \| HalfDuplex` only |
+| `BMCR` | `0x0000` | `0x0000` | PHY control left entirely zeroed |
+| `BMSR` | `0x0805` | `0x0805` | Link detection = poll bit 2 |
+| MAC source | EEPROM `0x01`–`0x06` | EEPROM `0x01`–`0x06` | Read it; no MAC generation needed |
+| MAC | `4a:f8:f8:c2:c2:f2` (local) | `9c:95:6e:b5:9b:62` (OUI) | — |
+| Flow control | Off | Off | `FLOW = 0` |
 
-Two findings worth calling out, because they are easy to get wrong:
+Three findings worth calling out, because they are easy to get wrong:
 
-**The PHY answers at every MII address.** A scan of addresses 0–31 returns the same ID
-(`0x0007`/`0x4165`) at every one. This is a PHY that does not decode its address, not a
-floating bus (which would read `0xFFFF`). Linux's phylib simply binds the first hit, address 0.
+**Always use MII address 0, and never validate the PHY ID.** The two boards behave differently
+here. The EVB's PHY decodes its address properly — it answers at 0 and returns `0xFFFF`
+everywhere else — and reports `0x0007C165`, the documented Microchip LAN867x ID. The MACH unit's
+PHY answers at *every* address 0–31 and reports `0x0007`/`0x4165`, with bit 15 of `PHYID2`
+clear. Address 0 is the only choice that works on both, and an ID whitelist would reject the
+MACH's working hardware.
 
 **Half-duplex requires two non-obvious register settings.** On the half-duplex path the Linux
 driver sets `MAC_CR.RCVOWN` (receive own transmissions) while leaving `FDPX` clear, and ORs the
 low nibble of `AFC_CFG` to `0xF` (`0x00F830A1` → `0x00F830AF`). Neither falls out of the
 datasheet; both come from the captured trace.
 
+**`PM_CTRL` is read-modify-write.** The captured writes differ between devices (`0x1D0` vs
+`0x1D1`) purely because the pre-existing register contents differed (`0x1C0` vs `0x1C1`). Both
+are just setting `PHY_RST` (bit 4). Do not hardcode the literal value.
+
 ### Verified initialization sequence
 
-Distinct register writes in first-occurrence order, as performed by Linux `smsc95xx v2.0.0`:
+Distinct register writes in first-occurrence order, as performed by Linux `smsc95xx v2.0.0`.
+**This sequence is identical on both devices** — diffing the two captured traces yields only
+the MAC bytes, the multicast hash values (which depend on which groups the host joined), and
+the `PM_CTRL` read-modify-write noted above.
 
 ```
-read EEPROM[0x01..0x06]        -> MAC 4a:f8:f8:c2:c2:f2
+read EEPROM[0x01..0x06]        -> MAC (device-specific)
 HW_CFG       0x00000008         LRST (lite reset), poll until clear
-ADDRL        0xC2F8F84A         MAC low
-ADDRH        0x0000F2C2         MAC high
+ADDRL        <MAC low>
+ADDRH        <MAC high>
 HW_CFG       0x00001004         BIR | PSEL
 BURST_CAP    0x00000005
 BULK_IN_DLY  0x00002000
@@ -253,10 +286,28 @@ parsing, so v1 leaves it off.
 ## Repository layout
 
 ```
-reference/    Captured hardware ground truth — usbmon pcap, decoded register
-              trace, USB descriptors, Linux driver report. See reference/README.md.
-tools/        Analysis and validation tooling (decode-usbmon.py; probe tool to come).
+reference/    Captured hardware ground truth for both devices — usbmon pcaps,
+              decoded register traces, USB descriptors, Linux driver reports.
+              See reference/README.md.
+tools/        decode-usbmon.py      turn a usbmon pcap into a named register trace
+              capture-usb-bringup.sh  capture a device's bring-up on a Linux host
+              smsc95xx-probe/       userspace protocol validation (to come)
 ```
+
+### Device matching
+
+Two personalities, matching `IOUSBHostInterface`:
+
+| | `idVendor` | `idProduct` | `bInterfaceClass` | `bConfigurationValue` | `bInterfaceNumber` |
+|---|---|---|---|---|---|
+| MACH | `0x0424` | `0x9E00` | 255 | 1 | 0 |
+| EVB | `0x184F` | `0x0051` | 255 | 1 | 0 |
+
+Note that `0x0424:0x9E00` is the generic LAN9500A/LAN9500Ai ID, so that personality will match
+*any* LAN9500A-based adapter, not only the MACH dongle. On a conventional 10/100 adapter the
+internal PHY is in use and the link is autonegotiated, which this driver does not implement —
+so such a device would bind but not necessarily work. Narrowing that personality is worth
+revisiting once there is hardware to test against.
 
 ---
 

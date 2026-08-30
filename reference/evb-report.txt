@@ -1,0 +1,183 @@
+=== evb: baseline (before plug-in) ===
+date:   2026-08-30T10:18:28-07:00
+kernel: 6.18.34+rpt-rpi-v8
+
+### lsusb (before)
+Bus 001 Device 001: ID 1d6b:0002 Linux Foundation 2.0 root hub
+Bus 001 Device 002: ID 2109:3431 VIA Labs, Inc. Hub
+Bus 002 Device 001: ID 1d6b:0003 Linux Foundation 3.0 root hub
+
+### ip -br link (before)
+lo               UNKNOWN        00:00:00:00:00:00 <LOOPBACK,UP,LOWER_UP> 
+eth0             UP             dc:a6:32:11:94:3f <BROADCAST,MULTICAST,UP,LOWER_UP> 
+wlan0            DOWN           dc:a6:32:11:94:40 <BROADCAST,MULTICAST> 
+
+>>> CAPTURING -- plug in the 'evb' device now (timeout 180s) <<<
+>>> interface 'eth1' appeared after 25s; capturing 12s more for link-up <<<
+
+=== evb: after plug-in ===
+
+### dmesg (new lines)
+[ 1718.362789] usb 1-1.1: new high-speed USB device number 6 using xhci_hcd
+[ 1718.455371] usb 1-1.1: New USB device found, idVendor=184f, idProduct=0051, bcdDevice= 2.00
+[ 1718.455400] usb 1-1.1: New USB device strings: Mfr=1, Product=2, SerialNumber=3
+[ 1718.455413] usb 1-1.1: Product: 10BASE-T1S
+[ 1718.455425] usb 1-1.1: Manufacturer: MCHP
+[ 1718.455435] usb 1-1.1: SerialNumber: 0005590
+[ 1718.460175] smsc95xx v2.0.0
+[ 1719.035244] Generic PHY usb-001:006:00: attached PHY driver (mii_bus:phy_addr=usb-001:006:00, irq=POLL)
+[ 1719.036380] smsc95xx 1-1.1:1.0 eth1: register 'smsc95xx' at usb-0000:01:00.0-1.1, smsc95xx USB 2.0 Ethernet, 9c:95:6e:b5:9b:62
+[ 1719.147160] smsc95xx 1-1.1:1.0 eth1: Link is Up - 10Mbps/Half - flow control off
+
+### lsusb (after)
+Bus 001 Device 001: ID 1d6b:0002 Linux Foundation 2.0 root hub
+Bus 001 Device 002: ID 2109:3431 VIA Labs, Inc. Hub
+Bus 001 Device 006: ID 184f:0051 K2L GmbH 10BASE-T1S
+Bus 002 Device 001: ID 1d6b:0003 Linux Foundation 3.0 root hub
+
+### lsusb -t
+/:  Bus 001.Port 001: Dev 001, Class=root_hub, Driver=xhci_hcd/1p, 480M
+    |__ Port 001: Dev 002, If 0, Class=Hub, Driver=hub/4p, 480M
+        |__ Port 001: Dev 006, If 0, Class=Vendor Specific Class, Driver=smsc95xx, 480M
+/:  Bus 002.Port 001: Dev 001, Class=root_hub, Driver=xhci_hcd/4p, 5000M
+
+### ip -br link (after)
+lo               UNKNOWN        00:00:00:00:00:00 <LOOPBACK,UP,LOWER_UP> 
+eth0             UP             dc:a6:32:11:94:3f <BROADCAST,MULTICAST,UP,LOWER_UP> 
+wlan0            DOWN           dc:a6:32:11:94:40 <BROADCAST,MULTICAST> 
+eth1             UP             9c:95:6e:b5:9b:62 <BROADCAST,MULTICAST,UP,LOWER_UP> 
+new USB IDs:   184f:0051
+new interface: eth1
+
+### ethtool eth1
+Settings for eth1:
+	Supported ports: [ TP	 MII ]
+	Supported link modes:   10baseT/Half
+	Supported pause frame use: Symmetric Receive-only
+	Supports auto-negotiation: No
+	Supported FEC modes: Not reported
+	Advertised link modes:  10baseT/Half
+	Advertised pause frame use: No
+	Advertised auto-negotiation: No
+	Advertised FEC modes: Not reported
+	Speed: 10Mb/s
+	Duplex: Half
+	Auto-negotiation: off
+	Port: MII
+	PHYAD: 0
+	Transceiver: external
+	Supports Wake-on: pumbag
+	Wake-on: d
+        Current message level: 0x00000007 (7)
+                               drv probe link
+	Link detected: yes
+
+### ethtool -i eth1
+driver: smsc95xx
+version: 6.18.34+rpt-rpi-v8
+firmware-version: smsc95xx USB 2.0 Ethernet
+expansion-rom-version: 
+bus-info: usb-0000:01:00.0-1.1
+supports-statistics: no
+supports-test: yes
+supports-eeprom-access: yes
+supports-register-dump: yes
+supports-priv-flags: no
+
+### ip -d link show eth1
+5: eth1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP mode DEFAULT group default qlen 1000
+    link/ether 9c:95:6e:b5:9b:62 brd ff:ff:ff:ff:ff:ff promiscuity 0 allmulti 0 minmtu 68 maxmtu 1500 addrgenmode none numtxqueues 1 numrxqueues 1 gso_max_size 65536 gso_max_segs 65535 tso_max_size 65536 tso_max_segs 65535 gro_max_size 65536 gso_ipv4_max_size 65536 gro_ipv4_max_size 65536 parentbus usb parentdev 1-1.1:1.0 
+
+### ip addr show eth1
+5: eth1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP group default qlen 1000
+    link/ether 9c:95:6e:b5:9b:62 brd ff:ff:ff:ff:ff:ff
+    inet6 fe80::f456:a65c:df15:f31/64 scope link noprefixroute 
+       valid_lft forever preferred_lft forever
+
+### lsusb -v -d 184f:0051
+
+Bus 001 Device 006: ID 184f:0051 K2L GmbH 10BASE-T1S
+Negotiated speed: High Speed (480Mbps)
+Device Descriptor:
+  bLength                18
+  bDescriptorType         1
+  bcdUSB               2.00
+  bDeviceClass          255 Vendor Specific Class
+  bDeviceSubClass         0 [unknown]
+  bDeviceProtocol         1 
+  bMaxPacketSize0        64
+  idVendor           0x184f K2L GmbH
+  idProduct          0x0051 10BASE-T1S
+  bcdDevice            2.00
+  iManufacturer           1 MCHP
+  iProduct                2 10BASE-T1S
+  iSerial                 3 0005590
+  bNumConfigurations      1
+  Configuration Descriptor:
+    bLength                 9
+    bDescriptorType         2
+    wTotalLength       0x0027
+    bNumInterfaces          1
+    bConfigurationValue     1
+    iConfiguration          0 
+    bmAttributes         0xa0
+      (Bus Powered)
+      Remote Wakeup
+    MaxPower              250mA
+    Interface Descriptor:
+      bLength                 9
+      bDescriptorType         4
+      bInterfaceNumber        0
+      bAlternateSetting       0
+      bNumEndpoints           3
+      bInterfaceClass       255 Vendor Specific Class
+      bInterfaceSubClass      0 [unknown]
+      bInterfaceProtocol    255 
+      iInterface              0 
+      Endpoint Descriptor:
+        bLength                 7
+        bDescriptorType         5
+        bEndpointAddress     0x81  EP 1 IN
+        bmAttributes            2
+          Transfer Type            Bulk
+          Synch Type               None
+          Usage Type               Data
+        wMaxPacketSize     0x0200  1x 512 bytes
+        bInterval               0
+      Endpoint Descriptor:
+        bLength                 7
+        bDescriptorType         5
+        bEndpointAddress     0x02  EP 2 OUT
+        bmAttributes            2
+          Transfer Type            Bulk
+          Synch Type               None
+          Usage Type               Data
+        wMaxPacketSize     0x0200  1x 512 bytes
+        bInterval               0
+      Endpoint Descriptor:
+        bLength                 7
+        bDescriptorType         5
+        bEndpointAddress     0x83  EP 3 IN
+        bmAttributes            3
+          Transfer Type            Interrupt
+          Synch Type               None
+          Usage Type               Data
+        wMaxPacketSize     0x0010  1x 16 bytes
+        bInterval               4
+Device Qualifier (for other device speed):
+  bLength                10
+  bDescriptorType         6
+  bcdUSB               2.00
+  bDeviceClass          255 Vendor Specific Class
+  bDeviceSubClass         0 [unknown]
+  bDeviceProtocol         1 
+  bMaxPacketSize0        64
+  bNumConfigurations      1
+Device Status:     0x0000
+  (Bus Powered)
+
+pcap:   /tmp/evb-bringup.pcap (2158130 bytes)
+report: /tmp/evb-report.txt
+
+Decode with: python3 tools/decode-usbmon.py evb-bringup.pcap --device N
+  (N is the USB device address from 'new high-speed USB device number N' in dmesg)
