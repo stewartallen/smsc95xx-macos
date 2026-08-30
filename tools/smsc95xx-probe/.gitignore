@@ -1,0 +1,4 @@
+# Build artifacts
+smsc95xx-probe
+test-proto
+*.dSYM/
