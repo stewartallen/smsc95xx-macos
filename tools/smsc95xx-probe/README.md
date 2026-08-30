@@ -23,17 +23,21 @@ should expect that exit code.
 
 ## Subcommands
 
-| Command | What it reads |
+| Command | What it does |
 |---|---|
-| `id` | `ID_REV` — chip id and revision |
-| `phy` | `BMCR`, `BMSR`, `PHYID1/2`, `ANAR`, `ANLPAR` at MII address 0, plus decoded link and autoneg state |
-| `eeprom` | The six-byte MAC at EEPROM offset 1, and the `ADDRL`/`ADDRH` values it packs into |
-| `all` | All of the above |
+| `id` | Reads `ID_REV` — chip id and revision |
+| `phy` | Reads `BMCR`, `BMSR`, `PHYID1/2`, `ANAR`, `ANLPAR` at MII address 0, plus decoded link and autoneg state |
+| `eeprom` | Reads the six-byte MAC at EEPROM offset 1, and shows the `ADDRL`/`ADDRH` values it packs into |
+| `init` | Initializes the chip for 10 Mb/s half-duplex fixed mode (no autoneg); reads BMSR and refuses if the PHY supports autonegotiation, to prevent misconfiguring a 10/100 adapter; requires `--mac` if EEPROM is unreadable |
+| `tx` | Sends one broadcast test frame with EtherType `0x88B5` and payload "SMSC95XX-PROBE-M2"; requires `--mac` if EEPROM is unreadable |
+| `rx` | Waits for inbound frames and prints raw bytes alongside parsed interpretation; requires `--mac` if EEPROM is unreadable |
+| `all` | Reads `id`, `phy`, and `eeprom` (performs control-transfer I/O only, does not initialize or transmit/receive frames) |
 
 ## Supported devices
 
-Tried in order: MACH SYSTEMS `0424:9e00`, then Microchip EVB-LAN8670-USB
-`184f:0051`.
+Tried in order: MACH SYSTEMS `0424:9905` (auto-load succeeded) and `0424:9e00`
+(auto-load failed) — these are the same physical device in different EEPROM states —
+then Microchip EVB-LAN8670-USB-D `184f:0051`.
 
 ## Expected output
 
@@ -42,23 +46,46 @@ captured from these same devices under the Linux `smsc95xx` driver. A
 mismatch means either this tool is wrong or the hardware differs from what was
 characterized — investigate rather than adjusting expectations.
 
+## RX framing
+
+The RX status-word bit layout has been validated against hardware.
+
+**Measured on EVB over 10BASE-T1S, 2026-08-30:** broadcast ARP frame from a
+Raspberry Pi, 68 bytes total (4-byte status header + 64-byte frame including CRC).
+
+```
+Raw transfer (first 16 bytes):
+  20 24 40 00  FF FF FF FF FF FF  9C 95 6E B5 9B 62  08 06
+  ^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^  ^^^^^
+  status      dst=broadcast       src=peer MAC        ARP
+```
+
+Status word `0x00402420` (little-endian) decodes as:
+- **Length**: `(0x00402420 & 0x3FFF0000) >> 16 = 0x40 = 64 bytes` ✓
+- **Broadcast bit**: `0x2000` set ✓
+- **Multicast bit**: `0x0400` set ✓  
+- **Frame Type bit**: `0x0020` set ✓
+
+**Verification status:**
+- ✓ **Confirmed against hardware**: 4-byte header size, `LEN_MASK`/`LEN_SHIFT`, length includes CRC,
+  `BROADCAST`, `MULTICAST`, `FRAME_TYPE`. `FILTER_FAIL` and `ERROR_SUM` read zero on this clean frame (consistent but not a positive confirmation).
+- ⊘ **Still unverified** (transcribed from Linux, never observed): `LENGTH_ERROR`, `RUNT`, `TOO_LONG`,
+  `COLLISION`, `WATCHDOG`, `MII_ERROR`, `DRIBBLING`, `CRC_ERROR`. These are error conditions that
+  would require deliberate provocation.
+
 ## Layout
 
 | File | Responsibility |
 |---|---|
 | `smsc95xx_regs.h` | Register offsets and bit masks. Constants only. |
 | `smsc95xx_proto.c` | Pure integer encode/decode. No I/O, fully unit-tested, destined to be lifted into the dext. |
-| `usb_backend.c` | IOUSBLib control transfers. |
-| `smsc95xx_ops.c` | Register, MII, and EEPROM operations. |
+| `usb_backend.c` | IOUSBLib control transfers (register access, no interface claim) and bulk transfers (with interface claim). |
+| `smsc95xx_ops.c` | Register, MII, and EEPROM operations; full initialization sequence for TX/RX. |
 | `main.c` | CLI. |
 
 ## Known findings
 
 ### The MACH unit has two distinct EEPROM states, and only one is trustworthy
-
-**Diagnosed 2026-08-30.** This supersedes three earlier accounts in this file — "EEPROM
-unreadable", then "readable only in a closing window", then "intermittently corrupt". All three
-were wrong. Here is what is actually happening.
 
 The chip performs a power-on EEPROM auto-load. On this unit it sometimes succeeds and sometimes
 fails, and the device presents differently in each case:
@@ -161,6 +188,38 @@ endpoint state, so it should not be done when macOS has already configured the d
 - Fail `Start()` rather than configure an interface with an unverified address.
 - Keep EEPROM access light. Several hundred back-to-back byte reads destabilised this unit,
   and it did not recover within 8 s of rest; a normal driver reads a handful of bytes once.
+
+### `GET_STATS` vendor request stalls on this hardware
+
+The `GET_STATS` vendor request (opcode `0xA2`) stalls with `kIOUSBPipeStalled`, making the chip's
+internal TX/RX byte counters unavailable as diagnostics.
+The cause is uninvestigated. This is a hardware issue on the MACH unit specifically, not the
+LAN9500A family generally, because the EVB has not been tested for this.
+
+### A direct dongle-to-dongle T1S link failed, then worked after rewiring
+
+Transmitting from one LAN9500A dongle straight into another over T1S initially failed completely:
+150 frames sent, zero received, while the reverse direction over the same link worked. After the
+link was rewired and re-checked, the same test passed cleanly:
+
+```
+60 frames transmitted from the MACH  ->  Pi's EVB: rx_packets 0 -> 60, rx_bytes 2760
+rx_errors 0   rx_dropped 0   rx_crc_errors 0   rx_frame_errors 0
+frames confirmed ours by content: src fc:61:79:90:04:56, EtherType 0x88B5,
+payload "SMSC95XX-PROBE-M2"
+```
+
+Exactly 60 received for 60 sent, no errors of any kind. So the original failure was in the
+physical link. **The specific defect was not isolated** — the link was rewired and re-checked in
+one step, so we cannot say what was wrong with it. A reversed pair on the differential wiring was
+suspected but never confirmed, and would not obviously explain the asymmetry, since a polarity
+swap would normally break both directions.
+
+**Practical guidance:** a direct two-dongle link is a working configuration. If it fails, check
+the wiring before suspecting software, and instrument the *receiving* end to separate "frames
+never arrived" from "frames arrived and were discarded" — `usbmon` on the receiving host shows
+whether the dongle handed anything up over its bulk IN endpoint at all, which the interface
+counters alone cannot tell you.
 
 ### Everything else matches the reference exactly
 

@@ -17,7 +17,7 @@ bridge, but nothing here is T1S-specific beyond the link configuration.
 | Device | VID:PID | Notes |
 |---|---|---|
 | **MACH SYSTEMS 10BASET1S-USB-IF** | `0424:9e00` **and** `0424:9905` | Behind an SMSC hub, with an STM32 CDC control function alongside. Two IDs because the product ID is loaded from EEPROM — same physical device. |
-| **Microchip EVB-LAN8670-USB** (EV08L38A) | `184f:0051` | Single function; Microchip's own 10BASE-T1S reference board. Validated on macOS — reads cleanly. |
+| **Microchip EVB-LAN8670-USB-D** | `184f:0051` | Single function; Microchip's own 10BASE-T1S reference board. Validated on macOS — reads cleanly. Note `lsusb` reports vendor `184f` as **K2L GmbH**, a Microchip subsidiary. |
 
 Both have been captured and verified against the Linux driver. From the driver's point of view
 they are the **same device** — identical endpoints, identical initialization sequence, identical
@@ -51,7 +51,7 @@ This driver targets **only** the `0424:9e00` Ethernet function. T1S and PLCA con
 the STM32's job over its CDC serial port, which macOS already supports via its built-in ACM
 driver — so this driver never touches T1S settings.
 
-### Microchip EVB-LAN8670-USB
+### Microchip EVB-LAN8670-USB-D
 
 Structurally simpler — one device, no hub, no separate control channel:
 
@@ -93,7 +93,7 @@ Everything below was measured, not assumed — captured from a Linux host runnin
 | Autonegotiation | **Not supported** | **Not supported** | No autoneg state machine needed |
 | Link | **10 Mb/s half-duplex** | **10 Mb/s half-duplex** | Advertise `10BaseT \| HalfDuplex` only |
 | `BMCR` | `0x0000` | `0x0000` | PHY control left entirely zeroed |
-| `BMSR` | `0x0805` | `0x0805` | Link detection = poll bit 2 |
+| `BMSR` | `0x0805` | `0x0805` | **NOT usable for link detection** — see below |
 | MAC source | EEPROM `0x01`–`0x06` | EEPROM `0x01`–`0x06` | Verify the `0xA5` signature first — see below |
 | MAC | `fc:61:79:90:04:56` (OUI) | `9c:95:6e:b5:9b:62` (OUI) | the capture's `4a:f8:…` is a corrupted read |
 | Flow control | Off | Off | `FLOW = 0` |
@@ -210,10 +210,14 @@ on the host with no DriverKit involved.
   (length + first/last segment flags) and `TX_CMD_B` → async bulk OUT on `0x02` →
   `IOUserNetworkTxCompletionQueue`.
 - **RX** — pre-posted bulk IN reads on `0x81` sized to `BURST_CAP` → walk the buffer parsing
-  32-bit RX status words (frame length in bits 30:16, error bits below), each frame 4-byte
+  32-bit RX status words (frame length in bits 29:16, error bits below), each frame 4-byte
   aligned → wrap into `IOUserNetworkPacket` → `IOUserNetworkRxCompletionQueue` → stack.
-- **Link** — poll `BMSR` bit 2 (matching phylib's approach) and/or take PHY events from the
-  interrupt endpoint, then `reportLinkStatus(kIOUserNetworkLinkStatusActive, 10BaseT|HDX)`.
+- **Link** — `BMSR` bit 2 is **not usable for link detection** on this hardware: with the
+  10BASE-T1S cable physically unplugged it still reads set across multiple direct reads, because
+  T1S is a multidrop bus with no continuous idle signalling while the medium is quiet. Real link
+  and PLCA state are in clause-45 MMD registers, reachable via the standard clause-22 indirect
+  registers 13/14 (no new transport needed). Link state can be taken from the interrupt endpoint,
+  or polled from clause-45 registers, then `reportLinkStatus(kIOUserNetworkLinkStatusActive, 10BaseT|HDX)`.
 
 ### NetworkingDriverKit surface
 
@@ -271,11 +275,10 @@ any future "what should the chip do here?" question.
 
 ### Do not test by pinging between two interfaces on one Mac
 
-An earlier version of this rig looped the T1S link back to a second USB adapter on the same
-Mac. That does not work as a test: macOS resolves a destination that is a local address
-through **`lo0`**, so the packet never reaches the wire. The driver would appear to work while
-transmitting nothing — a false positive. `ping -b <if>` binds the source interface but does not
-defeat the destination shortcut.
+Testing on the same Mac by looping the T1S link back to a second USB adapter does not work:
+macOS resolves a destination that is a local address through **`lo0`**, so the packet never
+reaches the wire. The driver would appear to work while transmitting nothing — a false positive.
+`ping -b <if>` binds the source interface but does not defeat the destination shortcut.
 
 Use a genuinely separate host (the Pi), or raw L2 frames via BPF, which bypass the IP stack
 entirely and also give byte-exact control for validating TX/RX framing.

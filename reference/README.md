@@ -20,7 +20,7 @@ Everything here was produced on a Raspberry Pi 4 (Debian 13 trixie, kernel
 | `mach-hub-descriptors.txt` | `lsusb -v` for the SMSC USB2422 hub (`0424:2422`). |
 | `mach-stm32-descriptors.txt` | `lsusb -v` for the STM32 CDC control function (`0483:5740`). |
 
-### Microchip EVB-LAN8670-USB (`184f:0051`)
+### Microchip EVB-LAN8670-USB-D (`184f:0051`)
 
 | File | What it is |
 |---|---|

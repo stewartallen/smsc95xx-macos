@@ -98,4 +98,87 @@
 /* MAC address bit: locally administered vs. globally unique. */
 #define SMSC95XX_MAC_LOCALLY_ADMINISTERED 0x02u
 
+/* TX framing. Each frame sent on the bulk OUT endpoint is preceded by two
+ * little-endian 32-bit command words.
+ *
+ * Verified against ten frames in reference/mach-bringup.pcap: every one had
+ * TX_CMD_A == (FIRST_SEG | LAST_SEG | len) and TX_CMD_B == len, with the bulk
+ * transfer being exactly 8 + len bytes and no padding. */
+#define SMSC95XX_TX_HEADER_LEN     8
+#define SMSC95XX_TX_CMD_A_LEN_MASK 0x000007FFu
+#define SMSC95XX_TX_CMD_A_LAST_SEG 0x00001000u
+#define SMSC95XX_TX_CMD_A_FIRST_SEG 0x00002000u
+#define SMSC95XX_TX_CMD_B_LEN_MASK 0x000007FFu
+
+/* Ethernet frame size bounds, excluding the TX header. Linux is observed
+ * transmitting unpadded frames as short as 42 bytes on this hardware, which
+ * the chip successfully pads before appending its 4-byte CRC. */
+#define SMSC95XX_FRAME_MIN         42
+#define SMSC95XX_FRAME_MAX         1514
+
+/* RX framing. Each frame in a bulk IN transfer is preceded by one
+ * little-endian 32-bit status word, and each record is padded so the next
+ * status word starts on a 4-byte boundary.
+ *
+ * VERIFIED against measured hardware:
+ *   4-byte header and LEN_MASK/LEN_SHIFT -- confirmed on three transfers whose
+ *     4 + len exactly equalled the observed size (68/70/108 for len 64/66/104).
+ *   length includes the Ethernet CRC.
+ *   BROADCAST, MULTICAST, FRAME_TYPE -- confirmed across all three address
+ *     classes, which separates the bits from one another rather than just
+ *     showing them set:
+ *       broadcast (ff:ff:ff:ff:ff:ff)      low bits 0x2420  BC+MC+FT
+ *       multicast (33:33:.. / 01:00:5E:..) low bits 0x0420  MC+FT, BC clear
+ *       unicast                            low bits 0x0020  FT only
+ *     Multicast is the discriminating case: a defect treating BROADCAST and
+ *     MULTICAST as one bit would pass the broadcast and unicast samples but
+ *     fail here.
+ *   FILTER_FAIL and ERROR_SUM were clear on every known-good frame observed,
+ *     which is consistent but is not a positive confirmation.
+ *
+ * NOT VERIFIED (transcribed from Linux smsc95xx, never provoked):
+ * LENGTH_ERROR, RUNT, TOO_LONG, COLLISION, WATCHDOG, MII_ERROR, DRIBBLING,
+ * CRC_ERROR. These are error conditions awaiting real hardware observations.
+ * Also not verified: the multi-frame record padding and 4-byte alignment rule.
+ * Only single-record transfers have been received on this hardware; multi-frame
+ * transfers are reachable via HW_CFG_INIT_2's MEF enable but have never been
+ * observed. The padding calculation (4 - (used % 4)) % 4 comes from the Linux
+ * driver and is mirrored in the test builder, so the tests cannot distinguish a
+ * correct rule from an incorrect one that both sides agree on. */
+#define SMSC95XX_RX_HEADER_LEN     4
+#define SMSC95XX_RX_STS_FILTER_FAIL  0x40000000u
+#define SMSC95XX_RX_STS_LEN_MASK     0x3FFF0000u
+#define SMSC95XX_RX_STS_LEN_SHIFT    16
+#define SMSC95XX_RX_STS_ERROR_SUM    0x00008000u
+#define SMSC95XX_RX_STS_BROADCAST    0x00002000u
+#define SMSC95XX_RX_STS_LENGTH_ERROR 0x00001000u
+#define SMSC95XX_RX_STS_RUNT         0x00000800u
+#define SMSC95XX_RX_STS_MULTICAST    0x00000400u
+#define SMSC95XX_RX_STS_TOO_LONG     0x00000080u
+#define SMSC95XX_RX_STS_COLLISION    0x00000040u
+#define SMSC95XX_RX_STS_FRAME_TYPE   0x00000020u
+#define SMSC95XX_RX_STS_WATCHDOG     0x00000010u
+#define SMSC95XX_RX_STS_MII_ERROR    0x00000008u
+#define SMSC95XX_RX_STS_DRIBBLING    0x00000004u
+#define SMSC95XX_RX_STS_CRC_ERROR    0x00000002u
+
+/* Frame length reported in the status word includes the 4-byte Ethernet CRC,
+ * which the hardware does not strip. */
+#define SMSC95XX_RX_CRC_LEN        4
+
+/* Values used by the init sequence, taken from the captured Linux bring-up in
+ * reference/mach-init-sequence.txt. Both supported devices produced an
+ * identical sequence; see the project README. */
+#define SMSC95XX_HW_CFG_INIT_1     0x00001004u   /* BIR | PSEL            */
+#define SMSC95XX_HW_CFG_INIT_2     0x00001026u   /* BIR | MEF | PSEL | BCE */
+#define SMSC95XX_BURST_CAP_INIT    0x00000005u
+#define SMSC95XX_BULK_IN_DLY_INIT  0x00002000u
+#define SMSC95XX_LED_GPIO_CFG_INIT 0x81110007u
+#define SMSC95XX_AFC_CFG_INIT      0x00F830A1u
+#define SMSC95XX_AFC_CFG_HALF_DUPLEX_BITS 0x0000000Fu
+#define SMSC95XX_VLAN1_INIT        0x00008100u   /* ETH_P_8021Q */
+#define SMSC95XX_INT_STS_CLEAR_ALL 0xFFFFFFFFu
+#define SMSC95XX_TX_CFG_ON         0x00000004u
+#define SMSC95XX_PM_CTRL_PHY_RST   0x00000010u
+
 #endif /* SMSC95XX_REGS_H */

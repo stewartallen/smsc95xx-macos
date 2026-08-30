@@ -41,4 +41,31 @@ int smsc95xx_read_mac_verified(usb_device *d, uint8_t mac[6], uint8_t *sig_out);
 /* Read E2P_CMD and report whether the power-on EEPROM auto-load succeeded. */
 int smsc95xx_eeprom_loaded(usb_device *d, bool *loaded);
 
+/* Program the station address into ADDRL/ADDRH. */
+int smsc95xx_set_mac(usb_device *d, const uint8_t mac[6]);
+
+/* Run the full initialization sequence and enable TX and RX.
+ *
+ * Follows the captured Linux bring-up, with two deliberate omissions recorded
+ * in the design spec: checksum offload (COE_CR) is left off, because it is out
+ * of scope and would add two bytes to every received frame; and the interrupt
+ * endpoint (INT_EP_CTL) is left disabled, because link state is polled instead.
+ *
+ * Configures the MAC for 10 Mb/s half duplex -- RCVOWN set, FDPX clear, and the
+ * low nibble of AFC_CFG set -- which is what this hardware runs at; it has no
+ * autonegotiation. When `promiscuous` is true, PRMS is set so the probe can see
+ * frames not addressed to it, which is what makes RX testing practical. */
+int smsc95xx_init(usb_device *d, const uint8_t mac[6], bool promiscuous);
+
+/* Read BMSR bit 2 and report it.
+ *
+ * NOTE: on this hardware that bit is NOT a reliable indication of link state.
+ * With the 10BASE-T1S cable physically unplugged it still reads set, verified
+ * over twelve consecutive direct reads. T1S is a multidrop bus with no
+ * continuous idle signalling, so a clause-22 PHY has nothing to detect while
+ * the medium is quiet; genuine link and PLCA status live in clause-45 MMD
+ * registers. Treat this as a raw register readout, not as link truth, and do
+ * not gate anything on it. */
+int smsc95xx_link_up(usb_device *d, bool *up);
+
 #endif /* SMSC95XX_OPS_H */

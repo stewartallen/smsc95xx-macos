@@ -138,3 +138,106 @@ int smsc95xx_read_mac_verified(usb_device *d, uint8_t mac[6], uint8_t *sig_out)
     return smsc95xx_read_mac(d, mac);
 }
 
+int smsc95xx_set_mac(usb_device *d, const uint8_t mac[6])
+{
+    uint32_t addrl = 0, addrh = 0;
+    smsc95xx_mac_to_regs(mac, &addrl, &addrh);
+
+    int kr = smsc95xx_write_reg(d, SMSC95XX_REG_ADDRL, addrl);
+    if (kr != kIOReturnSuccess)
+        return kr;
+    return smsc95xx_write_reg(d, SMSC95XX_REG_ADDRH, addrh);
+}
+
+/* Read BMSR bit 2 and report it.
+ *
+ * NOTE: on this hardware that bit is NOT a reliable indication of link state.
+ * With the 10BASE-T1S cable physically unplugged it still reads set, verified
+ * over twelve consecutive direct reads. T1S is a multidrop bus with no
+ * continuous idle signalling, so a clause-22 PHY has nothing to detect while
+ * the medium is quiet; genuine link and PLCA status live in clause-45 MMD
+ * registers. Treat this as a raw register readout, not as link truth, and do
+ * not gate anything on it. */
+int smsc95xx_link_up(usb_device *d, bool *up)
+{
+    uint16_t bmsr = 0;
+    int kr = smsc95xx_mii_read(d, SMSC95XX_PHY_ADDR, SMSC95XX_MII_BMSR, &bmsr);
+    if (kr == kIOReturnSuccess && up)
+        *up = smsc95xx_bmsr_link_up(bmsr);
+    return kr;
+}
+
+/* Write a register and stop at the first failure, to keep init readable. */
+#define WR(off, val)                                     \
+    do {                                                 \
+        int wkr = smsc95xx_write_reg(d, (off), (val));   \
+        if (wkr != kIOReturnSuccess)                     \
+            return wkr;                                  \
+    } while (0)
+
+int smsc95xx_init(usb_device *d, const uint8_t mac[6], bool promiscuous)
+{
+    uint32_t v = 0;
+    int kr;
+
+    /* Lite reset, then wait for the chip to clear the bit itself. */
+    WR(SMSC95XX_REG_HW_CFG, SMSC95XX_HW_CFG_LRST);
+    for (int i = 0; ; i++) {
+        kr = smsc95xx_read_reg(d, SMSC95XX_REG_HW_CFG, &v);
+        if (kr != kIOReturnSuccess)
+            return kr;
+        if (!(v & SMSC95XX_HW_CFG_LRST))
+            break;
+        if (i >= 100)
+            return kIOReturnTimeout;
+    }
+
+    kr = smsc95xx_set_mac(d, mac);
+    if (kr != kIOReturnSuccess)
+        return kr;
+
+    WR(SMSC95XX_REG_HW_CFG,      SMSC95XX_HW_CFG_INIT_1);
+    WR(SMSC95XX_REG_BURST_CAP,   SMSC95XX_BURST_CAP_INIT);
+    WR(SMSC95XX_REG_BULK_IN_DLY, SMSC95XX_BULK_IN_DLY_INIT);
+    WR(SMSC95XX_REG_HW_CFG,      SMSC95XX_HW_CFG_INIT_2);
+    WR(SMSC95XX_REG_INT_STS,     SMSC95XX_INT_STS_CLEAR_ALL);
+    WR(SMSC95XX_REG_LED_GPIO_CFG, SMSC95XX_LED_GPIO_CFG_INIT);
+    WR(SMSC95XX_REG_FLOW,        0);
+    WR(SMSC95XX_REG_AFC_CFG,     SMSC95XX_AFC_CFG_INIT);
+    WR(SMSC95XX_REG_VLAN1,       SMSC95XX_VLAN1_INIT);
+    WR(SMSC95XX_REG_HASHH,       0);
+    WR(SMSC95XX_REG_HASHL,       0);
+
+    /* COE_CR and INT_EP_CTL are deliberately not written -- see the header. */
+
+    /* Half-duplex 10 Mb/s: RCVOWN set, FDPX clear. */
+    uint32_t mac_cr = SMSC95XX_MAC_CR_TXEN | SMSC95XX_MAC_CR_RXEN |
+                      SMSC95XX_MAC_CR_RCVOWN;
+    if (promiscuous)
+        mac_cr |= SMSC95XX_MAC_CR_PRMS;
+
+    WR(SMSC95XX_REG_MAC_CR, 0);
+    /* The captured sequence enables the transmitter in MAC_CR BEFORE turning on
+     * the TX datapath in TX_CFG, then enables the receiver afterwards. Both
+     * captures agree on this ordering; preserve it rather than collapsing the
+     * writes, since these orderings encode undocumented hardware requirements. */
+    WR(SMSC95XX_REG_MAC_CR, SMSC95XX_MAC_CR_TXEN);
+    WR(SMSC95XX_REG_TX_CFG, SMSC95XX_TX_CFG_ON);
+    WR(SMSC95XX_REG_MAC_CR, mac_cr);
+
+    /* AFC_CFG's low nibble is set on the half-duplex path. */
+    WR(SMSC95XX_REG_AFC_CFG,
+       SMSC95XX_AFC_CFG_INIT | SMSC95XX_AFC_CFG_HALF_DUPLEX_BITS);
+
+    /* PHY reset is read-modify-write: the surrounding bits differ between
+     * devices and must be preserved. */
+    kr = smsc95xx_read_reg(d, SMSC95XX_REG_PM_CTRL, &v);
+    if (kr != kIOReturnSuccess)
+        return kr;
+    WR(SMSC95XX_REG_PM_CTRL, v | SMSC95XX_PM_CTRL_PHY_RST);
+
+    return kIOReturnSuccess;
+}
+
+#undef WR
+

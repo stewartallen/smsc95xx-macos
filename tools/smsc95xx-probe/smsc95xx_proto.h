@@ -11,6 +11,7 @@
 #define SMSC95XX_PROTO_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 /* Build the MII_ADDR register value that starts a PHY register access.
@@ -39,5 +40,34 @@ bool smsc95xx_eeprom_sig_valid(uint8_t sig);
 /* Decode BMSR. */
 bool smsc95xx_bmsr_link_up(uint16_t bmsr);
 bool smsc95xx_bmsr_autoneg_capable(uint16_t bmsr);
+
+/* Write the 8-byte TX command header for a frame of `frame_len` bytes into
+ * `buf`, which must have room for at least SMSC95XX_TX_HEADER_LEN bytes.
+ *
+ * Returns the number of header bytes written (always SMSC95XX_TX_HEADER_LEN) on
+ * success, or 0 if `buflen` is too small or `frame_len` is outside
+ * [SMSC95XX_FRAME_MIN, SMSC95XX_FRAME_MAX]. Returning 0 rather than truncating
+ * keeps a bad length from becoming a malformed transfer. */
+size_t smsc95xx_tx_prepend(uint8_t *buf, size_t buflen, size_t frame_len);
+
+/* Iterate the frames in one bulk IN transfer.
+ *
+ * A single transfer can carry several frames back to back, because the driver
+ * enables multiple-Ethernet-frames mode (HW_CFG.MEF). Each record is a 4-byte
+ * little-endian status word followed by frame data, padded so the next record
+ * starts 4-byte aligned.
+ *
+ * Call with *offset == 0 and call repeatedly until it returns false. On success
+ * *frame points into `buf` (no copy is made), *frame_len is the frame length
+ * INCLUDING the trailing 4-byte Ethernet CRC that the hardware leaves in place,
+ * and *status is the raw status word so the caller can test error bits.
+ *
+ * Returns false at the end of the buffer, and also on a malformed record --
+ * a truncated status word, or a length that would run past the end of the
+ * buffer. Malformed and end-of-buffer are deliberately not distinguished:
+ * either way there is nothing more to decode. */
+bool smsc95xx_rx_next(const uint8_t *buf, size_t len, size_t *offset,
+                      const uint8_t **frame, size_t *frame_len,
+                      uint32_t *status);
 
 #endif /* SMSC95XX_PROTO_H */

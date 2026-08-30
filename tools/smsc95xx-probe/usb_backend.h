@@ -2,9 +2,10 @@
 /*
  * Minimal userspace USB transport over IOUSBLib.
  *
- * Only device-level (endpoint 0) control transfers are supported, which is all
- * the smsc95xx register protocol needs. Because we never claim the interface,
- * this does not conflict with any driver and needs no entitlements.
+ * Control transfers (endpoint 0) are supported for register access and need no
+ * interface claim or entitlements — they coexist with any bound driver. Bulk
+ * transfers (on claimed interface) require claiming the interface, which may
+ * conflict with an existing driver.
  */
 #ifndef USB_BACKEND_H
 #define USB_BACKEND_H
@@ -43,5 +44,27 @@ int usb_control_out(usb_device *d, uint8_t request, uint16_t value,
 
 /* Human-readable form of an IOReturn from this module. */
 const char *usb_strerror(int kr);
+
+/* Claim interface 0 and locate its bulk pipes.
+ *
+ * Required before any bulk transfer; the control-transfer functions above do
+ * NOT need it. Idempotent: calling it twice is harmless. usb_close() releases
+ * the interface, so callers never do.
+ *
+ * Returns kIOReturnSuccess, or an IOReturn describing the failure. In
+ * particular kIOReturnExclusiveAccess means another driver has claimed the
+ * interface -- which is expected once a dext is installed, and is why the
+ * control path deliberately avoids claiming. */
+int usb_claim_interface(usb_device *d);
+
+/* Bulk transfer on the claimed interface. usb_claim_interface() must have
+ * succeeded first; without it these return kIOReturnNotOpen.
+ *
+ * Both use a 1000 ms timeout. usb_bulk_in() is given the buffer size in *len
+ * and writes the number of bytes actually received back to it; a timeout with
+ * no data is reported as kIOReturnTimeout, which for RX simply means no frame
+ * arrived and is not necessarily an error. */
+int usb_bulk_out(usb_device *d, const void *buf, uint32_t len);
+int usb_bulk_in(usb_device *d, void *buf, uint32_t *len);
 
 #endif /* USB_BACKEND_H */
