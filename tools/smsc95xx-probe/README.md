@@ -104,6 +104,33 @@ while the EEPROM keeps reading correctly for seconds afterwards, so enumeration 
 trigger. Contention for a shared EEPROM/config bus is the natural explanation for corruption
 that is intermittent, bursty, and byte-granular, but that has not been proven.
 
+### For comparison: when Linux reads it
+
+From `reference/mach-bringup.pcap`, timed from the first control transfer to the addressed
+device:
+
+```
+ +0.000 ms  GET_DESCRIPTOR x3        (enumeration)
+ +3.660 ms  SET_CONFIGURATION
+ +8.362 ms  SET_INTERFACE
++10.026 ms  first E2P_CMD  -.
+    ...                     |  entire 6-byte MAC read: 1.52 ms, one pass, no retry
++11.550 ms  last E2P_DATA  -'
++11.657 ms  HW_CFG = LRST            (first chip reset)
++25.241 ms  ID_REV
+```
+
+The EEPROM read is the driver's *first* interaction with the chip — before the reset, before even
+`ID_REV` — because `smsc95xx_bind()` calls `smsc95xx_init_mac_address()` ahead of
+`smsc95xx_reset()`.
+
+Note what this means: Linux performs a single 1.52 ms pass and validates only with
+`is_valid_ether_addr()`, which rejects all-zeros and multicast and nothing more. It would have
+accepted the `fc:61:79:90:04:56` reading described above and configured the interface with it,
+silently. So Linux is **less** robust here than the algorithm below, not more — reading early
+helps but does not guarantee a clean read, which is why consecutive agreement rather than timing
+is the load-bearing check.
+
 ### Failed register reads return stale data, not errors
 
 `ADDRL` (`0x108`) and `ADDRH` (`0x104`) were observed returning `0x000000F2` — the value of the
