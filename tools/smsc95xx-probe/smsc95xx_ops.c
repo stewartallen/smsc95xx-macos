@@ -132,7 +132,7 @@ int smsc95xx_read_mac_verified(usb_device *d, uint8_t mac[6], uint8_t *sig_out)
         return kr;
     if (sig_out)
         *sig_out = sig;
-    if (sig != SMSC95XX_EEPROM_SIGNATURE)
+    if (!smsc95xx_eeprom_sig_valid(sig))
         return kIOReturnNotReadable;
 
     return smsc95xx_read_mac(d, mac);

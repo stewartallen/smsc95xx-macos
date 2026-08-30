@@ -43,6 +43,11 @@ void smsc95xx_regs_to_mac(uint32_t addrl, uint32_t addrh, uint8_t mac[6])
     mac[5] = (uint8_t)((addrh >> 8) & 0xFF);
 }
 
+bool smsc95xx_eeprom_sig_valid(uint8_t sig)
+{
+    return sig == SMSC95XX_EEPROM_SIGNATURE;
+}
+
 bool smsc95xx_bmsr_link_up(uint16_t bmsr)
 {
     return (bmsr & SMSC95XX_BMSR_LINK_UP) != 0;

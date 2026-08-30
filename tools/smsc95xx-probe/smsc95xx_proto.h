@@ -28,6 +28,14 @@ void smsc95xx_id_rev_split(uint32_t id_rev, uint16_t *chip, uint16_t *rev);
 void smsc95xx_mac_to_regs(const uint8_t mac[6], uint32_t *addrl, uint32_t *addrh);
 void smsc95xx_regs_to_mac(uint32_t addrl, uint32_t addrh, uint8_t mac[6]);
 
+/* True only for the EEPROM signature byte that marks a trustworthy read.
+ *
+ * A read that does not carry this byte at offset 0 must be discarded however
+ * plausible the rest looks: on marginal hardware a failed read is systematically
+ * shifted rather than random, so it is stable across re-reads and passes ordinary
+ * pattern checks. See the README's Known findings. */
+bool smsc95xx_eeprom_sig_valid(uint8_t sig);
+
 /* Decode BMSR. */
 bool smsc95xx_bmsr_link_up(uint16_t bmsr);
 bool smsc95xx_bmsr_autoneg_capable(uint16_t bmsr);

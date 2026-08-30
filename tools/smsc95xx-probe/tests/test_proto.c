@@ -93,6 +93,31 @@ static void test_bmsr_decode(void)
     CHECK_TRUE(smsc95xx_bmsr_autoneg_capable(0x782D), "autoneg-capable PHY");
 }
 
+static void test_eeprom_signature(void)
+{
+    /* Observed on the MACH unit: 0xA5 at offset 0 when the power-on auto-load
+     * succeeded and the MAC read fc:61:79:90:04:56 identically 10/10 times;
+     * 0x4A when it failed and the same offsets read 4a:f8:f8:c2:c2:f2 -- a
+     * systematically mis-clocked read that is stable and passes every pattern
+     * check, so only this signature distinguishes the two. */
+    CHECK_TRUE(smsc95xx_eeprom_sig_valid(0xA5), "0xA5 is the valid signature");
+    CHECK_FALSE(smsc95xx_eeprom_sig_valid(0x4A),
+                "0x4A (mis-clocked 0xA5) must be rejected");
+    CHECK_FALSE(smsc95xx_eeprom_sig_valid(0x00), "0x00 must be rejected");
+    CHECK_FALSE(smsc95xx_eeprom_sig_valid(0xFF), "0xFF must be rejected");
+
+    /* The real MAC packs to these registers. The mis-clocked address packs to
+     * 0xC2F8F84A/0x0000F2C2, which is what the captured Linux trace wrote --
+     * both are exercised here so the distinction stays visible. */
+    const uint8_t real_mac[SMSC95XX_MAC_LEN] = {
+        0xFC, 0x61, 0x79, 0x90, 0x04, 0x56
+    };
+    uint32_t addrl = 0, addrh = 0;
+    smsc95xx_mac_to_regs(real_mac, &addrl, &addrh);
+    CHECK_EQ_U32(addrl, 0x907961FCu, "real MACH ADDRL");
+    CHECK_EQ_U32(addrh, 0x00005604u, "real MACH ADDRH");
+}
+
 int main(void)
 {
     test_mii_addr_word();
@@ -100,5 +125,6 @@ int main(void)
     test_id_rev_split();
     test_mac_packing();
     test_bmsr_decode();
+    test_eeprom_signature();
     TEST_REPORT();
 }

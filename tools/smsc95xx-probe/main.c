@@ -170,9 +170,15 @@ int main(int argc, char **argv)
     } else if (!strcmp(argv[1], "eeprom")) {
         rc = cmd_eeprom(d);
     } else { /* "all" */
+        /* Run every subcommand even if an earlier one fails. A diagnostic tool
+         * should not withhold the EEPROM state just because the MII path
+         * stalled -- that is exactly when you want the rest of the picture.
+         * Report failure if any of them failed. */
         rc = cmd_id(d);
-        if (!rc) { printf("\n"); rc = cmd_phy(d); }
-        if (!rc) { printf("\n"); rc = cmd_eeprom(d); }
+        printf("\n");
+        rc |= cmd_phy(d);
+        printf("\n");
+        rc |= cmd_eeprom(d);
     }
 
     usb_close(d);
