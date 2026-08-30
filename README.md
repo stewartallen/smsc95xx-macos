@@ -17,7 +17,7 @@ bridge, but nothing here is T1S-specific beyond the link configuration.
 | Device | VID:PID | Notes |
 |---|---|---|
 | **MACH SYSTEMS 10BASET1S-USB-IF** | `0424:9e00` **and** `0424:9905` | Behind an SMSC hub, with an STM32 CDC control function alongside. Two IDs because the product ID is loaded from EEPROM — same physical device. |
-| **Microchip EVB-LAN8670-USB** (EV08L38A) | `184f:0051` | Single function; Microchip's own 10BASE-T1S reference board |
+| **Microchip EVB-LAN8670-USB** (EV08L38A) | `184f:0051` | Single function; Microchip's own 10BASE-T1S reference board. Validated on macOS — reads cleanly. |
 
 Both have been captured and verified against the Linux driver. From the driver's point of view
 they are the **same device** — identical endpoints, identical initialization sequence, identical

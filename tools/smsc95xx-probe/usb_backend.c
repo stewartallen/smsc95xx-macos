@@ -65,6 +65,26 @@ usb_device *usb_open_id(uint16_t vid, uint16_t pid, int *kr_out)
 
         int open_kr = (*intf)->USBDeviceOpen(intf);
         if (open_kr == kIOReturnSuccess) {
+            /* The MAC/PHY register block at offsets >= 0x100 is only reachable
+             * on a CONFIGURED device; reads of it STALL otherwise, while
+             * registers below 0x100 work either way. macOS configures this
+             * device in some states but not others -- it does not when the
+             * EEPROM auto-load succeeds and the device presents
+             * bDeviceProtocol 1, which is the normal case for the EVB and for
+             * the MACH unit at 0x9905. So configure it ourselves when needed.
+             *
+             * Conditional on purpose: re-issuing SET_CONFIGURATION resets
+             * endpoint state, so do not do it when macOS already has. */
+            UInt8 cfg = 0;
+            if ((*intf)->GetConfiguration(intf, &cfg) == kIOReturnSuccess &&
+                cfg == 0 &&
+                (*intf)->SetConfiguration(intf, 1) != kIOReturnSuccess) {
+                last_kr = kIOReturnNotReady;
+                (*intf)->USBDeviceClose(intf);
+                (*intf)->Release(intf);
+                continue;
+            }
+
             dev = calloc(1, sizeof(*dev));
             if (dev) {
                 dev->intf = intf;

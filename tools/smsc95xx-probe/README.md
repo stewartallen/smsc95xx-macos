@@ -167,6 +167,35 @@ endpoint state, so it should not be done when macOS has already configured the d
 In the `0x9E00` state: `ID_REV 0x9E000002`, `BMCR 0x0000`, `BMSR 0x0805`, PHY ID `0x0007:0x4165`,
 autoneg not supported.
 
-The Microchip EVB (`184f:0051`) has never been tested against live hardware. Its support is by
-source code inspection, and the test vectors in `tests/test_proto.c` come from a capture file
-but have not been validated in a real run.
+### The Microchip EVB reads cleanly — validated on macOS 2026-08-30
+
+The EVB (`184f:0051`) has now been exercised on this Mac, and it is the clean baseline the MACH
+unit is not:
+
+```
+ID_REV   0x9E000002  chip 0x9E00  rev 0x0002
+PHY0.BMCR    0x0000     PHY0.BMSR    0x0805
+PHY0.PHYID1  0x0007     PHY0.PHYID2  0xC165
+link     up             autoneg  not supported
+E2P_CMD  auto-load LOADED
+EEPROM   signature 0xA5 ok
+MAC      9c:95:6e:b5:9b:62  (globally administered)
+ADDRL    0xB56E959C   ADDRH  0x0000629B
+```
+
+The MAC and register values match `reference/evb-init-sequence.txt` exactly, the signature is
+valid, and reads are stable. **So the mis-clocked EEPROM read is a fault in the MACH unit, not
+behaviour of the LAN9500A family.** The signature check is still worth keeping — it costs one byte
+read and it is the only thing that distinguishes a good read from a bad one — but it guards against
+a faulty part rather than a design quirk.
+
+Per-board differences observed, all benign:
+
+| | MACH | EVB |
+|---|---|---|
+| PHY ID | `0x0007:0x4165` | `0x0007:0xC165` (documented LAN867x) |
+| MII address decoding | answers at all 32 addresses | answers at address 0 only |
+| `ANAR` / `ANLPAR` | `0x0021` / `0x0021` | `0x0000` / `0x0000` |
+
+Both devices need `SetConfiguration` before the MAC/PHY register block is reachable: each presents
+`bDeviceProtocol 1` in its normal state and macOS leaves them unconfigured.
