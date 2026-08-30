@@ -1,0 +1,34 @@
+# Superpowers process artifacts (design specs, implementation plans) — kept local
+docs/superpowers/
+
+# macOS
+.DS_Store
+
+# Xcode
+build/
+DerivedData/
+*.xcuserstate
+*.xcuserdatad/
+xcuserdata/
+*.xcscmblueprint
+*.xccheckout
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# Swift Package Manager
+.build/
+.swiftpm/
+Package.resolved
+
+# DriverKit / codesign scratch
+*.dext.zip
+*.provisionprofile
+entitlements.local.plist
+
+# Python
+__pycache__/
+*.pyc
+.venv/
