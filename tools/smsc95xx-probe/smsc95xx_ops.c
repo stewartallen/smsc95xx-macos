@@ -114,3 +114,27 @@ int smsc95xx_read_mac(usb_device *d, uint8_t mac[6])
     return smsc95xx_eeprom_read(d, SMSC95XX_EEPROM_MAC_OFFSET, mac,
                                 SMSC95XX_MAC_LEN);
 }
+
+int smsc95xx_eeprom_loaded(usb_device *d, bool *loaded)
+{
+    uint32_t cmd = 0;
+    int kr = smsc95xx_read_reg(d, SMSC95XX_REG_E2P_CMD, &cmd);
+    if (kr == kIOReturnSuccess && loaded)
+        *loaded = (cmd & SMSC95XX_E2P_LOADED) != 0;
+    return kr;
+}
+
+int smsc95xx_read_mac_verified(usb_device *d, uint8_t mac[6], uint8_t *sig_out)
+{
+    uint8_t sig = 0;
+    int kr = smsc95xx_eeprom_read(d, SMSC95XX_EEPROM_SIG_OFFSET, &sig, 1);
+    if (kr != kIOReturnSuccess)
+        return kr;
+    if (sig_out)
+        *sig_out = sig;
+    if (sig != SMSC95XX_EEPROM_SIGNATURE)
+        return kIOReturnNotReadable;
+
+    return smsc95xx_read_mac(d, mac);
+}
+

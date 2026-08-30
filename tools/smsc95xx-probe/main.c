@@ -65,10 +65,28 @@ static int cmd_phy(usb_device *d)
 
 static int cmd_eeprom(usb_device *d)
 {
+    /* Report whether the chip's power-on EEPROM auto-load succeeded. When it did
+     * not, reads can come back systematically shifted but still plausible. */
+    bool loaded = false;
+    int kr = smsc95xx_eeprom_loaded(d, &loaded);
+    if (kr == kIOReturnSuccess)
+        printf("E2P_CMD  auto-load %s\n", loaded ? "LOADED" : "NOT loaded");
+
     uint8_t mac[SMSC95XX_MAC_LEN] = {0};
-    int kr = smsc95xx_read_mac(d, mac);
+    uint8_t sig = 0;
+    kr = smsc95xx_read_mac_verified(d, mac, &sig);
+
     if (kr == kIOReturnNotFound) {
         fprintf(stderr, "no EEPROM responding (E2P_CMD reported TIMEOUT)\n");
+        return 1;
+    }
+    if (kr == kIOReturnNotReadable) {
+        fprintf(stderr,
+                "EEPROM signature mismatch: offset 0 read 0x%02X, expected 0x%02X.\n"
+                "Refusing to report a MAC. On this hardware a failed read returns\n"
+                "plausible-looking but systematically shifted data, so the address\n"
+                "would be wrong in a way no re-read or pattern check would catch.\n",
+                sig, SMSC95XX_EEPROM_SIGNATURE);
         return 1;
     }
     if (kr != kIOReturnSuccess) {
@@ -76,8 +94,8 @@ static int cmd_eeprom(usb_device *d)
         return 1;
     }
 
-    /* Check for invalid MAC patterns: all zeros or all ones indicate read failure,
-     * not a valid address. */
+    /* Signature matched, so the read is trustworthy. Pattern checks below are a
+     * belt-and-braces guard against a signature byte that matched by accident. */
     bool all_zeros = true, all_ones = true;
     for (int i = 0; i < SMSC95XX_MAC_LEN; i++) {
         if (mac[i] != 0x00)
@@ -86,11 +104,13 @@ static int cmd_eeprom(usb_device *d)
             all_ones = false;
     }
     if (all_zeros || all_ones) {
-        fprintf(stderr, "EEPROM read succeeded but returned invalid data: %02x:%02x:%02x:%02x:%02x:%02x\n",
+        fprintf(stderr, "EEPROM signature matched but MAC is invalid: "
+                "%02x:%02x:%02x:%02x:%02x:%02x\n",
                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
         return 1;
     }
 
+    printf("EEPROM   signature 0x%02X ok\n", sig);
     printf("MAC      %02x:%02x:%02x:%02x:%02x:%02x\n",
            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     printf("         %s administered\n",

@@ -54,106 +54,108 @@ characterized — investigate rather than adjusting expectations.
 
 ## Known findings
 
-### EEPROM reads on the MACH unit are intermittently corrupt
+### The MACH unit has two distinct EEPROM states, and only one is trustworthy
 
-**Measured 2026-08-30.** This supersedes two earlier descriptions in this file: first that the
-EEPROM was unreadable, then that it was readable only inside a closing window. Both were
-artifacts of under-sampling. The actual behaviour is *intermittent corruption*.
+**Diagnosed 2026-08-30.** This supersedes three earlier accounts in this file — "EEPROM
+unreadable", then "readable only in a closing window", then "intermittently corrupt". All three
+were wrong. Here is what is actually happening.
 
-The MAC is at EEPROM offsets 1–6 and reads `4a:f8:f8:c2:c2:f2` — exactly what
-`reference/mach-init-sequence.txt` shows Linux reading. The register protocol was always
-correct.
+The chip performs a power-on EEPROM auto-load. On this unit it sometimes succeeds and sometimes
+fails, and the device presents differently in each case:
 
-Reading the full MAC 25 times back-to-back per attach, across three plug-in cycles (75 reads):
-
-| Value returned | Count | What it is |
+| | auto-load **succeeded** | auto-load **failed** |
 |---|---|---|
-| `4a:f8:f8:c2:c2:f2` | 62 | correct |
-| `00:00:00:00:00:00` | 8 | dead read |
-| `4a:f8:1f:c2:c2:f2` | 2 | one byte corrupted |
-| `4a:f8:f8:c2:58:00` | 1 | trailing bytes corrupted |
-| `00:00:f8:c2:c2:f2` | 1 | leading bytes corrupted |
-| `00:00:00:00:00:f2` | 1 | mostly dead |
+| `E2P_CMD` bit 9 (`LOADED`) | set | clear |
+| USB product ID | **`0x9905`** (from EEPROM) | **`0x9E00`** (chip default) |
+| `bcdDevice` | `0x0200` | `0x0300` |
+| String descriptors | present (`10BASE-T1S-USB-IF`) | absent |
+| `bDeviceProtocol` | `1` | `255` |
+| EEPROM offset 0 | `0xA5` — valid signature | `0x4A` |
+| MAC at offsets 1–6 | `fc:61:79:90:04:56` | `4a:f8:f8:c2:c2:f2` |
+| Read stability | 10/10 byte-identical | unstable under load |
 
-Per-read correctness by cycle (`C` = correct, `x` = anything else), in order:
+**The real MAC is `fc:61:79:90:04:56`.** It sits behind a valid `0xA5` signature, is
+globally-administered, and reads identically every time.
 
-```
-cycle 1  xCCCCCCCCxxxxxxxxxxCCCCCC
-cycle 2  CCCCCCCCCCCCCCCCCCCCCCCCC
-cycle 3  CxCCCCCCCCxCCCCCCCCCCCCCC
-```
+### The failed-state read is a systematic mis-clock, not noise
 
-Three properties matter for anything consuming this:
-
-1. **Failures come in bursts as well as singles.** Cycle 1 shows ten consecutive bad reads
-   spanning roughly 370 ms, then full recovery. So a single retry is not enough, and a failed
-   read does not mean the EEPROM is permanently gone.
-2. **Every consecutive run of failures was all-zeros** — which a pattern check catches. The
-   non-zero corruptions were always isolated single reads.
-3. **A wholly plausible wrong address is possible.** A separate run returned
-   `fc:61:79:90:04:56`: not zeros, not all-ones, not multicast, and with the
-   locally-administered bit clear, so it looks like a legitimately assigned address. Pattern
-   validation alone would have accepted it. It was never seen twice in a row.
-
-Timing was also measured (time from enumeration to the first sustained failure): 1.4 s, 2.7 s,
-5.0 s, 7.8 s, 9.9 s across five attaches. Highly variable, and — given the recovery seen in
-cycle 1 — not a hard deadline. Read early anyway; there is no benefit to waiting.
-
-**Cause not confirmed.** The dongle's STM32 companion (`0483:5740`) enumerates at about +0.06 s
-while the EEPROM keeps reading correctly for seconds afterwards, so enumeration is not the
-trigger. Contention for a shared EEPROM/config bus is the natural explanation for corruption
-that is intermittent, bursty, and byte-granular, but that has not been proven.
-
-### For comparison: when Linux reads it
-
-From `reference/mach-bringup.pcap`, timed from the first control transfer to the addressed
-device:
+The two readings are related exactly:
 
 ```
- +0.000 ms  GET_DESCRIPTOR x3        (enumeration)
- +3.660 ms  SET_CONFIGURATION
- +8.362 ms  SET_INTERFACE
-+10.026 ms  first E2P_CMD  -.
-    ...                     |  entire 6-byte MAC read: 1.52 ms, one pass, no retry
-+11.550 ms  last E2P_DATA  -'
-+11.657 ms  HW_CFG = LRST            (first chip reset)
-+25.241 ms  ID_REV
+bad[k] == (real[k >> 1] << 1) & 0xFF        for every k
 ```
 
-The EEPROM read is the driver's *first* interaction with the chip — before the reset, before even
-`ID_REV` — because `smsc95xx_bind()` calls `smsc95xx_init_mac_address()` ahead of
-`smsc95xx_reset()`.
+| offset | 0 | 1 | 2 | 3 | 4 | 5 | 6 |
+|---|---|---|---|---|---|---|---|
+| real | A5 | FC | 61 | 79 | 90 | 04 | 56 |
+| bad  | 4A | 4A | F8 | F8 | C2 | C2 | F2 |
 
-Note what this means: Linux performs a single 1.52 ms pass and validates only with
-`is_valid_ether_addr()`, which rejects all-zeros and multicast and nothing more. It would have
-accepted the `fc:61:79:90:04:56` reading described above and configured the interface with it,
-silently. So Linux is **less** robust here than the algorithm below, not more — reading early
-helps but does not guarantee a clean read, which is why consecutive agreement rather than timing
-is the load-bearing check.
+`A5<<1 = 4A`, `FC<<1 = F8`, `61<<1 = C2`, `79<<1 = F2`, each appearing at two consecutive
+addresses. So in the failed state the EEPROM interface reads with **one extra clock (data shifted
+left a bit) and a halved address**. That is a hardware timing fault on the EEPROM interface of
+this unit, not random corruption.
 
-### Failed register reads return stale data, not errors
+### Why re-reading and pattern validation cannot save you
 
-`ADDRL` (`0x108`) and `ADDRH` (`0x104`) were observed returning `0x000000F2` — the value of the
-*last EEPROM byte read* — and `0x00000503`, rather than their power-on defaults or an error.
-Meanwhile `ID_REV` kept returning the correct `0x9E000002` and `E2P_CMD` readback kept correctly
-echoing the requested address. The device does not fail cleanly, so `kIOReturnSuccess` is not
-evidence that the data is real.
+This is the important part, and it is counter-intuitive.
 
-### What a driver must therefore do
+The bad read is **stable and repeatable**. It also passes every pattern check: `4a:f8:f8:c2:c2:f2`
+is not all-zeros, not all-ones, not multicast. So:
 
-- Read the MAC **early**, in `Start()`.
-- **Require several consecutive identical reads** — three is a reasonable choice, given that no
-  non-zero corruption was ever observed twice in a row across ~100 reads. Two would probably
-  suffice; three costs microseconds.
-- **Also validate the pattern:** reject all-`0x00`, all-`0xFF`, and the multicast bit. Necessary
-  but not sufficient on its own, per property 3 above.
-- **Retry through bursts.** Allow at least ~500 ms of attempts before giving up, since a 370 ms
-  dead burst was observed followed by full recovery.
-- Fail `Start()` rather than invent an address if no stable value emerges.
+- Reading twice and comparing — **fails**, both reads agree.
+- Reading three times and requiring agreement — **fails**, all three agree.
+- Rejecting all-`0x00` / all-`0xFF` / multicast — **fails**, it passes all of them.
+
+Only checking provenance works:
+
+1. **`E2P_CMD` bit 9 (`LOADED`)** — tells you the auto-load succeeded before you read anything.
+2. **EEPROM offset 0 == `0xA5`** — the signature. In the bad state it reads `0x4A`, so this
+   catches the mis-clock directly.
+
+`smsc95xx_read_mac_verified()` implements the second check and refuses to return a MAC without
+it. `smsc95xx_eeprom_loaded()` exposes the first.
+
+### Stock Linux gets this wrong
+
+`reference/mach-init-sequence.txt` shows Linux reading `4A F8 F8 C2 C2 F2` and configuring `eth1`
+with it. `smsc95xx` validates only with `is_valid_ether_addr()` and never checks the signature, so
+on this dongle it silently uses the mis-clocked address whenever auto-load has failed. The
+captured trace also shows `E2P_CMD` readbacks of `0x00000001`–`0x00000006` with `LOADED` **clear**,
+confirming the capture was taken in the failed state. By contrast the EVB capture shows
+`0x0000020N` with `LOADED` **set**.
+
+So the `4a:f8:f8:c2:c2:f2` value that appears throughout `reference/` and in this project's unit
+tests is a corrupted read. The unit tests remain valid — they verify that `mac_to_regs()` packs
+whatever bytes it is given the same way the hardware did, which is a property of the packing
+function and independent of which address is genuine.
+
+### The USB product ID comes from the EEPROM
+
+`0x9E00` and `0x9905` are the *same physical device* in different auto-load states. Any matching
+on `idProduct` is therefore matching EEPROM contents rather than silicon, and must accept both.
+`usb_open_first()` tries `0x9905`, then `0x9E00`, then the EVB.
+
+One partial auto-load was also observed, presenting `bNumConfigurations = 112` — impossible — which
+left macOS unable to configure the device at all until it was power-cycled.
+
+### Open: MII reads stall in the loaded state
+
+With the device at `0x9905` (auto-load succeeded, `bDeviceProtocol = 1`), MII register reads fail
+with `kIOUSBPipeStalled`. In the `0x9E00` state (`bDeviceProtocol = 255`) they work and return the
+expected `BMCR 0x0000` / `BMSR 0x0805` / PHY ID `0x0007:0x4165`. Not yet investigated.
+
+### What a driver should do
+
+- Check `E2P_CMD.LOADED` and the `0xA5` signature. **Do not** rely on re-reads or pattern checks.
+- Match both `0x9E00` and `0x9905`.
+- Fail `Start()` rather than configure an interface with an unverified address.
+- Keep EEPROM access light. Several hundred back-to-back byte reads destabilised this unit,
+  and it did not recover within 8 s of rest; a normal driver reads a handful of bytes once.
 
 ### Everything else matches the reference exactly
 
-`ID_REV 0x9E000002`, `BMCR 0x0000`, `BMSR 0x0805`, PHY ID `0x0007:0x4165`, autoneg not supported.
+In the `0x9E00` state: `ID_REV 0x9E000002`, `BMCR 0x0000`, `BMSR 0x0805`, PHY ID `0x0007:0x4165`,
+autoneg not supported.
 
 The Microchip EVB (`184f:0051`) has never been tested against live hardware. Its support is by
 source code inspection, and the test vectors in `tests/test_proto.c` come from a capture file

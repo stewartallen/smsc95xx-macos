@@ -16,7 +16,7 @@ bridge, but nothing here is T1S-specific beyond the link configuration.
 
 | Device | VID:PID | Notes |
 |---|---|---|
-| **MACH SYSTEMS 10BASET1S-USB-IF** | `0424:9e00` | Behind an SMSC hub, with an STM32 CDC control function alongside |
+| **MACH SYSTEMS 10BASET1S-USB-IF** | `0424:9e00` **and** `0424:9905` | Behind an SMSC hub, with an STM32 CDC control function alongside. Two IDs because the product ID is loaded from EEPROM — same physical device. |
 | **Microchip EVB-LAN8670-USB** (EV08L38A) | `184f:0051` | Single function; Microchip's own 10BASE-T1S reference board |
 
 Both have been captured and verified against the Linux driver. From the driver's point of view
@@ -94,8 +94,8 @@ Everything below was measured, not assumed — captured from a Linux host runnin
 | Link | **10 Mb/s half-duplex** | **10 Mb/s half-duplex** | Advertise `10BaseT \| HalfDuplex` only |
 | `BMCR` | `0x0000` | `0x0000` | PHY control left entirely zeroed |
 | `BMSR` | `0x0805` | `0x0805` | Link detection = poll bit 2 |
-| MAC source | EEPROM `0x01`–`0x06` | EEPROM `0x01`–`0x06` | Read early, and read it repeatedly — see below |
-| MAC | `4a:f8:f8:c2:c2:f2` (local) | `9c:95:6e:b5:9b:62` (OUI) | — |
+| MAC source | EEPROM `0x01`–`0x06` | EEPROM `0x01`–`0x06` | Verify the `0xA5` signature first — see below |
+| MAC | `fc:61:79:90:04:56` (OUI) | `9c:95:6e:b5:9b:62` (OUI) | the capture's `4a:f8:…` is a corrupted read |
 | Flow control | Off | Off | `FLOW = 0` |
 
 Three findings worth calling out, because they are easy to get wrong:
@@ -116,20 +116,26 @@ datasheet; both come from the captured trace.
 `0x1D1`) purely because the pre-existing register contents differed (`0x1C0` vs `0x1C1`). Both
 are just setting `PHY_RST` (bit 4). Do not hardcode the literal value.
 
-**EEPROM reads are intermittently corrupt on the MACH unit, and failed register reads return
-stale data rather than errors.** The MAC is at EEPROM offsets 1–6 and reads
-`4a:f8:f8:c2:c2:f2`, matching the Linux capture. But over 75 back-to-back reads across three
-attaches, 62 were correct and 13 were not: one burst of ten consecutive all-zero reads spanning
-~370 ms followed by full recovery, plus isolated single-byte corruptions. A separate run returned
-`fc:61:79:90:04:56` — an address that passes every pattern check, since it is neither zeros nor
-all-ones nor multicast and has the locally-administered bit clear.
+**The MAC in the captured trace is wrong, and the EEPROM signature is the only way to tell.**
+The MACH unit's chip performs a power-on EEPROM auto-load that sometimes fails. When it fails the
+device presents `0x9E00` with no strings, EEPROM offset 0 reads `0x4A`, and the MAC reads
+`4a:f8:f8:c2:c2:f2`. When it succeeds the device presents **`0x9905`** with strings, offset 0 reads
+the valid **`0xA5`** signature, and the MAC reads **`fc:61:79:90:04:56`** — identically on 10/10
+reads.
 
-Meanwhile `ADDRL`/`ADDRH` were seen returning `0x000000F2` (the last EEPROM byte read) while
-`ID_REV` stayed correct, so a `kIOReturnSuccess` return is not evidence the data is real.
+The failed-state read is a systematic mis-clock, exactly `bad[k] == (real[k>>1] << 1) & 0xFF`:
+`A5→4A`, `FC→F8`, `61→C2`, `79→F2`, each byte appearing at two consecutive addresses. One extra
+clock and a halved address.
 
-A driver must therefore read the MAC early in `Start()`, require **several consecutive identical
-reads** rather than one, validate the pattern as well, and retry through bursts for at least
-~500 ms before failing `Start()`. Never invent an address. Full measurements in
+This defeats every obvious defence: the bad read is **stable**, so re-reading and requiring
+agreement passes it, and `4a:f8:f8:c2:c2:f2` is neither zeros nor all-ones nor multicast, so
+pattern validation passes it too. Only provenance works — `E2P_CMD` bit 9 (`LOADED`) and the `0xA5`
+signature at offset 0. Stock Linux checks neither, so `reference/mach-init-sequence.txt` shows it
+configuring `eth1` with the mis-clocked address.
+
+**Also: the USB product ID comes from the EEPROM.** `0x9E00` and `0x9905` are the same physical
+device in different auto-load states, so matching on `idProduct` matches EEPROM contents rather
+than silicon and must accept both. Full analysis in
 [`tools/smsc95xx-probe/README.md`](tools/smsc95xx-probe/README.md).
 
 ### Verified initialization sequence

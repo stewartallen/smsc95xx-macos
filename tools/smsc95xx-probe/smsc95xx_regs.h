@@ -47,6 +47,10 @@
 /* E2P_CMD fields. */
 #define SMSC95XX_E2P_BUSY         0x80000000u
 #define SMSC95XX_E2P_TIMEOUT      0x00000400u
+/* LOADED is set when the chip's power-on EEPROM auto-load succeeded. When it is
+ * clear, EEPROM reads on marginal hardware can return systematically shifted
+ * data that still looks plausible -- see the README's Known findings. */
+#define SMSC95XX_E2P_LOADED       0x00000200u
 #define SMSC95XX_E2P_ADDR_MASK    0x000001FFu
 
 /* HW_CFG bits. */
@@ -83,7 +87,11 @@
  */
 #define SMSC95XX_PHY_ADDR         0
 
-/* EEPROM layout: the MAC address occupies six bytes starting at offset 1. */
+/* EEPROM layout: offset 0 holds a fixed signature byte, and the MAC address
+ * occupies six bytes starting at offset 1. A read that does not return the
+ * signature at offset 0 must not be trusted, however plausible the rest looks. */
+#define SMSC95XX_EEPROM_SIG_OFFSET 0x00
+#define SMSC95XX_EEPROM_SIGNATURE  0xA5
 #define SMSC95XX_EEPROM_MAC_OFFSET 0x01
 #define SMSC95XX_MAC_LEN           6
 

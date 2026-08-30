@@ -13,9 +13,15 @@
 
 typedef struct usb_device usb_device;
 
-/* Known LAN9500A-based dongles, tried in order by usb_open_first(). */
+/* Known LAN9500A-based dongles, tried in order by usb_open_first().
+ *
+ * Note that on this chip family the USB product ID can come FROM the EEPROM: the
+ * MACH unit presents 0x9E00 (the chip's hardwired default) when the power-on
+ * EEPROM auto-load fails, and 0x9905 (the programmed ID) when it succeeds. Both
+ * are the same physical device, so both must be matched. */
 #define SMSC95XX_VID_MACH 0x0424
-#define SMSC95XX_PID_MACH 0x9E00
+#define SMSC95XX_PID_MACH 0x9E00   /* auto-load failed: chip default  */
+#define SMSC95XX_PID_MACH_EE 0x9905 /* auto-load succeeded: from EEPROM */
 #define SMSC95XX_VID_EVB  0x184F
 #define SMSC95XX_PID_EVB  0x0051
 

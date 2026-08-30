@@ -88,8 +88,9 @@ usb_device *usb_open_id(uint16_t vid, uint16_t pid, int *kr_out)
 usb_device *usb_open_first(uint16_t *vid_out, uint16_t *pid_out, int *kr_out)
 {
     static const uint16_t ids[][2] = {
-        { SMSC95XX_VID_MACH, SMSC95XX_PID_MACH },
-        { SMSC95XX_VID_EVB,  SMSC95XX_PID_EVB  },
+        { SMSC95XX_VID_MACH, SMSC95XX_PID_MACH_EE },
+        { SMSC95XX_VID_MACH, SMSC95XX_PID_MACH    },
+        { SMSC95XX_VID_EVB,  SMSC95XX_PID_EVB     },
     };
 
     int last_kr = kIOReturnNoDevice;
