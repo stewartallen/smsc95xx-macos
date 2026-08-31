@@ -45,6 +45,16 @@ exactly which values are device-specific and which are not.
 |---|---|
 | `m4-interface.txt` | The M4 evidence: the interface appears in `ifconfig` with the correct MAC read from EEPROM. Records the interface properties, link state behaviour, four NetworkingDriverKit facts that cost time to discover, an open item on advertised-but-unimplemented offloads, and the finding that the two EEPROM provenance signals can disagree. **M4 registers an interface but does not move frames** — there is no USB bulk transfer path until M5. See `dext/README.md` for networking personality details. |
 
+### Code signing evidence
+
+| File | What it is |
+|---|---|
+| `signing-entitlement-match.txt` | How a provisioning profile authorises `com.apple.developer.driverkit.transport.usb`, measured: the profile's `"*"` is a literal to reproduce exactly, not a wildcard to narrow, so all six candidate entitlement shapes tested are recorded with their verdicts. Also records the misleading diagnostics (`"Exec format error"` is shared with a wrong-architecture dext; `"No matching profile found"` appears even when the profile was found and matched), and that `codesign -v` reports "valid on disk" for a bundle AMFI will reject. This is the evidence for dropping `amfi_get_out_of_my_way=0x1`. |
+
+Use `tools/probe-entitlements/probe-entitlements.sh` to re-measure this against a different profile
+without installing the extension or touching hardware, and
+`tools/inspect-profile/inspect-profile.sh` to see what a profile grants.
+
 ## Reproducing a capture
 
 Use `tools/capture-usb-bringup.sh` on a Linux host. It starts a `usbmon` capture, waits for the

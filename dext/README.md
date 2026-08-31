@@ -26,28 +26,37 @@ posture.**
    reboot
    ```
 
-3. **Install the AMFI boot-arg** — required because the maintainer's Apple Developer account is
-   pending activation, so no provisioning profile can yet authorise the restricted
-   `com.apple.developer.system-extension.install` entitlement. Without this boot-arg the installer
-   app is SIGKILLed at exec with exit code 137. Once a real Apple Development identity with proper
-   entitlements becomes available, this step should be skipped and developer mode (see `make install`)
-   should handle it via the profile.
+3. **Enable developer mode:**
    ```sh
-   sudo nvram boot-args="amfi_get_out_of_my_way=0x1"
+   sudo systemextensionsctl developer on
    ```
-   **What this does:** disables code-signing entitlement validation **machine-wide**, not just for
-   this driver. It is a security regression and should be reverted:
-   ```sh
-   sudo nvram -d boot-args
-   ```
-   when the Developer account activates and a real signing identity is available.
 
 4. **Verify the prerequisites:**
    ```sh
-   csrutil status                    # should report "disabled"
-   nvram boot-args                   # should output "amfi_get_out_of_my_way=0x1"
-   systemextensionsctl developer on  # run as root; output will confirm when complete
+   csrutil status   # should report "disabled"
+   nvram boot-args  # should report "data was not found" — see below
    ```
+
+### No AMFI boot-arg is needed
+
+Earlier revisions of this driver required `sudo nvram boot-args="amfi_get_out_of_my_way=0x1"`,
+because an ad-hoc signature cannot authorise the restricted entitlements the driver and its
+installer claim. That boot-arg disables code-signing entitlement validation **machine-wide**, not
+just for this driver — it is a serious security regression, and it breaks unrelated software that
+relies on entitlement validation (JDKs and .NET runtimes were both affected here).
+
+It is no longer required. Signing with a real Apple Development identity plus embedded
+provisioning profiles authorises the entitlements properly, and the driver loads with AMFI
+enforcing. See [Signing with a real identity](#signing-with-a-real-identity). If you still have the
+boot-arg set from an earlier revision, remove it:
+
+```sh
+sudo nvram -d boot-args   # then reboot
+```
+
+SIP must still be **disabled**: a development-signed dext requires it, and only notarised
+distribution lifts that requirement. SIP is a separate mechanism from AMFI, and disabling it does
+not disable entitlement validation.
 
 ---
 
@@ -63,11 +72,16 @@ make
 ```
 
 Builds `build/com.github.stewartallen.smsc95xx.driver.dext` and
-`build/SMSC95xxInstaller.app`, both ad-hoc signed. The build system:
+`build/SMSC95xxInstaller.app`. The build system:
 - Runs `iig` on the C++ interface definition to generate the vtable glue
 - Compiles all code with `arm64e` (pointer authentication, required on Apple Silicon)
 - Links against `DriverKit` and `USBDriverKit` frameworks
-- Signs both bundles with ad-hoc signatures and full entitlements
+- Signs both bundles with full entitlements
+
+With no `.env` and no arguments both bundles are **ad-hoc** signed, which does not authorise their
+restricted entitlements — such a build only loads with the AMFI boot-arg, and is not the supported
+path. Create `dext/.env` from `.env.example` to sign properly; see
+[Signing with a real identity](#signing-with-a-real-identity).
 
 **Build artifacts are placed in `build/`, not in the source tree or Xcode default locations.**
 
@@ -204,15 +218,14 @@ a configuration mistake.
 
 ### Where the entitlements came from
 
-The `dext/SMSC95xxDriver/SMSC95xxDriver.entitlements` file specifies:
-The dext (`SMSC95xxDriver/SMSC95xxDriver.entitlements`) carries three:
+The dext (`SMSC95xxDriver/SMSC95xxDriver.entitlements.in`) carries three:
 
 - `com.apple.developer.driverkit`
 - `com.apple.developer.driverkit.transport.usb`
 - `com.apple.developer.driverkit.family.networking` — claimed ahead of need, so an entitlement
   rejection surfaces now rather than at M4 alongside a new queue model
 
-The installer app (`SMSC95xxInstaller/Installer.entitlements`) carries one:
+The installer app (`SMSC95xxInstaller/Installer.entitlements.in`) carries one:
 
 - `com.apple.developer.system-extension.install`
 
@@ -230,9 +243,163 @@ provisioning profile, which needs an active Apple Developer account. Under an un
 ad-hoc) signature **AMFI** SIGKILLs the process at exec — the installer exits 137 before `main` runs.
 
 The gate is AMFI, not SIP: this was measured with SIP already disabled, and the same binary in the same
-directory exits 2 and prints usage once re-signed *without* the entitlement. That is why
-`amfi_get_out_of_my_way=0x1` is in the Prerequisites, and why it can be dropped as soon as a real
-signing identity is available.
+directory exits 2 and prints usage once re-signed *without* the entitlement.
+
+---
+
+## Signing with a real identity
+
+Restricted entitlements are authorised by a **provisioning profile**, not by the certificate. A real
+Apple Development certificate alone changes nothing; the profile is what grants the entitlements, and
+it has to be embedded in the bundle.
+
+### What to create in the developer portal
+
+Two App IDs, two profiles:
+
+| | App ID | Profile type | Capabilities to tick |
+|---|---|---|---|
+| dext | `com.github.stewartallen.smsc95xx.driver` | DriverKit App Development | DriverKit, DriverKit Family Networking, DriverKit USB Transport |
+| installer | `com.github.stewartallen.smsc95xx` | macOS App Development | System Extension |
+
+Both profiles must list this Mac's **Provisioning UDID** — not its hardware UUID or serial:
+
+```sh
+system_profiler SPHardwareDataType | grep "Provisioning UDID"
+```
+
+Check what a downloaded profile actually grants with `tools/inspect-profile/inspect-profile.sh`.
+Note that a DriverKit profile's `Platform` field reads `OSX`, not `DriverKit`; the App ID and the
+granted entitlements are what identify it.
+
+### Building signed
+
+Signing configuration lives in `dext/.env`, which is **gitignored** — it names a person and points
+at files that must never be committed. Copy the template and fill it in:
+
+```sh
+cp .env.example .env
+```
+
+```sh
+SIGN_ID=Apple Development: you@example.com (XXXXXXXXXX)
+DEXT_PROFILE=~/Downloads/YourDriver_DriverKit_Development.provisionprofile
+APP_PROFILE=~/Downloads/YourInstaller_macOS_Development.provisionprofile
+```
+
+`.env` is read by `make`, not by a shell, so values are taken literally — **do not quote them**, and
+`$VAR` is not expanded. The Makefile strips stray quotes and expands a leading `~/` anyway, because
+both are easy to write by habit and both fail confusingly. Then just:
+
+```sh
+sudo make install
+```
+
+The same variables can still be passed per invocation, which overrides `.env`:
+
+```sh
+make install SIGN_ID="Apple Development: …" DEXT_PROFILE=… APP_PROFILE=…
+```
+
+**No Apple Team ID is checked in.** The two entitlements files are templates
+(`*.entitlements.in`) carrying a `__TEAM_ID__` placeholder; the Makefile reads the real value out of
+the provisioning profile and writes the substituted files into `build/gen/`. Reading it from the
+profile rather than hardcoding it means it cannot drift from the profile it has to agree with, and
+it lets anyone build this with their own account. `TEAM_ID` can be set explicitly in `.env` if you
+are signing without a profile.
+
+Three ways to get this wrong are caught at build time rather than at launch, where a signing fault
+is far more expensive to diagnose: a profile path that does not exist, `SIGN_ID` set with no Team ID
+available, and a placeholder that survived substitution. A bare `make` with no `.env` still produces
+an ad-hoc build.
+
+`make signinfo` reports the resulting Authority chain and whether a profile is embedded in each
+bundle. A correct dext reads:
+
+```
+Authority=Apple Development: you@example.com (XXXXXXXXXX)
+Authority=Apple Worldwide Developer Relations Certification Authority
+Authority=Apple Root CA
+TeamIdentifier=<your team>
+  profile: embedded
+```
+
+Two entitlements exist purely to tie the binary to its profile and must match it exactly:
+`com.apple.application-identifier` (team ID + bundle ID) and `com.apple.developer.team-identifier`.
+
+### The entitlement value must match the profile exactly
+
+This is the part that is not documented and cost the most time. The DriverKit App Development profile
+grants:
+
+```
+com.apple.developer.driverkit.transport.usb = ( { idVendor = "*" } )
+```
+
+That `"*"` is **not** a wildcard the checker expands and matches against concrete values. It is a
+literal that must be reproduced verbatim. Measured against this profile:
+
+| `transport.usb` claimed by the binary | Verdict |
+|---|---|
+| *(key absent — control)* | accepted |
+| `[{idVendor: "*"}]` | **accepted** |
+| `[{idVendor: 1060}, {idVendor: 6223}]` | rejected |
+| `[{idVendor: "*", idProduct: "*"}]` | rejected |
+| `[{idVendor: "1060"}]` | rejected |
+| `true` | rejected |
+
+So the entitlement cannot be narrowed to our actual vid/pid pairs under a development profile.
+This is safe: the entitlement is only an upper bound on what the dext is *allowed* to attach to,
+while the `Info.plist` personalities decide what it *does* attach to, and IOKit will not hand it
+anything else. Narrowing the entitlement itself needs a Developer ID profile with values approved by
+Apple — the known route, untested here.
+
+`tools/probe-entitlements/probe-entitlements.sh` tests a candidate entitlements file against a
+profile without installing the extension or touching the hardware, which turns a
+replug-and-pray loop into a few seconds. Always include a control case with the restricted
+entitlement absent; it must come back accepted, or the harness is not measuring anything.
+
+### Diagnosing a rejection
+
+The error surfaced at the top is misleading in two ways. `kernelmanagerd` reports:
+
+```
+Error Domain=NSPOSIXErrorDomain Code=8 "Exec format error"
+```
+
+which is the *same* message a wrong-architecture dext produces (see
+[Why `arm64e` and not `arm64`](#why-arm64e-and-not-arm64)). And AMFI reports:
+
+```
+Error Domain=AppleMobileFileIntegrityError Code=-413 "No matching profile found"
+```
+
+which reads as "the profile is missing" even when the profile was found, verified and matched to
+this Mac. The line that actually says what is wrong comes from `taskgated-helper`:
+
+```sh
+/usr/bin/log show --last 5m \
+    --predicate 'process == "amfid" OR process == "taskgated-helper"' --style compact
+```
+
+```
+Checking profile: <your profile name>
+ProfileGrantsEntitlement matchEntitlement failed value match for entitlement:
+    com.apple.developer.driverkit.transport.usb
+Unsatisfied entitlements: com.apple.developer.driverkit.transport.usb
+Disallowing: ...
+```
+
+If the log contains `Unsatisfied Entitlements`, it is a profile mismatch and not an architecture
+problem. Beware that **`codesign -v` reports "valid on disk" either way** — the signature genuinely
+is valid, and profile authorisation is a separate check that amfid performs at exec time. Verifying
+the Authority chain is necessary but not sufficient.
+
+One build-time trap: `codesign` parses the entitlements plist with `AMFIUnserializeXML`, which is
+stricter than `plutil`. A double hyphen inside an XML comment passes `plutil -lint` and then fails
+signing with `AMFIUnserializeXML: syntax error near line N`.
+
+Full measured evidence: `reference/signing-entitlement-match.txt`.
 
 ---
 
@@ -600,9 +767,13 @@ driver remains active — a subtle and misleading failure mode.
 ## Not distributable
 
 This driver is built for **local development only**. It requires:
-- SIP disabled (security regression)
-- AMFI validation disabled (security regression)
-- Unsigned ad-hoc signatures (impossible for distribution)
-- Restricted entitlements that require Apple's approval, which this maintainer has not yet obtained
+- SIP disabled (security regression) — a development-signed dext will not load with SIP on
+- A development provisioning profile naming this specific Mac, so the build only loads on the
+  machines listed in the profile
+- A `transport.usb` entitlement that a development profile forces to `idVendor: "*"`, which is far
+  broader than the three devices this driver actually matches
 
-Making this driver ready for distribution is out of scope for this project.
+It no longer requires AMFI validation to be disabled, and it is no longer ad-hoc signed.
+
+Distribution would need a Developer ID identity, notarisation, and Apple's approval of concrete
+vid/pid values for the USB transport entitlement. That is out of scope for this project.

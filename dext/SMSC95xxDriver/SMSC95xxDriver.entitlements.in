@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- TEMPLATE. The Makefile substitutes __TEAM_ID__ and writes the real
+	     entitlements into build/gen, so no Apple Team ID is checked in and anyone
+	     can build this with their own account. The value is read straight out of
+	     DEXT_PROFILE, so it cannot drift from the profile it has to match.
+
+	     These two keys exist only to tie the binary to its provisioning profile:
+	     the profile is what authorises the restricted entitlements below, and it
+	     will not match a binary whose application-identifier or team-identifier
+	     disagree with it. -->
+	<key>com.apple.application-identifier</key>
+	<string>__TEAM_ID__.com.github.stewartallen.smsc95xx.driver</string>
+	<key>com.apple.developer.driverkit</key>
+	<true/>
+	<key>com.apple.developer.driverkit.family.networking</key>
+	<true/>
+	<!-- This value must be an EXACT copy of what the provisioning profile grants,
+	     which for a DriverKit App Development profile is [ { idVendor = "*" } ].
+	     The "*" is not a wildcard the checker expands: taskgated-helper compares
+	     the value literally, so narrowing it in any way is rejected with
+	     "matchEntitlement failed value match" and the dext dies at launch with
+	     OS_REASON_CODESIGNING. Measured against this profile, only the exact
+	     value below is accepted; [{idVendor=1060}], [{idVendor="*",idProduct="*"}],
+	     [{idVendor="1060"}] and a plain boolean true are all rejected. See
+	     reference/signing-entitlement-match.txt. Narrowing this to concrete
+	     vid/pid pairs requires a Developer ID profile with values approved by
+	     Apple, not a development profile.
+
+	     This is only an upper bound on what we are ALLOWED to attach to; the
+	     three exact vid/pid pairs we actually match are the Info.plist
+	     personalities (0x0424 Microchip/SMSC, 0x184F MACH SYSTEMS).
+
+	     Note: keep comments free of double hyphens. plutil -lint accepts them,
+	     but codesign's stricter AMFIUnserializeXML parser fails with a syntax
+	     error and the build stops at the signing step. -->
+	<key>com.apple.developer.driverkit.transport.usb</key>
+	<array>
+		<dict>
+			<key>idVendor</key>
+			<string>*</string>
+		</dict>
+	</array>
+	<key>com.apple.developer.team-identifier</key>
+	<string>__TEAM_ID__</string>
+</dict>
+</plist>

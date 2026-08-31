@@ -12,6 +12,75 @@ DEXT_ID      := com.github.stewartallen.smsc95xx.driver
 APP_NAME     := SMSC95xxInstaller
 APP_ID       := com.github.stewartallen.smsc95xx
 
+# Signing. Empty SIGN_ID means ad-hoc, which needs amfi_get_out_of_my_way=0x1 because the
+# restricted entitlements are then unauthorised. That boot-arg disables entitlement
+# validation machine-wide and is NOT the supported path -- set SIGN_ID to a real identity
+# and pass both profiles, which authorises the entitlements properly and loads with AMFI
+# enforcing. Configure that once in .env (see .env.example), or override per invocation:
+#   make install SIGN_ID="Apple Development: you@example.com (XXXXXXXXXX)" \
+#                APP_PROFILE=~/app.provisionprofile DEXT_PROFILE=~/dext.provisionprofile
+# A profile only authorises an entitlement whose value it grants EXACTLY: the "*" in the
+# profile's transport.usb grant is a literal to reproduce, not a wildcard to narrow. See
+# SMSC95xxDriver/SMSC95xxDriver.entitlements.in and reference/signing-entitlement-match.txt.
+# Local signing configuration lives in .env, which is gitignored: the signing identity
+# names a person, and the profile paths point at files that must never be committed.
+# Copy .env.example to .env and fill it in. Command-line variables still win over .env,
+# and a missing .env is fine -- you get an ad-hoc build.
+-include .env
+
+SIGN_ID      ?=
+APP_PROFILE   ?=
+DEXT_PROFILE  ?=
+
+# .env is parsed by make, not by a shell, so values are taken literally: quotes become
+# part of the value and neither ~ nor $VAR is expanded. Both are easy to write out of
+# habit and both fail confusingly -- a quoted SIGN_ID reaches codesign with the quotes
+# attached, and a quoted "~/x.provisionprofile" is passed through as a literal path that
+# does not exist. Undo both here so either style works.
+strip_quotes  = $(subst ",,$(subst ',,$(1)))
+expand_home   = $(patsubst ~/%,$(HOME)/%,$(1))
+SIGN_ID      := $(call strip_quotes,$(SIGN_ID))
+APP_PROFILE  := $(call expand_home,$(call strip_quotes,$(APP_PROFILE)))
+DEXT_PROFILE := $(call expand_home,$(call strip_quotes,$(DEXT_PROFILE)))
+
+CODESIGN_ID  := $(if $(SIGN_ID),$(SIGN_ID),-)
+
+# Catch a path typo before it turns into a silently ad-hoc build: a missing profile means
+# the restricted entitlements go unauthorised, which signs and verifies cleanly and only
+# fails at launch.
+$(foreach p,$(APP_PROFILE) $(DEXT_PROFILE),\
+    $(if $(wildcard $(p)),,$(error profile not found: $(p) -- check .env)))
+
+# No Apple Team ID is checked in: the entitlements files are templates carrying
+# __TEAM_ID__, and the real value is read out of the provisioning profile at build
+# time. Reading it from the profile rather than hardcoding it means it cannot drift
+# from the profile it has to match, and it lets anyone build this with their own
+# account. Override TEAM_ID only if you are signing without a profile.
+#
+# A .provisionprofile is CMS-signed, so the plist has to be unwrapped before the
+# Entitlements dict can be read.
+# loads(), not load(): a pipe is not seekable and plistlib.load() insists on seeking.
+team_id_of = $(shell security cms -D -i "$(1)" 2>/dev/null | /usr/bin/python3 -c \
+    'import plistlib,sys; print(plistlib.loads(sys.stdin.buffer.read())["Entitlements"]["com.apple.developer.team-identifier"])' 2>/dev/null)
+TEAM_ID      ?= $(if $(DEXT_PROFILE),$(call team_id_of,$(DEXT_PROFILE)),$(if $(APP_PROFILE),$(call team_id_of,$(APP_PROFILE)),))
+TEAM_ID      := $(strip $(TEAM_ID))
+
+ifeq ($(TEAM_ID),)
+ifeq ($(strip $(SIGN_ID)),)
+# An ad-hoc build is not profile-backed, so the two keys that tie the binary to a profile
+# are never validated. Substituting an obviously fake Team ID keeps a bare `make` working
+# with no configuration at all, while the error below still refuses a *signed* build that
+# has no real one.
+TEAM_ID      := ADHOCNOTEAM
+else
+# Fail early and loudly. Signing for real with an unsubstituted or wrong Team ID produces
+# a bundle that signs and verifies cleanly, then dies at launch under AMFI -- the most
+# expensive failure mode to diagnose, so do not let the build reach it.
+$(error SIGN_ID is set but no TEAM_ID could be read from a profile. Set DEXT_PROFILE and \
+APP_PROFILE in .env, or set TEAM_ID explicitly)
+endif
+endif
+
 BUILD        := build
 # The bundle and its executable must be named after the bundle IDENTIFIER, not the
 # project name. Named SMSC95xxDriver.dext instead, OSSystemExtensionRequest fails
@@ -21,6 +90,11 @@ BUILD        := build
 DEXT_BUNDLE  := $(BUILD)/$(DEXT_ID).dext
 APP_BUNDLE   := $(BUILD)/$(APP_NAME).app
 GEN          := $(BUILD)/gen
+
+# Generated from the .in templates with the real Team ID substituted in, so they land
+# in build/ and are never checked in. Declared after GEN because := expands now.
+DEXT_ENT     := $(GEN)/$(DEXT_NAME).entitlements
+APP_ENT      := $(GEN)/Installer.entitlements
 
 # $(shell) is evaluated at parse time and does not inherit the `export` above,
 # so DEVELOPER_DIR has to be set inline here or the SDK path comes back empty.
@@ -109,17 +183,40 @@ $(BUILD)/smsc95xx_proto.o: $(COMMON)/smsc95xx_proto.c $(COMMON_HDRS)
 
 DEXT_OBJS := $(BUILD)/$(DEXT_NAME).o $(BUILD)/$(DEXT_NAME).iig.o $(BUILD)/smsc95xx_proto.o
 
+# ---- entitlements ----
+
+# Substitute the Team ID into the templates. An unsubstituted __TEAM_ID__ would sign and
+# verify cleanly and only fail at launch, so check for it here rather than let that
+# through; and lint after substituting, because it is the generated file that codesign
+# reads. Note codesign parses entitlements with AMFIUnserializeXML, which is stricter
+# than plutil -- a double hyphen inside an XML comment passes the lint below and then
+# fails signing.
+$(DEXT_ENT): $(DEXT_NAME)/$(DEXT_NAME).entitlements.in
+	@mkdir -p $(GEN)
+	sed 's/__TEAM_ID__/$(TEAM_ID)/g' $< > $@
+	@! grep -q __TEAM_ID__ $@ || { echo "$@: __TEAM_ID__ not substituted; set TEAM_ID or pass a profile" >&2; rm -f $@; exit 1; }
+	plutil -lint $@
+
+$(APP_ENT): $(APP_NAME)/Installer.entitlements.in
+	@mkdir -p $(GEN)
+	sed 's/__TEAM_ID__/$(TEAM_ID)/g' $< > $@
+	@! grep -q __TEAM_ID__ $@ || { echo "$@: __TEAM_ID__ not substituted; set TEAM_ID or pass a profile" >&2; rm -f $@; exit 1; }
+	plutil -lint $@
+
 # A dext bundle is flat: Info.plist and the executable sit at the top level,
 # with no Contents/MacOS. Verified against /System/Library/DriverExtensions.
-dext: $(DEXT_OBJS) $(DEXT_NAME)/Info.plist $(DEXT_NAME)/$(DEXT_NAME).entitlements
+dext: $(DEXT_OBJS) $(DEXT_NAME)/Info.plist $(DEXT_ENT)
 	plutil -lint $(DEXT_NAME)/Info.plist
-	plutil -lint $(DEXT_NAME)/$(DEXT_NAME).entitlements
 	rm -rf $(DEXT_BUNDLE)
 	mkdir -p $(DEXT_BUNDLE)
 	xcrun -sdk driverkit clang++ $(DK_LDFLAGS) -o $(DEXT_BUNDLE)/$(DEXT_ID) $(DEXT_OBJS)
 	cp $(DEXT_NAME)/Info.plist $(DEXT_BUNDLE)/Info.plist
-	codesign --force --sign - \
-	    --entitlements $(DEXT_NAME)/$(DEXT_NAME).entitlements \
+	@# A dext bundle is flat, so the profile goes at its root. This location is NOT
+	@# documented by Apple and is the one part of the signing setup taken on trust --
+	@# verify with `codesign -d -vvv` that the entitlements read as profile-backed.
+	$(if $(DEXT_PROFILE),cp "$(DEXT_PROFILE)" $(DEXT_BUNDLE)/embedded.provisionprofile,@true)
+	codesign --force --sign "$(CODESIGN_ID)" \
+	    --entitlements $(DEXT_ENT) \
 	    --identifier $(DEXT_ID) \
 	    --timestamp=none $(DEXT_BUNDLE)
 	codesign -v --verbose=2 $(DEXT_BUNDLE)
@@ -142,7 +239,7 @@ $(ICNS): $(ICON_SRC)
 	done
 	iconutil -c icns $(ICONSET) -o $(ICNS)
 
-app: dext $(ICNS) $(APP_NAME)/main.m $(APP_NAME)/Info.plist $(APP_NAME)/Installer.entitlements
+app: dext $(ICNS) $(APP_NAME)/main.m $(APP_NAME)/Info.plist $(APP_ENT)
 	plutil -lint $(APP_NAME)/Info.plist
 	rm -rf $(APP_BUNDLE)
 	mkdir -p $(APP_BUNDLE)/Contents/MacOS $(APP_BUNDLE)/Contents/Resources $(APP_BUNDLE)/Contents/Library/SystemExtensions
@@ -150,8 +247,9 @@ app: dext $(ICNS) $(APP_NAME)/main.m $(APP_NAME)/Info.plist $(APP_NAME)/Installe
 	cp $(APP_NAME)/Info.plist $(APP_BUNDLE)/Contents/Info.plist
 	cp $(ICNS) $(APP_BUNDLE)/Contents/Resources/AppIcon.icns
 	cp -R $(DEXT_BUNDLE) $(APP_BUNDLE)/Contents/Library/SystemExtensions/
-	codesign --force --sign - \
-	    --entitlements $(APP_NAME)/Installer.entitlements \
+	$(if $(APP_PROFILE),cp "$(APP_PROFILE)" $(APP_BUNDLE)/Contents/embedded.provisionprofile,@true)
+	codesign --force --sign "$(CODESIGN_ID)" \
+	    --entitlements $(APP_ENT) \
 	    --identifier $(APP_ID) \
 	    --timestamp=none $(APP_BUNDLE)
 	codesign -v --verbose=2 $(APP_BUNDLE)
@@ -165,6 +263,17 @@ install: app
 uninstall:
 	-/Applications/$(APP_NAME).app/Contents/MacOS/$(APP_NAME) deactivate
 	rm -rf /Applications/$(APP_NAME).app
+
+# `codesign -v` reports "valid on disk" even when signing silently fell back to ad-hoc,
+# so check the Authority chain, not validity.
+.PHONY: signinfo
+signinfo:
+	@echo "--- dext ---"
+	@codesign -dv --verbose=2 $(DEXT_BUNDLE) 2>&1 | grep -E "Authority|TeamIdentifier|Signature|flags" || true
+	@test -f $(DEXT_BUNDLE)/embedded.provisionprofile && echo "  profile: embedded" || echo "  profile: NONE"
+	@echo "--- installer app ---"
+	@codesign -dv --verbose=2 $(APP_BUNDLE) 2>&1 | grep -E "Authority|TeamIdentifier|Signature|flags" || true
+	@test -f $(APP_BUNDLE)/Contents/embedded.provisionprofile && echo "  profile: embedded" || echo "  profile: NONE"
 
 status:
 	systemextensionsctl list

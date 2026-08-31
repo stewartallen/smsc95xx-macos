@@ -31,6 +31,12 @@ Package.resolved
 *.provisionprofile
 entitlements.local.plist
 
+# Local signing configuration: identity name, profile paths, Apple Team ID.
+# .env.example is the committed template. Never commit .env itself.
+.env
+.env.*
+!.env.example
+
 # Python
 __pycache__/
 *.pyc

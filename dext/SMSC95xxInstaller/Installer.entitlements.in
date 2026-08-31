@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- TEMPLATE. The Makefile substitutes __TEAM_ID__ from APP_PROFILE and writes
+	     the real entitlements into build/gen, so no Apple Team ID is checked in.
+	     See SMSC95xxDriver/SMSC95xxDriver.entitlements.in for the details. -->
+	<key>com.apple.application-identifier</key>
+	<string>__TEAM_ID__.com.github.stewartallen.smsc95xx</string>
+	<key>com.apple.developer.system-extension.install</key>
+	<true/>
+	<key>com.apple.developer.team-identifier</key>
+	<string>__TEAM_ID__</string>
+</dict>
+</plist>

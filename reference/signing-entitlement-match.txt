@@ -1,0 +1,164 @@
+# How a provisioning profile authorises com.apple.developer.driverkit.transport.usb
+#
+# date:    2026-08-30 23:43 PDT
+# system:  macOS 26.6.2 build 25G83, Apple Silicon (Mac16,11)
+# posture: SIP disabled, NO amfi boot-arg (AMFI enforcing), Developer Mode on
+# device:  MACH SYSTEMS 10BASET1S-USB-IF, 0424:9905
+# dext:    com.github.stewartallen.smsc95xx.driver 2.7/27, arm64e
+# signing: an Apple Development identity, team <TEAM_ID>
+# profile: a DriverKit App Development profile for App ID
+#          <TEAM_ID>.com.github.stewartallen.smsc95xx.driver
+#
+# The signing identity name and Team ID are redacted throughout: they identify a person
+# and an Apple developer account, and none of the findings below depend on their values.
+# Local signing configuration lives in dext/.env, which is gitignored.
+#
+# WHY THIS FILE EXISTS
+# Removing amfi_get_out_of_my_way=0x1 made the dext fail to launch even though it
+# was signed with a real identity, carried an embedded profile, and passed
+# `codesign -v`. The cause was the SHAPE of one entitlement value, and the rule
+# governing it is not documented by Apple. This is the measurement.
+
+
+## THE RULE (measured)
+
+The profile grants:
+
+    com.apple.developer.driverkit.transport.usb = ( { idVendor = "*" } )
+
+The binary's entitlement value must be an EXACT copy of that. The "*" is NOT a
+wildcard that the checker expands and matches against concrete values -- it is a
+literal that must be reproduced verbatim. Narrowing the claim, in any direction,
+is rejected.
+
+
+## MEASURED RESULTS
+
+Each candidate was signed onto a throwaway copy of the built dext bundle with the
+real identity and the real embedded profile, then exec'd directly. Exec'ing a dext
+binary as a normal process runs the full amfid + taskgated-helper profile check
+before failing on the Mach-O, so the verdict lands in the log without needing the
+hardware. Method is tools/probe-entitlements/probe-entitlements.sh.
+
+  candidate transport.usb value                        verdict
+  ---------------------------------------------------  --------
+  (key absent -- control)                              ACCEPTED
+  ( { idVendor = 1060 }, { idVendor = 6223 } )         REJECTED
+  ( { idVendor = "*" } )                               ACCEPTED
+  ( { idVendor = "*", idProduct = "*" } )              REJECTED
+  ( { idVendor = "1060" } )                            REJECTED
+  true                                                 REJECTED
+
+The "key absent" control is what proves the harness can distinguish acceptance
+from rejection rather than reporting ACCEPTED for everything.
+
+Note what the rejections rule out. It is not simply "extra keys are forbidden":
+{ idVendor = "*", idProduct = "*" } adds a key and fails, but so does
+{ idVendor = 1060 }, which adds nothing and only narrows an existing key. And it
+is not a type coercion problem either: { idVendor = "1060" } is a string, like the
+profile's value, and still fails. Only byte-identical passes.
+
+
+## THE DIAGNOSTIC TRAIL
+
+The user-visible error is misleading. AMFI reports:
+
+    Error Domain=AppleMobileFileIntegrityError Code=-413 "No matching profile found"
+
+which reads as "the profile is missing or wasn't found". It was neither. The
+profile was located, its signature verified, and its device UDID matched. The
+useful line is one level down, from taskgated-helper:
+
+    Checking profile: SMSC95xx Driver DriverKit Development
+    ProfileGrantsEntitlement matchEntitlement failed value match for entitlement:
+        com.apple.developer.driverkit.transport.usb
+    com.github.stewartallen.smsc95xx.driver: Unsatisfied entitlements:
+        com.apple.developer.driverkit.transport.usb
+    Disallowing: com.github.stewartallen.smsc95xx.driver
+
+then the kernel:
+
+    AMFI: code signature validation failed.
+    AMFI: bailing out because of restricted entitlements.
+    Unsatisfied Entitlements: com.apple.developer.driverkit.transport.usb
+
+then launchd kills it with OS_REASON_CODESIGNING, and kernelmanagerd surfaces the
+whole thing as:
+
+    Error Domain=NSPOSIXErrorDomain Code=8 "Exec format error"
+
+"Exec format error" is the SAME message a wrong-architecture dext produces (plain
+arm64 instead of arm64e). Two unrelated faults, one symptom. Distinguish them by
+whether the log also contains "Unsatisfied Entitlements": if it does, it is a
+profile/entitlement mismatch, not an architecture problem.
+
+To find this trail:
+
+    /usr/bin/log show --last 5m \
+        --predicate 'process == "amfid" OR process == "taskgated-helper"' \
+        --style compact
+
+`log` is a zsh builtin, so the /usr/bin prefix is required. Do not pipe stderr to
+/dev/null while diagnosing -- that is how the builtin's "too many arguments"
+error stays hidden.
+
+
+## WHAT codesign DOES NOT TELL YOU
+
+`codesign -v` reports "valid on disk" and "satisfies its Designated Requirement"
+for a bundle whose entitlements the profile does not authorise. The signature IS
+valid; profile authorisation is a separate check performed by amfid at exec time.
+Verifying the Authority chain is likewise necessary but not sufficient -- ours read
+correctly as Apple Development -> WWDR -> Apple Root CA the whole time the dext was
+being rejected.
+
+There is also a build-time trap in the entitlements plist itself: codesign parses
+it with AMFIUnserializeXML, which is stricter than plutil. A double hyphen inside
+an XML comment passes `plutil -lint` and then fails signing with
+
+    Failed to parse entitlements: AMFIUnserializeXML: syntax error near line N
+
+
+## CONSEQUENCE FOR THIS DRIVER
+
+The entitlement is an upper bound on what the dext is ALLOWED to attach to, not
+what it does attach to. Claiming ( { idVendor = "*" } ) authorises attachment to
+any USB device; the three exact vid/pid pairs we actually match are the Info.plist
+personalities, and IOKit will not hand us anything else. So the practical exposure
+is unchanged, but the entitlement is broader than we would like and cannot be
+narrowed with a development profile.
+
+Narrowing it requires a Developer ID profile carrying concrete vid/pid values
+approved by Apple. Untested here -- recorded as the known route, not as something
+measured.
+
+
+## END STATE
+
+    $ nvram boot-args
+    nvram: Error getting variable - 'boot-args': (iokit/common) data was not found
+
+    $ csrutil status
+    System Integrity Protection status: disabled.
+
+SIP remains disabled: a development-signed dext still requires it. Only
+notarisation lifts that, and it was never the goal here -- the goal was removing
+the AMFI bypass, which disabled entitlement validation for every process on the
+machine and broke unrelated software (JDKs, .NET).
+
+    $ systemextensionsctl list
+    *   *   <TEAM_ID>  com.github.stewartallen.smsc95xx.driver (2.7/27)  [activated enabled]
+
+    running: v27 [<install-uuid>]
+    staged:  v27 [<install-uuid>]
+
+    $ ifconfig en10
+    en10: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+        options=6460<TSO4,TSO6,CHANNEL_IO,PARTIAL_CSUM,ZEROINVERT_CSUM>
+        ether fc:61:79:90:04:56
+        media: autoselect (10baseT/UTP <half-duplex>)
+        status: active
+
+Zero entitlement rejections logged after the dext started. Note that `options=`
+still advertises offloads the driver does not implement -- unrelated to signing,
+tracked as an open M5 question.
