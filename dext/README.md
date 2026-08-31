@@ -1,5 +1,12 @@
 # Building and loading SMSC95xxDriver.dext
 
+> **Scope as of M4.** This driver registers a network interface and reads the chip's registers.
+> It does **not** move frames yet — there is no USB bulk transfer path until M5. `ifconfig` will show
+> the interface with the correct MAC and `status: active`, but nothing can be sent or received and
+> `ping` will not work. Do not read `status: active` as reachability; see the link-state section for
+> why it reports active whenever the dongle is attached.
+
+
 The DriverKit extension (`dext`) for the LAN9500A is built entirely with the `Makefile` — no Xcode
 project. Every non-obvious flag has been validated on hardware and is documented here.
 
@@ -300,6 +307,134 @@ matter:
   looks for an interface first and configures only when none is found.
 - **`matchInterfaces = false`** keeps the interface from being published for other drivers to match
   while this driver owns the device. `false` proved sufficient; `true` was never needed.
+
+---
+
+## Networking personality change in M4
+
+The transition from M3 (dext loads and matches) to M4 (interface appears) required a change in the
+IOKit personality and bundle configuration to shift from generic `IOUserService` to network-specific
+`IOUserNetworkEthernet`. This is not discoverable from Apple's documentation but is essential:
+
+**In `Info.plist` personalities:**
+- `IOClass` changed from `IOUserService` to `IOUserNetworkEthernet`
+- `CFBundleIdentifierKernel` changed from `com.apple.kpi.iokit` to `com.apple.iokit.IOSkywalkFamily`
+
+**In the bundle root:**
+- Added `OSBundleLibraries` with `com.apple.iokit.IOSkywalkFamily = 1.0`
+
+**`IOProviderClass` stays `IOUSBHostDevice`** for the reason already documented above: the device
+arrives unconfigured, with no interface nodes in the IOKit tree. Device-level matching is the only
+option.
+
+### Five NetworkingDriverKit facts that cost real time
+
+Each of these cost hours. In fairness, three of them *are* readable in the SDK headers if you know
+where to look — the `__deprecated … = 0` markers, `registerEthernetInterface`'s doxygen block, and the
+`QUEUENAME` attributes are all right there. The problem is that none is in Apple's prose documentation,
+and none announces itself as load-bearing until something silently fails. They are recorded here with
+their symptoms so the symptom leads back to the cause:
+
+**Capital/lowercase method pairs.** `IOUserNetworkEthernet` declares several methods twice: a
+deprecated capital-initial form that is pure virtual and must be overridden for the class to
+instantiate, and a live lowercase form that the stack actually calls. Overriding only the deprecated
+one compiles, loads, and silently does nothing. Affects:
+- `SetInterfaceEnable` / `setInterfaceEnable`
+- `GetHardwareAssists` / `getHardwareAssists`
+- `ReportLinkStatus` / `reportLinkStatus`
+- `RegisterEthernetInterface` / `registerEthernetInterface`
+
+**Nine methods are both `__deprecated` and pure virtual.** All must be stubbed or the class will not
+instantiate; a missing one presents as the dext server launching and immediately exiting, with nothing
+logged to the kernel. The nine are: `SetInterfaceEnable`, `SetMulticastAddresses`,
+`SetAllMulticastModeEnable`, `SelectMediaType`, `SetWakeOnMagicPacketEnable`, `SetMTU`,
+`GetMaxTransferUnit`, `SetHardwareAssists`, `GetHardwareAssists`.
+
+**`registerEthernetInterface` (NDK_22, lowercase) takes no MAC.** The real signature, from
+`IOUserNetworkEthernet.iig`:
+
+```cpp
+IOReturn registerEthernetInterface(IOUserNetworkPacketQueue **queues, uint32_t numQueues,
+                                   IOUserNetworkPacketBufferPool *txPool,
+                                   IOUserNetworkPacketBufferPool *rxPool) LOCALONLY NDK_22;
+```
+
+A single array of `IOUserNetworkPacketQueue *` — the four concrete queue classes all derive from it —
+and no MAC parameter. The MAC arrives via a `getHardwareAddress(ether_addr_t *)` override instead. One
+pool may serve as both `txPool` and `rxPool`; the header's own documentation says so explicitly.
+
+**Link status must be reported from `setInterfaceEnable(true)`, not only from `Start()`.**
+Reported only from `Start()`, the value is discarded before the interface is enabled and `ifconfig`
+shows `media: autoselect (none)` with no `status:` line. Reporting it again from
+`setInterfaceEnable(true)` — the live lowercase callback the stack invokes on `ifconfig up` —
+produces the correct output. Both calls are kept.
+
+**`TxDispatchQueue` / `RxDispatchQueue` are NOT needed in `Info.plist`.** Those QUEUENAME attributes
+sit on framework-internal LOCAL methods a driver never implements. The four queue `Create` calls each
+take an `IODispatchQueue *` the driver supplies, and no Apple-shipped dext declares these keys.
+
+---
+
+## Link-state policy
+
+The interface reports `status: active` whenever the dongle is attached, whether or not the cable is
+plugged in. This is defensible on a PLCA-less 10BASE-T1S multidrop segment: there is no continuous
+link-integrity signal to read while the medium is quiet, so the honest model is to report the link
+up whenever the device is present.
+
+**Important:** `status: active` does **not** mean the cable is plugged in. It does not track cable
+state. On this hardware, `BMSR` bit 2 (link status) reads set even with the 10BASE-T1S cable physically
+unplugged, measured twelve consecutive times with the Linux driver out of the path. Under IEEE clause 22
+the link-status bit is latching-low, so a PHY that had detected the failure would show it clear on the
+first read. This PHY does not.
+
+Real T1S link and PLCA state live in IEEE clause-45 MMD registers, reachable through the clause-22
+indirect registers 13/14 that the driver's existing `miiRead`/`miiWrite` transport already supports.
+This is deferred, not blocked.
+
+See `reference/m4-interface.txt` section 2 for the measured evidence.
+
+---
+
+## Advertised offloads — open item
+
+The interface advertises `TSO4,TSO6,PARTIAL_CSUM` — TCP segmentation offload and partial checksum
+offload — that the driver does not implement. `Start()` never touches `COE_CR` at all — it skips
+checksum offload initialization entirely, and there is no packet segmentation logic anywhere in the
+driver.
+
+Three driver-side APIs were tried, each returning nothing:
+- `getHardwareAssists()` — called repeatedly, returns 0, flags unchanged
+- `setHardwareAssists(assists, mask)` — never called by the stack
+- `getTSOOptions(opts)` — never called by the stack
+
+**Search for the right symbol.** `kIOEthernetHardwareAssist*` is the in-kernel IONetworkingFamily
+prefix and finds nothing under DriverKit — searching for it produces a false conclusion that no such
+constants exist. The DriverKit spelling is `kIOUserNetworkHWAssist*`, in
+`NetworkingDriverKit/IOUserNetworkTypes.h`:
+
+```c
+kIOUserNetworkHWAssistTxChecksumIPHdr = 0x00000001,  TxChecksumTCP = 0x00000002,
+kIOUserNetworkHWAssistTxChecksumUDP   = 0x00000004,  TSO4          = 0x00200000,
+kIOUserNetworkHWAssistTSO6            = 0x00400000,  RxChecksum    = 0x20000000,
+```
+
+Those are exactly the capabilities `ifconfig` names. A fourth API, `getFeatureFlags()` (NDK_22), was
+also checked — but the `kIOUserNetworkFeatureFlag*` enum carries only VLAN, timestamp, WOMP and
+NicProxy bits, no TSO or checksum, so it cannot be the source either.
+
+So the bounded conclusion is narrower than "no API exists": the driver reports 0 through the one API
+the family actually calls, the descriptor the family builds has a `hwAssists` field fed from it, and the
+advertisement persists regardless. The remaining hypothesis — untested — is that `options=` reflects
+what the **Skywalk layer** offers to the BSD stack, with the offload performed in software above the
+driver, rather than a claim about our hardware. `CHANNEL_IO` and `ZEROINVERT_CSUM` appearing in the same
+list are consistent with that reading, both being Skywalk-native flags.
+
+**M5 test:** once bulk transfer is wired, check whether the stack hands us packets that are
+pre-segmented or carry partial checksums. If it does, transmission will fail in a way that looks
+exactly like a framing bug, so check this **before** suspecting the framing code. If the stack
+honours the 0 from `getHardwareAssists()` in practice, the advertisement is cosmetic and this item
+can be closed.
 
 ---
 

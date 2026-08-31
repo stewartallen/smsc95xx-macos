@@ -1,0 +1,321 @@
+# M4 evidence: the LAN9500A appears in ifconfig with the MAC read from its EEPROM
+#
+# date:    2026-08-30 19:18 PDT
+# system:  macOS 26.6.2 build 25G83, Apple Silicon
+# posture: SIP disabled, boot-args amfi_get_out_of_my_way=0x1,
+#          systemextensionsctl developer on
+# device:  MACH SYSTEMS 10BASET1S-USB-IF, 0424:9905 (EEPROM auto-load succeeded on
+#          the cycle captured here; the failed state is covered separately below)
+# dext:    com.github.stewartallen.smsc95xx.driver 2.2/22, ad-hoc signed, arm64e
+#
+# SCOPE -- read this before drawing conclusions from the rest of the file:
+# M4 registers a network interface. It does NOT move frames. There is no USB bulk
+# transfer path until M5, so the interface exists, carries the correct MAC and reports
+# a link, and nothing more. ping will not work. Do not read "status: active" as
+# reachability.
+
+
+=======================================================================
+1. THE INTERFACE
+=======================================================================
+
+Baseline before any M4 change, and after every task that should not register
+anything (Tasks 1-3):
+
+    $ ifconfig -a | grep -c "^en"
+    10
+
+After registration:
+
+    $ ifconfig -a | grep -c "^en"
+    11
+
+    $ ifconfig en10
+    en10: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+        options=6460<TSO4,TSO6,CHANNEL_IO,PARTIAL_CSUM,ZEROINVERT_CSUM>
+        ether fc:61:79:90:04:56
+        inet6 fe80::f7:b71:b3c7:eeae%en10 prefixlen 64 secured scopeid 0x20
+        inet 169.254.53.68 netmask 0xffff0000 broadcast 169.254.255.255
+        nd6 options=201<PERFORMNUD,DAD>
+        media: autoselect (10baseT/UTP <half-duplex>)
+        status: active
+
+The MAC is cross-checked against the property the driver publishes itself, so the
+value in ifconfig is not taken on trust:
+
+    $ ioreg -w0 -r -c IOUSBHostDevice -l | grep SMSC95xxMACAddress
+    "SMSC95xxMACAddress" = <fc6179900456>          -> fc:61:79:90:04:56
+
+Successful attach:
+
+    kernel: SMSC95xx: Start: matched provider
+    kernel: (IOUSBHostFamily) …: IOUSBHostDevice::setConfigurationGated: SMSC95xxDriver selected configuration 1
+    kernel: SMSC95xx: device arrived unconfigured; selected configuration 1
+    kernel: SMSC95xx: ID_REV 0x9e000002 chip 0x9e00 rev 0x0002
+    kernel: SMSC95xx: PHY ID 0x0007:0x4165
+    kernel: SMSC95xx: E2P_CMD auto-load LOADED
+    kernel: SMSC95xx: MAC fc:61:79:90:04:56
+    kernel: SMSC95xx: pool and four queues created
+    kernel: SMSC95xx: ethernet interface registered
+    kernel: DK: SMSC95xxDriver::start(10BASE-T1S-USB-IF) ok
+
+Teardown on unplug -- the check that matters, because a half-removed network
+interface is worse than none:
+
+    ifconfig -a | grep -c "^en"                    ->  10      (back to baseline)
+    interfaces still carrying fc:61:79:90:04:56    ->  0
+    ps -Ao pid,comm | grep smsc95xx                ->  nothing
+    kernel: SMSC95xx: Stop
+    systemextensionsctl list  ->  single entry, 2.2/22 [activated enabled], no remnant
+
+
+=======================================================================
+2. FINDINGS THAT ARE NOT DISCOVERABLE FROM THE HEADERS
+=======================================================================
+
+## Link status must be reported from setInterfaceEnable(true), not only from Start()
+
+Reported only from Start(), the value is discarded before the interface is enabled and
+ifconfig shows:
+
+    media: autoselect (none)
+    (no status: line at all)
+
+Reporting it again from setInterfaceEnable(true) -- the live lowercase callback the
+stack invokes on `ifconfig up` -- produces the correct output shown in section 1.
+Both calls are kept.
+
+## Beware the capital/lowercase method pairs
+
+IOUserNetworkEthernet declares several methods twice: a capital-initial form marked
+__deprecated, and a live lowercase form that the stack actually calls. Overriding only the
+deprecated one compiles, loads, and silently does nothing.
+
+    SetInterfaceEnable       (iig:114)  vs  setInterfaceEnable       (iig:205)
+    SetPromiscuousModeEnable (iig:118)  vs  setPromiscuousModeEnable (iig:210)
+    SetMTU / GetMaxTransferUnit
+                    (iig:152,156)  vs  setMaxTransferUnit / getMaxTransferUnit (iig:219,222)
+    GetHardwareAssists       (iig:164)  vs  getHardwareAssists()     (iig:228)
+    ReportLinkStatus                    vs  reportLinkStatus
+    RegisterEthernetInterface           vs  registerEthernetInterface
+
+The MTU pair is the one that bit us silently: only the deprecated half was overridden at
+first, so a carefully written "accept only 1500" gate sat on a path the stack never calls.
+Both halves are now overridden.
+
+MEASURED, and the result is two separate facts -- do not conflate them:
+
+    $ sudo ifconfig en10 mtu 4000
+    ifconfig: ioctl (set mtu): Invalid argument      <- refused
+
+    driver log for setMaxTransferUnit:  (nothing)    <- our override was NOT called
+
+So an over-large MTU IS refused, which means the concrete M5 hazard -- the driver being
+handed frames larger than the 2048-byte pool buffers -- does not materialise in practice.
+But the refusal happens ABOVE the driver; our gate is not demonstrably on the live path.
+It is correct and harmless, and its protection is unproven. This is the same shape as
+getHardwareAssists in open item 1: the right value reported through the documented API,
+with no evidence the family consults it.
+
+Untested and cheap if it ever matters: try an MTU just above 1500 (e.g. 1600) to find out
+whether there is a threshold below which the request reaches the driver.
+
+Nine methods are simultaneously __deprecated and pure virtual (= 0): SetInterfaceEnable,
+SetMulticastAddresses, SetAllMulticastModeEnable, SelectMediaType,
+SetWakeOnMagicPacketEnable, SetMTU, GetMaxTransferUnit, SetHardwareAssists,
+GetHardwareAssists. All are stubbed.
+
+CAUTION ON THE MECHANISM -- "a pure virtual must be overridden or the class will not
+instantiate" is NOT established, and the counter-example is in this very build: SetPromiscuousModeEnable (iig:118) is also pure
+virtual, was NOT overridden at the time the interface first registered successfully, and
+the class instantiated anyway. In the iig-generated header the dispatched capital-letter
+methods are not C++ pure virtuals at all. What IS reliably observed is the symptom: with a
+stub missing, the dext server launches and immediately exits and the kernel names nothing.
+Treat that symptom as the signal; do not rely on the stated cause.
+
+## getSupportedMediaArray: mediaCount is an OUTPUT, not a capacity
+
+The stack calls it with a non-null array and *mediaCount == 0:
+
+    getSupportedMediaArray: mediaArray=non-null, *mediaCount=0
+
+Treating *mediaCount as available capacity and returning kIOReturnNoSpace when it is
+zero makes every call fail, and ifconfig then reports
+`SIOCGIFXMEDIA: Input/output error`. Write the entries and set the count.
+
+## The registration overload takes no MAC
+
+registerEthernetInterface(queues, numQueues, txPool, rxPool) (NDK_22, lowercase) has no
+MAC parameter; the stack fetches it via a getHardwareAddress(ether_addr_t *) override.
+One pool may serve both directions. Queue array order {txSubmit, rxSubmit, txComplete,
+rxComplete} worked first time.
+
+## TxDispatchQueue / RxDispatchQueue are NOT needed in Info.plist
+
+None were added and registration succeeded, and no Apple-shipped dext under
+/System/Library/DriverExtensions declares either key.
+
+The reason is NOT that those QUEUENAME attributes sit on framework-internal methods a
+driver never implements -- a tempting reading, and wrong. iig emits both names into OUR OWN
+class description; see dext/build/gen/SMSC95xxDriver.iig.cpp:
+
+    #define SMSC95xxDriver_QueueNames  "" "\017RxDispatchQueue" "\017TxDispatchQueue"
+
+bound to _RxSQDataAvailable / _TxSQDataAvailable at queue indices 0 and 1. So the class does
+declare the queue names; what is not required is the Info.plist key. Worth knowing before
+M5, because those handlers will run on those queues.
+
+
+=======================================================================
+3. THE TWO EEPROM PROVENANCE SIGNALS CAN DISAGREE
+=======================================================================
+
+The most interesting hardware result of this milestone, observed on one power cycle:
+
+    kernel: SMSC95xx: E2P_CMD auto-load LOADED
+    kernel: SMSC95xx: EEPROM signature mismatch: offset 0 read 0x4a, expected 0xa5
+    kernel: DK: SMSC95xxDriver::start(10BASE-T1S-USB-IF) fail
+
+The device enumerated as 0x9905 with string descriptors present and the E2P_CMD LOADED
+bit **set** -- every indication of a successful auto-load -- yet the EEPROM data read
+back mis-clocked, exactly the (real[k>>1] << 1) & 0xFF pattern characterised in M2.
+
+**Neither provenance signal is sufficient on its own.** Gating only on LOADED, which
+looks the more authoritative of the two, would have accepted a corrupt MAC here. The
+0xA5 signature check is what refused it.
+
+This corrects reference/m3-dext-match.txt, which recorded the two signals agreeing
+(both indicating failure) as though that were the rule. It is not; it was a
+coincidence of the cycles observed at the time.
+
+The driver requires BOTH signals plus a plausibility check
+(smsc95xx_mac_plausible(), shared with the probe and unit-tested there) before an
+address is used.
+
+
+## The interface's display name cannot be fixed from the driver
+
+System Settings and `networksetup -listallhardwareports` show this interface as
+"Ethernet Adapter (en10)" rather than the device's USB product name, while the Belkin
+USB-C LAN on the same machine shows "Belkin USB-C LAN". Investigated and understood:
+
+SystemConfiguration derives an interface's display name from kUSBProductString found by
+walking the IOService provider chain, then PERSISTS it in
+/Library/Preferences/SystemConfiguration/NetworkInterfaces.plist keyed by MAC address, in
+SCNetworkInterfaceInfo. Belkin's entry carries idProduct, idVendor and kUSBProductString;
+ours carries only UserDefinedName = "Ethernet Adapter (en10)".
+
+Two things were ruled out:
+
+  - Not a missing property. Our USB device node carries
+    kUSBProductString = "10BASE-T1S-USB-IF", the same kind of value as the Belkin's.
+  - Not a stale cache. The cached entry was deleted, configd was signalled, and the
+    interface re-registered while the device node WAS named -- the new entry's IOPathMatch
+    reads .../10BASE-T1S-USB-IF@00141100/SMSC95xxDriver/... -- and SC still chose the
+    generic name.
+
+The difference is the shape of the provider chain:
+
+    Belkin:  IOUSBHostDevice -> IOUSBHostInterface -> AppleUserECM     -> ... -> en9
+    ours:    IOUSBHostDevice ->                       SMSC95xxDriver   -> ... -> en10
+
+SC's heuristic appears to require an IOUSBHostInterface in the chain. We do not have one,
+because this device arrives unconfigured and therefore publishes no interface node to
+match -- the very reason the driver matches IOUSBHostDevice (see section 2). Publishing
+kUSBProductString and "USB Product Name" as registry properties on the driver's own node
+does NOT work: SC does not read them from there, and kUSBProductString does not even
+persist onto the node. Do not spend time on it.
+
+THE ACTUAL FIX, and it is not cosmetic-only: split into two drivers, as Apple's own ECM
+dext does. A device-level driver matches IOUSBHostDevice, selects the configuration, and
+lets the resulting IOUSBHostInterface be matched by a second personality that owns the
+networking. That puts an IOUSBHostInterface in the chain and would very likely restore the
+name -- and it is arguably the right structure anyway, because the bulk endpoints M5 needs
+live on the interface, not the device. Worth deciding at M5 rather than bolted on here.
+
+Workaround meanwhile: the name is user-editable in System Settings, and the interface
+functions correctly regardless.
+
+
+=======================================================================
+4. OPEN ITEMS
+=======================================================================
+
+## Open item 1: the interface advertises offloads the driver does not implement
+
+    options=6460<TSO4,TSO6,CHANNEL_IO,PARTIAL_CSUM,ZEROINVERT_CSUM>
+
+TCP segmentation offload and partial checksum offload are advertised. The driver
+implements neither -- M2's initialisation deliberately skips COE_CR, and there is no
+segmentation logic anywhere.
+
+Three driver-side APIs were tried. This is a bounded negative result, not a shrug:
+
+    getHardwareAssists()      called repeatedly, returns 0, flags unchanged
+    setHardwareAssists(a,m)   NEVER called -- no log line on any attach
+    getTSOOptions(opts)       NEVER called -- no log line on any attach
+
+SEARCH FOR THE RIGHT SYMBOL. kIOEthernetHardwareAssist* is the in-kernel IONetworkingFamily prefix
+and finds nothing under DriverKit; searching for it yields the false conclusion that no such constants
+exist. The DriverKit spelling is kIOUserNetworkHWAssist*, in NetworkingDriverKit/IOUserNetworkTypes.h:
+
+    kIOUserNetworkHWAssistTxChecksumIPHdr = 0x00000001   TxChecksumTCP = 0x00000002
+    kIOUserNetworkHWAssistTxChecksumUDP   = 0x00000004   TSO4          = 0x00200000
+    kIOUserNetworkHWAssistTSO6            = 0x00400000   RxChecksum    = 0x20000000
+
+These are exactly the capabilities ifconfig names. A fourth API, getFeatureFlags() (NDK_22), was also
+checked: the kIOUserNetworkFeatureFlag* enum carries only VLAN, timestamp, WOMP and NicProxy bits --
+no TSO, no checksum -- so it cannot be the source either.
+
+The honest bounded conclusion is therefore narrower than "no API exists". The driver reports 0 through
+the one API the family actually calls; the interface descriptor the family builds carries a hwAssists
+field fed from it; and the advertisement persists regardless. The remaining hypothesis, UNTESTED, is
+that options= describes what the Skywalk layer offers the BSD stack -- with the offload done in
+software above the driver -- rather than a claim about this hardware. CHANNEL_IO and ZEROINVERT_CSUM
+appearing in the same list are consistent with that, both being Skywalk-native flags.
+
+The getHardwareAssists override returning 0 is retained because it is correct regardless.
+
+**M5 test that settles it:** once the bulk path exists, check whether the stack hands
+us packets that are pre-segmented or carry partial checksums. If it does, transmission
+will fail in a way that looks exactly like a framing bug, so check this BEFORE
+suspecting the framing code -- which M2 already proved correct against this silicon. If
+the stack does honour the 0 from getHardwareAssists in practice, the advertisement is
+cosmetic and this item can be closed.
+
+## Open item 2: link state is not cable state
+
+The interface reports `status: active` whenever the dongle is attached. On a 10BASE-T1S
+multidrop segment without PLCA there is no continuous link-integrity signal to read, so
+this is the honest model of the medium rather than a shortcut, and it matches what Linux
+reports. But it does **not** track the cable: unplugging the T1S cable leaves the
+interface active.
+
+BMSR bit 2 must never be used for this. Measured in M2 with the cable physically
+unplugged, it read 0x0805 -- link bit set -- twelve consecutive times, with Linux out of
+the path. Under clause 22 the link-status bit is latching-low, so a PHY that had noticed
+the failure would have shown it clear on the first read.
+
+Real T1S link and PLCA state live in clause-45 MMD registers, reachable through the
+clause-22 indirect registers 13/14 that the driver's existing miiRead/miiWrite path can
+already drive. Deferred, not blocked.
+
+
+=======================================================================
+5. NOTE ON TESTING THIS MILESTONE
+=======================================================================
+
+Two things made verification much slower than the code warranted, and both will recur:
+
+1. **The EEPROM auto-load is intermittent on this unit.** Several power cycles came up
+   in the 0x9E00 state, where Start() refuses before reaching the code under test. A
+   refusal is the driver working, not a failure -- but it tests nothing downstream of
+   the MAC check. Roughly one cycle in three succeeded during this session.
+
+2. **Replacing a dext that holds a device open half-applies the upgrade.** The new
+   version stages, systemextensionsctl reports it activated enabled, and the kernel
+   keeps running the OLD binary. This caught out an observation three separate times
+   here; once it made a working fix look like a failure. `make -C dext status` prints
+   running vs staged vs declared precisely so the mismatch is visible. Always unplug
+   before installing, and always confirm the running version before interpreting
+   anything.

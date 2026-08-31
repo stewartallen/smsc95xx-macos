@@ -11,8 +11,9 @@
 #include <DriverKit/IOService.iig>
 #include <USBDriverKit/IOUSBHostDevice.iig>
 #include <USBDriverKit/IOUSBHostInterface.iig>
+#include <NetworkingDriverKit/IOUserNetworkEthernet.iig>
 
-class SMSC95xxDriver: public IOService
+class SMSC95xxDriver: public IOUserNetworkEthernet
 {
 public:
     virtual bool init() override;
@@ -26,6 +27,58 @@ public:
     virtual kern_return_t writeRegister(uint32_t offset, uint32_t value) LOCALONLY;
     virtual kern_return_t miiRead(uint8_t phy, uint8_t reg, uint16_t *value) LOCALONLY;
     virtual kern_return_t eepromRead(uint16_t offset, uint8_t *buf, size_t len) LOCALONLY;
+
+    /* Deprecated in the SDK but still pure virtual, so all nine must exist or the
+     * class will not instantiate. v1 implements none of them: no multicast
+     * filtering, no WoL, no media selection, no checksum offload. */
+    virtual kern_return_t SetInterfaceEnable(bool isEnable) override;
+    /* The live callback for ifconfig up/down -- distinct from the deprecated
+     * capital-S pure virtual above. */
+    virtual IOReturn      setInterfaceEnable(bool enable) override;
+
+    /* SetPromiscuousModeEnable is a TENTH pure virtual (iig:118). Unlike the other nine
+     * it is not marked __deprecated, and the class instantiated without it -- so "pure
+     * virtual means you must override it" is not the real mechanism. Overridden anyway
+     * because the deprecated/live split is the same as everywhere else, and M6's BPF tap
+     * work lands directly on it. */
+    virtual kern_return_t SetPromiscuousModeEnable(bool enable) override;
+    virtual IOReturn      setPromiscuousModeEnable(bool enable) override;
+
+    /* The MTU pair the stack actually calls. Overriding only the deprecated
+     * SetMTU/GetMaxTransferUnit left the 1500-only gate on a dead path, so the framework
+     * default would have accepted any MTU -- handing M5 frames larger than the
+     * 2048-byte pool buffers. */
+    virtual IOReturn      setMaxTransferUnit(uint32_t mtu) override;
+    virtual uint32_t      getMaxTransferUnit() override;
+    /* Serve the EEPROM MAC read by Start() to the network stack. LOCALONLY NDK_21
+     * per IOUserNetworkEthernet.iig:309. */
+    virtual kern_return_t getHardwareAddress(ether_addr_t *addr) override;
+    virtual IOReturn getSupportedMediaArray(MediaWord *mediaArray,
+                                            uint32_t *mediaCount) override;
+    /* The live getHardwareAssists returns the flags value directly (LOCALONLY NDK_21),
+     * not through a pointer parameter. It must override the base class default to
+     * prevent the stack from using offloads we do not implement. */
+    virtual uint32_t getHardwareAssists() override;
+    /* Experiment to suppress TSO advertisement. Declared per IOUserNetworkEthernet.iig:375
+     * (LOCALONLY NDK_22). Returns a zero-initialised struct if TSO options need to be
+     * explicitly suppressed. */
+    virtual IOReturn getTSOOptions(IOUserNetworkTSOOptions *options) override;
+    /* The live setHardwareAssists is called with the assists the stack wishes to enable.
+     * Per IOUserNetworkEthernet.iig:369 (LOCALONLY NDK_22). Logging the requested values
+     * is diagnostic; we support none of them. */
+    virtual IOReturn setHardwareAssists(uint32_t hardwareAssists, uint32_t hardwareAssistsMask) override;
+    /* These two must name deprecated SDK types, because the pure virtuals they
+     * override are themselves declared with them. See DK_CXXFLAGS in the Makefile
+     * for why -Wdeprecated-declarations is disabled for the dext. */
+    virtual kern_return_t SetMulticastAddresses(const IOUserNetworkMACAddress *addresses,
+                                                uint32_t count) override;
+    virtual kern_return_t SetAllMulticastModeEnable(bool enable) override;
+    virtual kern_return_t SelectMediaType(IOUserNetworkMediaType mediaType) override;
+    virtual kern_return_t SetWakeOnMagicPacketEnable(bool enable) override;
+    virtual kern_return_t SetMTU(uint32_t mtu) override;
+    virtual kern_return_t GetMaxTransferUnit(uint32_t *mtu) override;
+    virtual kern_return_t SetHardwareAssists(uint32_t hardwareAssists) override;
+    virtual kern_return_t GetHardwareAssists(uint32_t *hardwareAssists) override;
 };
 
 #endif /* SMSC95xxDriver_h */

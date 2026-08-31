@@ -39,6 +39,12 @@ exactly which values are device-specific and which are not.
 | `m3-dext-match.txt` | The M3 evidence: the dext loads, matches the LAN9500A, and reads its registers. Covers both provenance paths — EEPROM-loaded (`0424:9905`), where the real MAC is read and `Start()` succeeds, and auto-load-failed (`0424:9E00`), where the driver refuses. Also records the four requirements for a dext to load, each with the error it produces, and a list of causes already ruled out. See `dext/README.md` for how to build and load. |
 | `m3-attach-state.txt` | The USB device tree at clean attachment (before driver startup) — proves the device arrives unconfigured with no interface nodes, explaining why device-level matching is necessary. |
 
+### M4 network interface evidence
+
+| File | What it is |
+|---|---|
+| `m4-interface.txt` | The M4 evidence: the interface appears in `ifconfig` with the correct MAC read from EEPROM. Records the interface properties, link state behaviour, four NetworkingDriverKit facts that cost time to discover, an open item on advertised-but-unimplemented offloads, and the finding that the two EEPROM provenance signals can disagree. **M4 registers an interface but does not move frames** — there is no USB bulk transfer path until M5. See `dext/README.md` for networking personality details. |
+
 ## Reproducing a capture
 
 Use `tools/capture-usb-bringup.sh` on a Linux host. It starts a `usbmon` capture, waits for the

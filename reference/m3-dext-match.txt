@@ -98,10 +98,22 @@ configures the resulting bogus 4a:f8:f8:c2:c2:f2 and reports success; this refus
 Note also that ID_REV still reads 0x9E000002 in this state: it is the chip identity register and is
 unrelated to the USB product ID, which is what changes with EEPROM state.
 
-NOT YET EXERCISED ON HARDWARE: v1.2 added an explicit gate on the E2P_CMD LOADED bit, so a failed
-auto-load is now refused at that check rather than at the signature. The capture above predates it,
-and every power cycle since has auto-loaded successfully. The signature gate is proven; the LOADED
-gate is proven only by construction, being structurally identical and four lines long.
+PROVEN ON HARDWARE (M4): both branches of the LOADED gate have now been exercised, on separate
+power cycles. The refusal branch, captured at dext v1.6/16:
+
+    kernel: SMSC95xx: E2P_CMD auto-load NOT loaded
+    kernel: SMSC95xx: EEPROM auto-load did not complete; refusing to trust its contents
+    kernel: DK: SMSC95xxDriver::start(IOUSBHostDevice) fail
+
+and the pass branch on a later cycle, where LOADED was set and the SIGNATURE check then did the
+refusing -- see reference/m4-interface.txt section 3. The two captures prove different things and
+neither alone is sufficient: the first shows the gate refuses when the bit is clear, the second shows
+the gate is not sufficient on its own.
+
+CORRECTION: The two provenance signals can disagree. The capture in section 3 above shows both
+indicating failure (both LOADED clear AND signature bad), but they are **independent checks** and must
+both pass. During M4, LOADED was set while the signature read mis-clocked, proving they can disagree
+and neither is sufficient alone. Both checks are required.
 
 
 =======================================================================

@@ -40,14 +40,35 @@ COMMON       := ../common
 
 # iig rejects -arch and -target outright, and needs -D__IIG=1 or every SDK .iig
 # header fails to parse (KERNEL/LOCALONLY are gated on __IIG in OSObject.h).
-IIG_FLAGS    := -D__IIG=1 -x c++ -std=gnu++17 -isysroot $(DK_SDK)
+# -Wno-deprecated-declarations here too: iig parses this file itself and emits the
+# same deprecation diagnostics as clang. See DK_CXXFLAGS for why they are expected.
+IIG_FLAGS    := -D__IIG=1 -x c++ -std=gnu++17 -isysroot $(DK_SDK) -Wno-deprecated-declarations
 
+# -Wno-deprecated-declarations is deliberate. Source-level #pragma bracketing does work
+# for the declarations -- the SDK header does exactly that around its own -- but iig also
+# emits the affected declarations inside `#define ..._Methods \` continuations, where a
+# pragma cannot go, so a blanket flag is the practical option rather than the only one.
+#
+# THE COST, worth knowing before M5: this suppresses the warning across the whole dext, so
+# an accidental use of a deprecated API will not be flagged. That matters here because the
+# deprecated/live split is this project's recurring trap, and several M5-path methods are
+# deprecated: IOUserNetworkPacketBufferPool::Create, DeallocatePacket, DeallocatePackets
+# and SetTxPacketHeadroom. Check those by hand against the headers.
+#
+# IOUserNetworkEthernet declares nine methods that are simultaneously
+# __deprecated and pure virtual, so a subclass MUST override them to instantiate at
+# all, and two of them name deprecated types (IOUserNetworkMACAddress,
+# IOUserNetworkMediaType) in their signatures. iig then regenerates those
+# declarations into build/gen/SMSC95xxDriver.h, which no source-level pragma can
+# bracket. The driver otherwise uses the modern lowercase APIs throughout
+# (getHardwareAssists, reportLinkStatus, registerEthernetInterface), so this flag is
+# not covering up an accidental use of a deprecated call.
 DK_CXXFLAGS  := -target $(DK_TARGET) -isysroot $(DK_SDK) -std=gnu++17 \
-                -fno-exceptions -fno-rtti -Wall -Wextra -I$(GEN) -I$(COMMON)
+                -fno-exceptions -fno-rtti -Wall -Wextra -Wno-deprecated-declarations -I$(GEN) -I$(COMMON)
 DK_CFLAGS    := -target $(DK_TARGET) -isysroot $(DK_SDK) -std=c11 \
                 -Wall -Wextra -I$(COMMON)
 DK_LDFLAGS   := -target $(DK_TARGET) -isysroot $(DK_SDK) \
-                -framework DriverKit -framework USBDriverKit
+                -framework DriverKit -framework USBDriverKit -framework NetworkingDriverKit
 
 APP_CFLAGS   := -mmacosx-version-min=13.0 -fobjc-arc -Wall -Wextra
 APP_LDFLAGS  := -framework Foundation -framework SystemExtensions

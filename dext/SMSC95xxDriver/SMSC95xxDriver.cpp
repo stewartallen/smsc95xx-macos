@@ -12,10 +12,24 @@
 #include <USBDriverKit/IOUSBHostDevice.h>
 #include <USBDriverKit/IOUSBHostInterface.h>
 #include <USBDriverKit/AppleUSBDefinitions.h>
+#include <NetworkingDriverKit/IOUserNetworkEthernet.h>
+#include <NetworkingDriverKit/IOUserNetworkPacketBufferPool.h>
+#include <NetworkingDriverKit/IOUserNetworkTxSubmissionQueue.h>
+#include <NetworkingDriverKit/IOUserNetworkTxCompletionQueue.h>
+#include <NetworkingDriverKit/IOUserNetworkRxSubmissionQueue.h>
+#include <NetworkingDriverKit/IOUserNetworkRxCompletionQueue.h>
+#include <DriverKit/IODispatchQueue.h>
 
 #include "SMSC95xxDriver.h"
 #include "smsc95xx_regs.h"
 #include "smsc95xx_proto.h"
+
+/* One definition, used by both reportLinkStatus call sites and getSupportedMediaArray,
+ * so the advertised media and the reported active media cannot drift apart.
+ * 10BASE-T is the closest available word -- there is no 10BASE-T1S constant -- and the
+ * segment is genuinely half duplex. */
+#define SMSC95XX_MEDIA_WORD \
+    (kIOUserNetworkMediaEthernet10BaseT | kIOUserNetworkMediaOptionHalfDuplex)
 
 #define Log(fmt, ...) os_log(OS_LOG_DEFAULT, "SMSC95xx: " fmt, ##__VA_ARGS__)
 
@@ -23,7 +37,7 @@
 #define POLL_ATTEMPTS 100
 
 /* `device` is the matched provider; `interface` is copied from it in Start once the
- * device is configured. Both are populated in Task 6 -- the skeleton leaves them null.
+ * device is configured. Both are populated during Start().
  * `ctrlBuffer` is a 4-byte IOBufferMemoryDescriptor used for all vendor control
  * transfers (reads and writes). `ctrlBytes` is the mapped address of ctrlBuffer. */
 struct SMSC95xxDriver_IVars {
@@ -35,6 +49,16 @@ struct SMSC95xxDriver_IVars {
      * while unopened. Closing in that state would unbalance IOKit's opener
      * accounting, so track the two facts separately. */
     bool                     interfaceOpened;
+    /* The stack fetches the MAC through getHardwareAddress() rather than as a
+     * registration argument, so the validated bytes have to outlive Start(). */
+    uint8_t                  macAddress[SMSC95XX_MAC_LEN];
+    bool                     macValid;
+    IODispatchQueue                *netDispatchQueue;
+    IOUserNetworkPacketBufferPool  *pool;
+    IOUserNetworkTxSubmissionQueue *txSubmit;
+    IOUserNetworkRxSubmissionQueue *rxSubmit;
+    IOUserNetworkTxCompletionQueue *txComplete;
+    IOUserNetworkRxCompletionQueue *rxComplete;
 };
 
 /* Private helper for tearing down resources on Start() failure or Stop(). */
@@ -232,10 +256,21 @@ CopyFirstInterface(IOUSBHostDevice *device, IOUSBHostInterface **out)
 
 /* Teardown path for partial Start() failures. Must be safe to call after any
  * subset of ivars has been populated. Called from both the fail: label in Start()
- * and from Stop(). */
+ * and from Stop(). Release the four queues before the pool: they hold references
+ * to it, and tearing the pool down first is the kind of ordering bug that only
+ * shows up on an error path. Release the dispatch queue last. */
 static kern_return_t
 TearDown(SMSC95xxDriver *driver, IOService *provider __unused)
 {
+    /* Release queues before the pool (they hold references to it). */
+    OSSafeReleaseNULL(driver->ivars->txSubmit);
+    OSSafeReleaseNULL(driver->ivars->rxSubmit);
+    OSSafeReleaseNULL(driver->ivars->txComplete);
+    OSSafeReleaseNULL(driver->ivars->rxComplete);
+
+    /* Release the pool after the queues. */
+    OSSafeReleaseNULL(driver->ivars->pool);
+
     if (driver->ivars->interface != nullptr) {
         if (driver->ivars->interfaceOpened) {
             driver->ivars->interface->Close(driver, 0);
@@ -251,6 +286,10 @@ TearDown(SMSC95xxDriver *driver, IOService *provider __unused)
          * second TearDown cannot issue a second Close. */
         driver->ivars->device = nullptr;
     }
+
+    /* Release the dispatch queue last. */
+    OSSafeReleaseNULL(driver->ivars->netDispatchQueue);
+
     return kIOReturnSuccess;
 }
 
@@ -485,6 +524,13 @@ IMPL(SMSC95xxDriver, Start)
         Log("MAC %02x:%02x:%02x:%02x:%02x:%02x",
             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
+        /* All provenance checks have passed: copy the validated MAC to ivars so it
+         * can be served via getHardwareAddress() to the network stack. */
+        for (int i = 0; i < SMSC95XX_MAC_LEN; i++) {
+            ivars->macAddress[i] = mac[i];
+        }
+        ivars->macValid = true;
+
         /* Publish MAC and EEPROM status to ioreg */
         OSDictionary *props = OSDictionary::withCapacity(2);
         if (props != nullptr) {
@@ -507,6 +553,78 @@ IMPL(SMSC95xxDriver, Start)
         }
     }
 
+    /* We pass this queue to the four Create() calls ourselves, which is why no
+     * TxDispatchQueue/RxDispatchQueue entry is needed in Info.plist. */
+    ret = IODispatchQueue::Create("SMSC95xxNetQueue", 0, 0, &ivars->netDispatchQueue);
+    if (ret != kIOReturnSuccess) {
+        Log("dispatch queue creation failed: 0x%x", ret);
+        goto fail;
+    }
+
+    {
+        /* 64 packets of 2048 bytes: comfortably above the 1514-byte maximum frame
+         * plus the 8-byte TX command header and the 4-byte RX status word, on a
+         * 10 Mb/s half-duplex segment where depth buys nothing. */
+        IOUserNetworkPacketBufferPoolOptions options = {};
+        options.packetCount         = 64;
+        options.bufferCount         = 64;
+        options.bufferSize          = 2048;
+        options.maxBuffersPerPacket = 1;
+
+        ret = IOUserNetworkPacketBufferPool::CreateWithOptions(this, "SMSC95xxPool",
+                                                              &options, &ivars->pool);
+        if (ret != kIOReturnSuccess) {
+            Log("packet buffer pool creation failed: 0x%x", ret);
+            goto fail;
+        }
+    }
+
+    ret = IOUserNetworkTxSubmissionQueue::Create(ivars->pool, this, 64, 0,
+                                                ivars->netDispatchQueue, &ivars->txSubmit);
+    if (ret != kIOReturnSuccess) { Log("TX submission queue failed: 0x%x", ret); goto fail; }
+
+    ret = IOUserNetworkTxCompletionQueue::Create(ivars->pool, this, 64, 0,
+                                                ivars->netDispatchQueue, &ivars->txComplete);
+    if (ret != kIOReturnSuccess) { Log("TX completion queue failed: 0x%x", ret); goto fail; }
+
+    ret = IOUserNetworkRxSubmissionQueue::Create(ivars->pool, this, 64, 0,
+                                                ivars->netDispatchQueue, &ivars->rxSubmit);
+    if (ret != kIOReturnSuccess) { Log("RX submission queue failed: 0x%x", ret); goto fail; }
+
+    ret = IOUserNetworkRxCompletionQueue::Create(ivars->pool, this, 64, 0,
+                                                ivars->netDispatchQueue, &ivars->rxComplete);
+    if (ret != kIOReturnSuccess) { Log("RX completion queue failed: 0x%x", ret); goto fail; }
+
+    Log("pool and four queues created");
+
+    {
+        /* NDK_22 lowercase overload: no MAC argument -- the stack calls
+         * getHardwareAddress() instead. One pool serves both directions, which the
+         * header explicitly permits. Submission queues first, then completion. */
+        IOUserNetworkPacketQueue *queues[4] = {
+            ivars->txSubmit, ivars->rxSubmit, ivars->txComplete, ivars->rxComplete
+        };
+
+        ret = registerEthernetInterface(queues, 4, ivars->pool, ivars->pool);
+        if (ret != kIOReturnSuccess) {
+            Log("registerEthernetInterface failed: 0x%x", ret);
+            goto fail;
+        }
+        Log("ethernet interface registered");
+    }
+
+    /* Report active while the dongle is attached. A T1S multidrop segment without
+     * PLCA carries no continuous link-integrity signal, so there is nothing truthful
+     * to poll: BMSR bit 2 reads set with the cable unplugged (measured at M2) and must
+     * never be presented as link truth. 10BASE-T is the closest available media word --
+     * there is no 10BASE-T1S constant -- and the link is genuinely half duplex. */
+    ret = reportLinkStatus(kIOUserNetworkLinkStatusActive,
+                           SMSC95XX_MEDIA_WORD);
+    if (ret != kIOReturnSuccess) {
+        Log("reportLinkStatus failed: 0x%x", ret);
+        goto fail;
+    }
+
     ret = RegisterService();
     if (ret != kIOReturnSuccess) {
         Log("RegisterService failed: 0x%x", ret);
@@ -526,4 +644,224 @@ IMPL(SMSC95xxDriver, Stop)
     Log("Stop");
     ::TearDown(this, provider);
     return Stop(provider, SUPERDISPATCH);
+}
+
+/* There are TWO of these and they are easy to confuse. The capital-S
+ * SetInterfaceEnable is the deprecated form (iig:114); the lowercase setInterfaceEnable
+ * (iig:205, LOCALONLY NDK_21) is the live one, and it is the one observed being called on
+ * `ifconfig up`/`down`. This stub returns success so it cannot be the thing that blocks a
+ * bring-up, but its return value has never been seen to matter. */
+kern_return_t
+SMSC95xxDriver::SetInterfaceEnable_Impl(bool isEnable __unused)
+{
+    return kIOReturnSuccess;
+}
+
+/* Deprecated form: exists so the class matches the SDK's declaration. The stack calls
+ * the lowercase one below. */
+kern_return_t
+SMSC95xxDriver::SetPromiscuousModeEnable_Impl(bool enable __unused)
+{
+    return kIOReturnSuccess;
+}
+
+IOReturn
+SMSC95xxDriver::setPromiscuousModeEnable(bool enable)
+{
+    /* Accepted but NOT yet acted on: this dext programs no MAC filter, because it never
+     * writes MAC_CR. Returning success is therefore a promise M5 has to keep by setting
+     * MAC_CR.PRMS. Logged so the gap is visible rather than assumed. */
+    Log("setPromiscuousModeEnable(%{public}s) -- accepted, but no MAC filter is programmed yet",
+        enable ? "true" : "false");
+    return kIOReturnSuccess;
+}
+
+/* The live MTU pair. v1 carries exactly one MTU: the pool buffers are 2048 bytes and
+ * there is no scatter-gather, so anything larger cannot be transmitted. */
+IOReturn
+SMSC95xxDriver::setMaxTransferUnit(uint32_t mtu)
+{
+    if (mtu != 1500) {
+        Log("setMaxTransferUnit(%u) refused -- only 1500 is supported", mtu);
+        return kIOReturnUnsupported;
+    }
+    return kIOReturnSuccess;
+}
+
+uint32_t
+SMSC95xxDriver::getMaxTransferUnit()
+{
+    return 1500;
+}
+
+IOReturn
+SMSC95xxDriver::setInterfaceEnable(bool enable)
+{
+    Log("setInterfaceEnable(%{public}s)", enable ? "true" : "false");
+    if (enable) {
+        /* Report the link active when the stack brings the interface up, not just at
+         * registration time. A link status reported during Start() is discarded because
+         * the interface is not yet enabled; this call happens when the user (or the
+         * system) actually enables it via ifconfig or similar. */
+        IOReturn ret = reportLinkStatus(kIOUserNetworkLinkStatusActive,
+                                       kIOUserNetworkMediaEthernet10BaseT |
+                                       kIOUserNetworkMediaOptionHalfDuplex);
+        if (ret != kIOReturnSuccess) {
+            Log("reportLinkStatus in setInterfaceEnable failed: 0x%x", ret);
+            return ret;
+        }
+    }
+    return kIOReturnSuccess;
+}
+
+kern_return_t
+SMSC95xxDriver::SetMulticastAddresses_Impl(const IOUserNetworkMACAddress *addresses __unused,
+                                           uint32_t count __unused)
+{
+    /* v1 has no multicast filtering. NOTE: this dext programs no MAC filter at all --
+     * it never writes MAC_CR -- so refusing here is not currently backed by promiscuous
+     * hardware. M5 must set MAC_CR (RXEN, and PRMS or real hash filtering) before this
+     * return value can be called safe. */
+    return kIOReturnUnsupported;
+}
+
+kern_return_t
+SMSC95xxDriver::SetAllMulticastModeEnable_Impl(bool enable __unused)
+{
+    /* v1 has no multicast filtering. NOTE: this dext programs no MAC filter at all --
+     * it never writes MAC_CR -- so refusing here is not currently backed by promiscuous
+     * hardware. M5 must set MAC_CR (RXEN, and PRMS or real hash filtering) before this
+     * return value can be called safe. */
+    return kIOReturnUnsupported;
+}
+
+kern_return_t
+SMSC95xxDriver::SelectMediaType_Impl(IOUserNetworkMediaType mediaType __unused)
+{
+    return kIOReturnUnsupported;
+}
+
+kern_return_t
+SMSC95xxDriver::SetWakeOnMagicPacketEnable_Impl(bool enable __unused)
+{
+    return kIOReturnUnsupported;
+}
+
+kern_return_t
+SMSC95xxDriver::SetMTU_Impl(uint32_t mtu)
+{
+    /* Accept only the standard MTU; claiming success for anything else would let
+     * the stack send frames the hardware path cannot carry. */
+    return (mtu == 1500) ? kIOReturnSuccess : kIOReturnUnsupported;
+}
+
+kern_return_t
+SMSC95xxDriver::GetMaxTransferUnit_Impl(uint32_t *mtu)
+{
+    if (mtu == nullptr) {
+        return kIOReturnBadArgument;
+    }
+    *mtu = 1500;                 /* v1 has no jumbo support */
+    return kIOReturnSuccess;
+}
+
+kern_return_t
+SMSC95xxDriver::SetHardwareAssists_Impl(uint32_t hardwareAssists __unused)
+{
+    return kIOReturnUnsupported;
+}
+
+kern_return_t
+SMSC95xxDriver::GetHardwareAssists_Impl(uint32_t *hardwareAssists)
+{
+    if (hardwareAssists == nullptr) {
+        return kIOReturnBadArgument;
+    }
+    *hardwareAssists = 0;        /* no checksum offload, no TSO, no VLAN -- v1 scope */
+    return kIOReturnSuccess;
+}
+
+/* Verified against IOUserNetworkEthernet.iig:309 --
+ *   getHardwareAddress(ether_addr_t *addr) LOCALONLY NDK_21
+ * ether_addr_t is 6 bytes (octet[6]); it is not the same type as the deprecated
+ * IOUserNetworkMACAddress used by the older RegisterEthernetInterface overload. */
+kern_return_t
+SMSC95xxDriver::getHardwareAddress(ether_addr_t *addr)
+{
+    if (addr == nullptr) {
+        return kIOReturnBadArgument;
+    }
+    if (!ivars->macValid) {
+        /* Never hand back a zero or synthesised address: refusing is what keeps a
+         * mis-clocked EEPROM read from reaching the network stack. */
+        Log("getHardwareAddress before a validated MAC was available");
+        return kIOReturnNotReady;
+    }
+    /* A loop, not memcpy: the dext currently pulls in no string.h, and there is no
+     * reason to add a platform header for six bytes. */
+    for (int i = 0; i < SMSC95XX_MAC_LEN; i++) {
+        addr->octet[i] = ivars->macAddress[i];
+    }
+    return kIOReturnSuccess;
+}
+
+/* IOUserNetworkEthernet.iig:185 --
+ *   getSupportedMediaArray(MediaWord *mediaArray, uint32_t *mediaCount) LOCALONLY NDK_21
+ * One entry only: 10BASE-T half duplex. BMSR bit 3 is clear on both dongles, so there
+ * is no autonegotiation and nothing else honest to offer. */
+IOReturn
+SMSC95xxDriver::getSupportedMediaArray(MediaWord *mediaArray, uint32_t *mediaCount)
+{
+    if (mediaCount == nullptr) {
+        return kIOReturnBadArgument;
+    }
+
+    /* mediaCount is an output field, not a capacity field. The stack always provides
+     * a non-null array and we write exactly one entry, setting the count to 1. */
+    if (mediaArray != nullptr) {
+        mediaArray[0] = SMSC95XX_MEDIA_WORD;
+        *mediaCount   = 1;
+        return kIOReturnSuccess;
+    }
+
+    /* If mediaArray is null (should not happen), report the count anyway for safety. */
+    *mediaCount = 1;
+    return kIOReturnSuccess;
+}
+
+/* Return 0 to prevent the stack from using offloads we do not implement.
+ * The deprecated capital-G GetHardwareAssists_Impl is not called by the stack;
+ * this is the live method per IOUserNetworkEthernet.iig:228 (LOCALONLY NDK_21). */
+uint32_t
+SMSC95xxDriver::getHardwareAssists()
+{
+    Log("getHardwareAssists: returning 0 (no offloads)");
+    return 0;
+}
+
+/* Experiment: test whether explicit TSO options suppress the offload flags.
+ * Per IOUserNetworkEthernet.iig:375 (LOCALONLY NDK_22). Returns a zero-initialised
+ * struct, which should advertise that we support no TSO. */
+IOReturn
+SMSC95xxDriver::getTSOOptions(IOUserNetworkTSOOptions *options)
+{
+    if (options == nullptr) {
+        return kIOReturnBadArgument;
+    }
+    /* Zero the WHOLE struct: it is a union of {tso_mtu4, tso_mtu6} plus a 56-byte
+     * reserved tail, so assigning the two named fields would leave 56 caller-provided
+     * bytes untouched while claiming to be zero-initialised. */
+    *options = IOUserNetworkTSOOptions{};
+    return kIOReturnSuccess;
+}
+
+/* Diagnostic: log what assist capabilities the stack requests, and reject them.
+ * Per IOUserNetworkEthernet.iig:369 (LOCALONLY NDK_22). The requested bitmask
+ * alone tells us what the family thinks it should enable, which is useful for
+ * M5's integration test. We support none of them. */
+IOReturn
+SMSC95xxDriver::setHardwareAssists(uint32_t hardwareAssists, uint32_t hardwareAssistsMask)
+{
+    Log("setHardwareAssists: requested=0x%08x, mask=0x%08x", hardwareAssists, hardwareAssistsMask);
+    return kIOReturnUnsupported;
 }

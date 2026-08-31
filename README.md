@@ -293,12 +293,22 @@ entirely and also give byte-exact control for validating TX/RX framing.
 | M1 | Probe reads `ID_REV`, PHY registers, EEPROM MAC — **done** |
 | M2 | Probe does full init, transmits one frame, receives one frame — **done** |
 | M3 | Dext loads and matches the device in `ioreg` — **done** |
-| M4 | Interface appears in `ifconfig` with the EEPROM MAC |
-| M5 | Frames cross the T1S link to the Pi |
+| M4 | Interface appears in `ifconfig` with the EEPROM MAC — **done** |
+| M5 | Frames cross the T1S link to the Pi — also splits the driver in two (see below) |
 | M6 | `tcpdump` works via the BPF tap; throughput measured |
 
 Throughput expectations should stay modest: the segment is 10 Mb/s half-duplex, and the media
 converter rate-adapts from 100BASE-TX, so loss under load is expected.
+
+**Planned for M5: split into two drivers.** Today one class matches `IOUSBHostDevice`, configures the
+device and owns the networking. M5 splits that into a device-level personality that only selects the
+configuration, plus an interface-level personality matching the resulting `IOUSBHostInterface` that owns
+the pipes and the network interface — the structure Apple's own USB Ethernet dext uses. The bulk
+endpoints live on the interface rather than the device, so this is the natural shape for the datapath,
+and it also fixes the interface's display name: SystemConfiguration names a USB network interface from
+`kUSBProductString` found while walking the provider chain, and needs an `IOUSBHostInterface` in that
+chain to find it. Attached directly to the device, the interface shows as `Ethernet Adapter (enN)`
+instead of the dongle's product name. See `reference/m4-interface.txt` for what was ruled out.
 
 ### v1 scope
 

@@ -15,13 +15,13 @@
 	<key>CFBundlePackageType</key>
 	<string>DEXT</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.4</string>
+	<string>2.4</string>
 	<key>CFBundleSupportedPlatforms</key>
 	<array>
 		<string>DriverKit</string>
 	</array>
 	<key>CFBundleVersion</key>
-	<string>14</string>
+	<string>24</string>
 	<key>IOKitPersonalities</key>
 	<dict>
 		<key>EVB-LAN8670-USB</key>
@@ -29,9 +29,9 @@
 			<key>CFBundleIdentifier</key>
 			<string>com.github.stewartallen.smsc95xx.driver</string>
 			<key>CFBundleIdentifierKernel</key>
-			<string>com.apple.kpi.iokit</string>
+			<string>com.apple.iokit.IOSkywalkFamily</string>
 			<key>IOClass</key>
-			<string>IOUserService</string>
+			<string>IOUserNetworkEthernet</string>
 			<key>IOProbeScore</key>
 			<integer>100000</integer>
 			<key>IOProviderClass</key>
@@ -50,9 +50,9 @@
 			<key>CFBundleIdentifier</key>
 			<string>com.github.stewartallen.smsc95xx.driver</string>
 			<key>CFBundleIdentifierKernel</key>
-			<string>com.apple.kpi.iokit</string>
+			<string>com.apple.iokit.IOSkywalkFamily</string>
 			<key>IOClass</key>
-			<string>IOUserService</string>
+			<string>IOUserNetworkEthernet</string>
 			<key>IOProbeScore</key>
 			<integer>100000</integer>
 			<key>IOProviderClass</key>
@@ -71,9 +71,9 @@
 			<key>CFBundleIdentifier</key>
 			<string>com.github.stewartallen.smsc95xx.driver</string>
 			<key>CFBundleIdentifierKernel</key>
-			<string>com.apple.kpi.iokit</string>
+			<string>com.apple.iokit.IOSkywalkFamily</string>
 			<key>IOClass</key>
-			<string>IOUserService</string>
+			<string>IOUserNetworkEthernet</string>
 			<key>IOProbeScore</key>
 			<integer>100000</integer>
 			<key>IOProviderClass</key>
@@ -90,6 +90,11 @@
 	</dict>
 	<key>NSHumanReadableCopyright</key>
 	<string>GPL-2.0</string>
+	<key>OSBundleLibraries</key>
+	<dict>
+		<key>com.apple.iokit.IOSkywalkFamily</key>
+		<string>1.0</string>
+	</dict>
 	<key>OSBundleRequired</key>
 	<string>DriverKit</string>
 	<key>OSBundleUsageDescription</key>
