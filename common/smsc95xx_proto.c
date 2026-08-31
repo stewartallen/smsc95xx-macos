@@ -123,3 +123,85 @@ bool smsc95xx_rx_next(const uint8_t *buf, size_t len, size_t *offset,
     *offset = at + used + ((4 - (used % 4)) % 4);
     return true;
 }
+
+static bool parse_hex16(const char *s, const char *end, uint16_t *out)
+{
+    uint32_t v = 0;
+    if (s == end) {
+        return false;
+    }
+    if ((size_t)(end - s) > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+        s += 2;
+        if (s == end) {
+            return false;
+        }
+    }
+    for (; s != end; s++) {
+        uint32_t d;
+        if (*s >= '0' && *s <= '9')      { d = (uint32_t)(*s - '0'); }
+        else if (*s >= 'a' && *s <= 'f') { d = (uint32_t)(*s - 'a') + 10u; }
+        else if (*s >= 'A' && *s <= 'F') { d = (uint32_t)(*s - 'A') + 10u; }
+        else                             { return false; }
+        v = (v << 4) | d;
+        if (v > 0xFFFFu) {
+            return false;
+        }
+    }
+    *out = (uint16_t)v;
+    return true;
+}
+
+bool smsc95xx_parse_vid_pid(const char *s, uint16_t *vid, uint16_t *pid)
+{
+    const char *colon;
+    uint16_t v, p;
+
+    if (s == NULL || vid == NULL || pid == NULL) {
+        return false;
+    }
+    colon = s;
+    while (*colon != '\0' && *colon != ':') {
+        colon++;
+    }
+    if (*colon != ':') {
+        return false;
+    }
+    /* A second colon lands in the pid field and parse_hex16 rejects it as non-hex. */
+    const char *pid_end = colon + 1;
+    while (*pid_end != '\0') {
+        pid_end++;
+    }
+    if (!parse_hex16(s, colon, &v) || !parse_hex16(colon + 1, pid_end, &p)) {
+        return false;
+    }
+    *vid = v;
+    *pid = p;
+    return true;
+}
+
+smsc95xx_mac_check
+smsc95xx_mac_plausible(const uint8_t mac[6])
+{
+    bool all_zeros = true, all_ones = true;
+    int i;
+
+    for (i = 0; i < 6; i++) {
+        if (mac[i] != 0x00) {
+            all_zeros = false;
+        }
+        if (mac[i] != 0xFF) {
+            all_ones = false;
+        }
+    }
+    if (all_zeros) {
+        return SMSC95XX_MAC_ALL_ZEROS;
+    }
+    if (all_ones) {
+        return SMSC95XX_MAC_ALL_ONES;
+    }
+    /* Bit 0 of the first octet is the group bit; a source address must be unicast. */
+    if (mac[0] & 0x01) {
+        return SMSC95XX_MAC_MULTICAST;
+    }
+    return SMSC95XX_MAC_PLAUSIBLE;
+}

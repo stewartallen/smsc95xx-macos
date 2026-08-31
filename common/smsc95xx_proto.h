@@ -14,6 +14,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* Build the MII_ADDR register value that starts a PHY register access.
  * Always sets MII_BUSY; sets MII_WRITE when `write` is true. */
 uint32_t smsc95xx_mii_addr_word(uint8_t phy, uint8_t reg, bool write);
@@ -69,5 +73,31 @@ size_t smsc95xx_tx_prepend(uint8_t *buf, size_t buflen, size_t frame_len);
 bool smsc95xx_rx_next(const uint8_t *buf, size_t len, size_t *offset,
                       const uint8_t **frame, size_t *frame_len,
                       uint32_t *status);
+
+/* Parse "vid:pid" (hex, optional 0x prefixes) into two 16-bit values.
+ * Returns false and leaves output arguments untouched on any malformed input. */
+bool smsc95xx_parse_vid_pid(const char *s, uint16_t *vid, uint16_t *pid);
+
+/* Why a MAC read out of EEPROM must be rejected even though the 0xA5 signature
+ * matched. The signature is the real gate; these are a guard against a signature
+ * byte that matched by accident.
+ *
+ * Note what is deliberately NOT rejected: a locally-administered address. The
+ * known-bad MAC this hardware produces when its EEPROM mis-clocks,
+ * 4a:f8:f8:c2:c2:f2, is locally administered but unicast, so it passes every
+ * pattern check here. That is precisely why provenance, not plausibility, decides
+ * whether an address is trustworthy. */
+typedef enum {
+    SMSC95XX_MAC_PLAUSIBLE = 0,
+    SMSC95XX_MAC_ALL_ZEROS,
+    SMSC95XX_MAC_ALL_ONES,
+    SMSC95XX_MAC_MULTICAST
+} smsc95xx_mac_check;
+
+smsc95xx_mac_check smsc95xx_mac_plausible(const uint8_t mac[6]);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* SMSC95XX_PROTO_H */

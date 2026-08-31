@@ -291,8 +291,8 @@ entirely and also give byte-exact control for validating TX/RX framing.
 |---|---|
 | M0 | Repo, README, characterized hardware reference — **done** |
 | M1 | Probe reads `ID_REV`, PHY registers, EEPROM MAC — **done** |
-| M2 | Probe does full init, transmits one frame, receives one frame |
-| M3 | Dext loads and matches the device in `ioreg` |
+| M2 | Probe does full init, transmits one frame, receives one frame — **done** |
+| M3 | Dext loads and matches the device in `ioreg` — **done** |
 | M4 | Interface appears in `ifconfig` with the EEPROM MAC |
 | M5 | Frames cross the T1S link to the Pi |
 | M6 | `tcpdump` works via the BPF tap; throughput measured |
@@ -312,28 +312,55 @@ parsing, so v1 leaves it off.
 ## Repository layout
 
 ```
+common/       The pure protocol layer: register offsets, bit layouts, TX/RX framing,
+              MAC plausibility. No I/O, no allocation, no platform headers, and
+              C++-safe, so the probe and the driver share exactly one copy.
+dext/         The DriverKit extension and the host app that installs it.
+              See dext/README.md for building, loading and debugging.
 reference/    Captured hardware ground truth for both devices — usbmon pcaps,
-              decoded register traces, USB descriptors, Linux driver reports.
-              See reference/README.md.
-tools/        decode-usbmon.py      turn a usbmon pcap into a named register trace
+              decoded register traces, USB descriptors, Linux driver reports,
+              and the M3 load/match evidence. See reference/README.md.
+tools/        decode-usbmon.py        turn a usbmon pcap into a named register trace
               capture-usb-bringup.sh  capture a device's bring-up on a Linux host
-              smsc95xx-probe/       userspace protocol validation (to come)
+              smsc95xx-probe/         userspace protocol validation against real hardware
+              usb-reenumerate/        force a USB re-enumeration so IOKit re-runs matching
 ```
 
 ### Device matching
 
-Two personalities, matching `IOUSBHostInterface`:
+Three personalities, matching `IOUSBHostDevice` (not `IOUSBHostInterface`):
 
-| | `idVendor` | `idProduct` | `bInterfaceClass` | `bConfigurationValue` | `bInterfaceNumber` |
-|---|---|---|---|---|---|
-| MACH | `0x0424` | `0x9E00` | 255 | 1 | 0 |
-| EVB | `0x184F` | `0x0051` | 255 | 1 | 0 |
+| | `idVendor` | `idProduct` | Notes |
+|---|---|---|---|
+| MACH (normal) | `0x0424` | `0x9905` | EEPROM auto-load succeeded; device strings present |
+| MACH (EEPROM failed) | `0x0424` | `0x9E00` | EEPROM auto-load failed; generic LAN9500A default |
+| EVB | `0x184F` | `0x0051` | Microchip reference board |
+
+**Why `IOUSBHostDevice` and not `IOUSBHostInterface`:** macOS leaves this device unconfigured
+at attach time. An unconfigured device has no interface nodes in the IOKit tree, only a device
+node. A personality matching `IOUSBHostInterface` would build, sign, install, and then silently
+never match, because no interface exists to match against. The driver selects configuration 1
+in its `Start()` method and copies interface 0. See `reference/m3-attach-state.txt` for the
+measured unconfigured state, and `reference/m3-dext-match.txt` for the evidence that device-level
+matching works on hardware.
+
+**`0x0424:0x9905` vs `0x9E00`:** On this hardware unit the EEPROM auto-load sometimes fails
+(cause not established). When it succeeds (normal case), the device reports `0x9905` with
+strings; when it fails, it reports the generic LAN9500A default `0x9E00` without strings. Both
+are the same physical chip, so the driver must match both IDs. The normal state is `0x9905`.
+See `README.md` "The MAC in the captured trace is wrong, and the EEPROM signature is the only
+way to tell" for full analysis.
 
 Note that `0x0424:0x9E00` is the generic LAN9500A/LAN9500Ai ID, so that personality will match
 *any* LAN9500A-based adapter, not only the MACH dongle. On a conventional 10/100 adapter the
 internal PHY is in use and the link is autonegotiated, which this driver does not implement —
-so such a device would bind but not necessarily work. Narrowing that personality is worth
-revisiting once there is hardware to test against.
+so such a device would bind. That is mitigated rather than open: `Start()` reads `BMSR` and refuses
+any PHY advertising autonegotiation capability (bit 3), which is exactly what an internal-PHY
+10/100BASE-TX adapter does and what a 10BASE-T1S PHY does not. Both supported dongles read
+`BMSR 0x0805` and pass; an unsupported adapter is left unclaimed rather than half-working.
+
+Narrowing the personality itself would still be preferable, but it cannot be done on vendor/product ID
+alone — `0424:9E00` is the chip default and genuinely shared.
 
 ---
 

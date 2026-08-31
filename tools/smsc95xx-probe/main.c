@@ -180,26 +180,19 @@ static int resolve_mac(usb_device *d, const char *override_mac,
         return 1;
     }
 
-    /* Signature matched, so the read is trustworthy. Pattern checks below are a
-     * belt-and-braces guard against a signature byte that matched by accident. */
-    bool all_zeros = true, all_ones = true;
-    for (int i = 0; i < SMSC95XX_MAC_LEN; i++) {
-        if (mac[i] != 0x00)
-            all_zeros = false;
-        if (mac[i] != 0xFF)
-            all_ones = false;
+    /* Signature matched, so the read is trustworthy. The plausibility checks are a
+     * belt-and-braces guard against a signature byte that matched by accident;
+     * they live in the pure layer so the driver applies exactly the same policy. */
+    const char *why = NULL;
+    switch (smsc95xx_mac_plausible(mac)) {
+    case SMSC95XX_MAC_PLAUSIBLE:                       break;
+    case SMSC95XX_MAC_ALL_ZEROS: why = "all zeros";    break;
+    case SMSC95XX_MAC_ALL_ONES:  why = "all ones";     break;
+    case SMSC95XX_MAC_MULTICAST: why = "multicast";    break;
     }
-    if (all_zeros || all_ones) {
-        fprintf(stderr, "EEPROM signature matched but MAC is invalid: "
-                "%02x:%02x:%02x:%02x:%02x:%02x\n",
-                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-        return 1;
-    }
-
-    /* Reject multicast source addresses (bit 0 of first octet). */
-    if (mac[0] & 0x01) {
-        fprintf(stderr, "EEPROM signature matched but MAC is multicast: "
-                "%02x:%02x:%02x:%02x:%02x:%02x\n",
+    if (why != NULL) {
+        fprintf(stderr, "EEPROM signature matched but MAC is %s: "
+                "%02x:%02x:%02x:%02x:%02x:%02x\n", why,
                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
         return 1;
     }
@@ -426,14 +419,18 @@ static int cmd_rx(usb_device *d, const char *override_mac)
 static void usage(const char *argv0)
 {
     fprintf(stderr,
-        "usage: %s <id|phy|eeprom|init|tx|rx|all> [--mac aa:bb:cc:dd:ee:ff]\n"
+        "usage: %s <id|phy|eeprom|init|tx|rx|all> [options]\n"
         "\n"
-        "Reads and drives a LAN9500A over USB. Tries the MACH SYSTEMS dongle\n"
+        "Reads and drives a LAN9500A over USB. By default tries the MACH SYSTEMS dongle\n"
         "(%04x:%04x and %04x:%04x) then the Microchip EVB (%04x:%04x).\n"
         "\n"
-        "  --mac  Override the station address. Needed only when the EEPROM\n"
-        "         signature does not verify; without it those commands refuse\n"
-        "         to run rather than use a possibly-wrong address.\n",
+        "Options (can appear in any position relative to the subcommand):\n"
+        "  --device vid:pid   Open the device with the given USB IDs (in hex).\n"
+        "                     If omitted, tries each supported device in order.\n"
+        "  --mac aa:bb:cc...  Override the station address. Needed only when the\n"
+        "                     EEPROM signature does not verify; without it those\n"
+        "                     commands refuse to run rather than use a possibly-wrong\n"
+        "                     address.\n",
         argv0,
         SMSC95XX_VID_MACH, SMSC95XX_PID_MACH_EE,
         SMSC95XX_VID_MACH, SMSC95XX_PID_MACH,
@@ -445,39 +442,89 @@ int main(int argc, char **argv)
     /* Line-buffer stdout so stderr errors appear in order when redirected. */
     setvbuf(stdout, NULL, _IOLBF, 0);
 
-    if (argc < 2 || argc > 4) {
+    if (argc < 2) {
         usage(argv[0]);
         return 2;
     }
 
-    /* Parse optional --mac argument. */
+    /* Parse optional --device and --mac arguments in any position.
+     * Scan all argv, consume options with their values, and collect
+     * remaining non-option arguments. There must be exactly one: the subcommand. */
     const char *override_mac = NULL;
-    if (argc == 4) {
-        if (strcmp(argv[2], "--mac") != 0) {
+    const char *device_selector = NULL;
+    const char *subcommand = NULL;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--device") == 0) {
+            if (i + 1 >= argc) {
+                usage(argv[0]);
+                return 2;
+            }
+            if (device_selector != NULL) {
+                /* Repeated --device option. */
+                usage(argv[0]);
+                return 2;
+            }
+            device_selector = argv[i + 1];
+            i++;
+        } else if (strcmp(argv[i], "--mac") == 0) {
+            if (i + 1 >= argc) {
+                usage(argv[0]);
+                return 2;
+            }
+            if (override_mac != NULL) {
+                /* Repeated --mac option. */
+                usage(argv[0]);
+                return 2;
+            }
+            override_mac = argv[i + 1];
+            i++;
+        } else if (argv[i][0] == '-') {
+            /* Unknown option starting with dash. */
             usage(argv[0]);
             return 2;
+        } else {
+            /* Non-option argument; must be the subcommand. */
+            if (subcommand != NULL) {
+                /* Multiple subcommands given. */
+                usage(argv[0]);
+                return 2;
+            }
+            subcommand = argv[i];
         }
-        override_mac = argv[3];
-    } else if (argc == 3) {
+    }
+
+    if (subcommand == NULL) {
         usage(argv[0]);
         return 2;
     }
 
     /* Validate subcommand before opening the device. */
-    if (strcmp(argv[1], "id") != 0 &&
-        strcmp(argv[1], "phy") != 0 &&
-        strcmp(argv[1], "eeprom") != 0 &&
-        strcmp(argv[1], "init") != 0 &&
-        strcmp(argv[1], "tx") != 0 &&
-        strcmp(argv[1], "rx") != 0 &&
-        strcmp(argv[1], "all") != 0) {
+    if (strcmp(subcommand, "id") != 0 &&
+        strcmp(subcommand, "phy") != 0 &&
+        strcmp(subcommand, "eeprom") != 0 &&
+        strcmp(subcommand, "init") != 0 &&
+        strcmp(subcommand, "tx") != 0 &&
+        strcmp(subcommand, "rx") != 0 &&
+        strcmp(subcommand, "all") != 0) {
         usage(argv[0]);
         return 2;
     }
 
     uint16_t vid = 0, pid = 0;
     int kr = kIOReturnNoDevice;
-    usb_device *d = usb_open_first(&vid, &pid, &kr);
+    usb_device *d = NULL;
+
+    if (device_selector) {
+        if (!smsc95xx_parse_vid_pid(device_selector, &vid, &pid)) {
+            fprintf(stderr, "smsc95xx-probe: --device expects vid:pid in hex, e.g. 0424:9905\n");
+            return 1;
+        }
+        d = usb_open_id(vid, pid, &kr);
+    } else {
+        d = usb_open_first(&vid, &pid, &kr);
+    }
+
     if (!d) {
         fprintf(stderr, "no supported device found: %s (0x%08x)\n", usb_strerror(kr), kr);
         return 1;
@@ -485,17 +532,17 @@ int main(int argc, char **argv)
     printf("device   %04x:%04x\n", vid, pid);
 
     int rc;
-    if (!strcmp(argv[1], "id")) {
+    if (!strcmp(subcommand, "id")) {
         rc = cmd_id(d);
-    } else if (!strcmp(argv[1], "phy")) {
+    } else if (!strcmp(subcommand, "phy")) {
         rc = cmd_phy(d);
-    } else if (!strcmp(argv[1], "eeprom")) {
+    } else if (!strcmp(subcommand, "eeprom")) {
         rc = cmd_eeprom(d);
-    } else if (!strcmp(argv[1], "init")) {
+    } else if (!strcmp(subcommand, "init")) {
         rc = cmd_init(d, override_mac);
-    } else if (!strcmp(argv[1], "tx")) {
+    } else if (!strcmp(subcommand, "tx")) {
         rc = cmd_tx(d, override_mac);
-    } else if (!strcmp(argv[1], "rx")) {
+    } else if (!strcmp(subcommand, "rx")) {
         rc = cmd_rx(d, override_mac);
     } else { /* "all" */
         /* Run every subcommand even if an earlier one fails. A diagnostic tool

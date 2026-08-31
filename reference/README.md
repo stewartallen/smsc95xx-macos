@@ -32,6 +32,13 @@ Everything here was produced on a Raspberry Pi 4 (Debian 13 trixie, kernel
 The two initialization sequences are functionally identical; diffing them is a quick way to see
 exactly which values are device-specific and which are not.
 
+### M3 dext loading evidence
+
+| File | What it is |
+|---|---|
+| `m3-dext-match.txt` | The M3 evidence: the dext loads, matches the LAN9500A, and reads its registers. Covers both provenance paths — EEPROM-loaded (`0424:9905`), where the real MAC is read and `Start()` succeeds, and auto-load-failed (`0424:9E00`), where the driver refuses. Also records the four requirements for a dext to load, each with the error it produces, and a list of causes already ruled out. See `dext/README.md` for how to build and load. |
+| `m3-attach-state.txt` | The USB device tree at clean attachment (before driver startup) — proves the device arrives unconfigured with no interface nodes, explaining why device-level matching is necessary. |
+
 ## Reproducing a capture
 
 Use `tools/capture-usb-bringup.sh` on a Linux host. It starts a `usbmon` capture, waits for the

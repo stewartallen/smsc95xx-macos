@@ -1,0 +1,27 @@
+# macOS ioreg output on fresh attach of LAN9500A in 0x9E00 state
+# date: 2026-08-30 15:45 PDT
+# system: macOS 26.6.2 build 25G83
+# device: MACH SYSTEMS 10BASET1S-USB-IF, power-cycled, no probe run after attach
+# method:  device power-cycled, then ioreg queried BEFORE running any userspace tool,
+#          so nothing in this capture was configured by us
+#
+# SCOPE: this capture is the 0x9E00 (EEPROM auto-load failed) state only. The 0x9905
+# state was measured separately during M3 and is also unconfigured at clean attach --
+# no kUSBCurrentConfiguration property and zero IOUSBHostInterface children -- which is
+# why the driver matches IOUSBHostDevice. The driver still handles an already-configured
+# device, because neither capture proves the behaviour is invariant across macOS versions
+# or hub topologies.
+
++-o IOUSBHostDevice@00142100  <class IOUSBHostDevice, id 0x1000ca47e, registered, matched,
+                               active, busy 0 (1 ms), retain 20>
+  +-o cef_server    <class AppleUSBHostDeviceUserClient, ...>
+  +-o Google Chrome <class AppleUSBHostDeviceUserClient, ...>
+
+"idVendor"    = 1060      (0x0424)
+"idProduct"   = 40448     (0x9E00)
+"bcdDevice"   = 768       (0x0300)
+"bDeviceClass"    = 255
+"bDeviceProtocol" = 255
+"bNumConfigurations" = 1
+                      <- no "kUSBCurrentConfiguration" property at all
+                      <- no IOUSBHostInterface child

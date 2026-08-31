@@ -41,6 +41,15 @@ static int tests_failed;
         }                                                                       \
     } while (0)
 
+#define CHECK(cond, what)                                                      \
+    do {                                                                       \
+        tests_run++;                                                            \
+        if (!(cond)) {                                                          \
+            tests_failed++;                                                     \
+            printf("FAIL %s:%d  %s\n", __FILE__, __LINE__, (what));            \
+        }                                                                       \
+    } while (0)
+
 #define TEST_REPORT()                                                          \
     do {                                                                       \
         printf("%d checks, %d failed\n", tests_run, tests_failed);              \

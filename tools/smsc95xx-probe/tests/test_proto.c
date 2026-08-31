@@ -14,8 +14,8 @@
  * 0x782D, and the MII write address 0x03 in test_mii_addr_word.
  * Do not replace measured values with hand-derived numbers.
  */
-#include "../smsc95xx_proto.h"
-#include "../smsc95xx_regs.h"
+#include "smsc95xx_proto.h"
+#include "smsc95xx_regs.h"
 #include "test_harness.h"
 
 static void test_mii_addr_word(void)
@@ -425,11 +425,10 @@ static void test_rx_status_multicast(void)
      * traffic that a Raspberry Pi emitted onto the 10BASE-T1S segment.
      *
      * These complete the three-way discrimination of the address-class bits.
-     * Previously we had broadcast frames (BROADCAST and MULTICAST both set) and
-     * unicast frames (both clear). Multicast is the case that separates the two
-     * bits from each other: MULTICAST set while BROADCAST stays clear. Without
-     * it, a defect that treated the two bits as one would pass both earlier
-     * tests.
+     * Broadcast sets BROADCAST and MULTICAST together, unicast clears both, and
+     * multicast is the case that separates them: MULTICAST set while BROADCAST
+     * stays clear. Without it, a defect treating the two bits as one would pass
+     * the broadcast and unicast vectors.
      *
      *   status      len  transfer  destination
      *   0x00FF0420  255  259       33:33:00:00:00:FB  (IPv6 mDNS)
@@ -471,6 +470,56 @@ static void test_rx_status_multicast(void)
     }
 }
 
+static void test_parse_vid_pid(void)
+{
+    /* --device vid:pid parsing */
+    {
+        uint16_t vid = 0, pid = 0;
+        CHECK(smsc95xx_parse_vid_pid("0424:9905", &vid, &pid) && vid == 0x0424 && pid == 0x9905,
+              "parse lowercase hex pair");
+        CHECK(smsc95xx_parse_vid_pid("184F:0051", &vid, &pid) && vid == 0x184F && pid == 0x0051,
+              "parse uppercase hex pair");
+        CHECK(smsc95xx_parse_vid_pid("0x0424:0x9905", &vid, &pid) && vid == 0x0424 && pid == 0x9905,
+              "0x prefixes accepted");
+        CHECK(!smsc95xx_parse_vid_pid("0424", &vid, &pid),         "reject missing colon");
+        CHECK(!smsc95xx_parse_vid_pid("0424:", &vid, &pid),        "reject empty pid");
+        CHECK(!smsc95xx_parse_vid_pid(":9905", &vid, &pid),        "reject empty vid");
+        CHECK(!smsc95xx_parse_vid_pid("10000:9905", &vid, &pid),   "reject vid over 16 bits");
+        CHECK(!smsc95xx_parse_vid_pid("0424:9905:1", &vid, &pid),  "reject trailing garbage");
+        CHECK(!smsc95xx_parse_vid_pid("g424:9905", &vid, &pid),    "reject non-hex");
+        CHECK(!smsc95xx_parse_vid_pid(NULL, &vid, &pid),           "reject NULL");
+    }
+}
+
+static void test_mac_plausible(void)
+{
+    /* The address this hardware actually carries. */
+    const uint8_t good[6]      = { 0xFC, 0x61, 0x79, 0x90, 0x04, 0x56 };
+    const uint8_t zeros[6]     = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+    const uint8_t ones[6]      = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+    const uint8_t multicast[6] = { 0x01, 0x00, 0x5E, 0x00, 0x00, 0x01 };
+    /* Locally administered but unicast, so plausible. */
+    const uint8_t local[6]     = { 0x02, 0x11, 0x22, 0x33, 0x44, 0x55 };
+    /* The MAC this unit reports when its EEPROM mis-clocks. It is unicast and
+     * passes every pattern check, which is why only the 0xA5 signature and the
+     * E2P_CMD LOADED bit can reject it. Asserting PLAUSIBLE here is deliberate:
+     * it pins the fact that plausibility does not and cannot catch this case. */
+    const uint8_t misclocked[6] = { 0x4A, 0xF8, 0xF8, 0xC2, 0xC2, 0xF2 };
+
+    CHECK(smsc95xx_mac_plausible(good) == SMSC95XX_MAC_PLAUSIBLE,
+          "real EEPROM MAC is plausible");
+    CHECK(smsc95xx_mac_plausible(zeros) == SMSC95XX_MAC_ALL_ZEROS,
+          "all-zero MAC rejected");
+    CHECK(smsc95xx_mac_plausible(ones) == SMSC95XX_MAC_ALL_ONES,
+          "all-ones MAC rejected");
+    CHECK(smsc95xx_mac_plausible(multicast) == SMSC95XX_MAC_MULTICAST,
+          "multicast MAC rejected (group bit set)");
+    CHECK(smsc95xx_mac_plausible(local) == SMSC95XX_MAC_PLAUSIBLE,
+          "locally administered unicast MAC is plausible");
+    CHECK(smsc95xx_mac_plausible(misclocked) == SMSC95XX_MAC_PLAUSIBLE,
+          "mis-clocked MAC passes plausibility -- only provenance rejects it");
+}
+
 int main(void)
 {
     test_mii_addr_word();
@@ -486,5 +535,7 @@ int main(void)
     test_rx_measured_vector();
     test_rx_status_unicast_vs_broadcast();
     test_rx_status_multicast();
+    test_parse_vid_pid();
+    test_mac_plausible();
     TEST_REPORT();
 }

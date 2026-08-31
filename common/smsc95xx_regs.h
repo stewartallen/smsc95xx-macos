@@ -7,6 +7,10 @@
 #ifndef SMSC95XX_REGS_H
 #define SMSC95XX_REGS_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* Vendor control requests. */
 #define SMSC95XX_REQ_WRITE_REGISTER 0xA0
 #define SMSC95XX_REQ_READ_REGISTER  0xA1
@@ -180,5 +184,9 @@
 #define SMSC95XX_INT_STS_CLEAR_ALL 0xFFFFFFFFu
 #define SMSC95XX_TX_CFG_ON         0x00000004u
 #define SMSC95XX_PM_CTRL_PHY_RST   0x00000010u
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* SMSC95XX_REGS_H */

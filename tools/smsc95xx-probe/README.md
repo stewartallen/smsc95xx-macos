@@ -14,6 +14,7 @@ claimed.
 make            # builds smsc95xx-probe
 make test       # runs unit tests for the pure protocol layer (no hardware)
 ./smsc95xx-probe all
+./smsc95xx-probe --device 0424:9e00 id
 ```
 
 **Note:** On the MACH SYSTEMS dongle (`0424:9e00`), the `./smsc95xx-probe eeprom` and
@@ -32,6 +33,13 @@ should expect that exit code.
 | `tx` | Sends one broadcast test frame with EtherType `0x88B5` and payload "SMSC95XX-PROBE-M2"; requires `--mac` if EEPROM is unreadable |
 | `rx` | Waits for inbound frames and prints raw bytes alongside parsed interpretation; requires `--mac` if EEPROM is unreadable |
 | `all` | Reads `id`, `phy`, and `eeprom` (performs control-transfer I/O only, does not initialize or transmit/receive frames) |
+
+## Options
+
+| Option | What it does |
+|---|---|
+| `--device vid:pid` | Open a specific device by USB vendor and product IDs (in hex). Without this, tries each supported device in order. |
+| `--mac aa:bb:cc:dd:ee:ff` | Override the station address. Needed only when the EEPROM signature does not verify; without it those commands refuse to run rather than use a possibly-wrong address. |
 
 ## Supported devices
 

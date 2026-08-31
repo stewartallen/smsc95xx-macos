@@ -1,0 +1,31 @@
+/* SPDX-License-Identifier: GPL-2.0 */
+/*
+ * DriverKit driver for the Microchip/SMSC LAN9500A USB 2.0 Ethernet controller.
+ * Ported from Linux's in-tree smsc95xx driver.
+ */
+
+#ifndef SMSC95xxDriver_h
+#define SMSC95xxDriver_h
+
+#include <Availability.h>
+#include <DriverKit/IOService.iig>
+#include <USBDriverKit/IOUSBHostDevice.iig>
+#include <USBDriverKit/IOUSBHostInterface.iig>
+
+class SMSC95xxDriver: public IOService
+{
+public:
+    virtual bool init() override;
+    virtual void free() override;
+    virtual kern_return_t Start(IOService *provider) override;
+    virtual kern_return_t Stop(IOService *provider) override;
+
+    /* LOCALONLY: these run entirely inside the driver process, so iig should not
+     * generate cross-process dispatch for them. */
+    virtual kern_return_t readRegister(uint32_t offset, uint32_t *value) LOCALONLY;
+    virtual kern_return_t writeRegister(uint32_t offset, uint32_t value) LOCALONLY;
+    virtual kern_return_t miiRead(uint8_t phy, uint8_t reg, uint16_t *value) LOCALONLY;
+    virtual kern_return_t eepromRead(uint16_t offset, uint8_t *buf, size_t len) LOCALONLY;
+};
+
+#endif /* SMSC95xxDriver_h */
