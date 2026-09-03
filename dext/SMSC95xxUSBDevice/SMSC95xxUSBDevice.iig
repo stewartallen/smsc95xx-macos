@@ -1,0 +1,22 @@
+/* SPDX-License-Identifier: GPL-2.0 */
+
+#ifndef SMSC95xxUSBDevice_h
+#define SMSC95xxUSBDevice_h
+
+#include <DriverKit/IOService.iig>
+#include <USBDriverKit/IOUSBHostDevice.iig>
+
+/* Device-level half of the driver. Its ONLY job is to select configuration 1 so that
+ * IOUSBHostInterface nodes appear, which is what SMSC95xxDriver matches against. It
+ * deliberately does not touch registers, the MAC, or the network stack -- if this class
+ * grows past about a hundred lines, something has been misplaced into it. */
+class SMSC95xxUSBDevice: public IOService
+{
+public:
+    virtual bool init() override;
+    virtual void free() override;
+    virtual kern_return_t Start(IOService *provider) override;
+    virtual kern_return_t Stop(IOService *provider) override;
+};
+
+#endif /* SMSC95xxUSBDevice_h */

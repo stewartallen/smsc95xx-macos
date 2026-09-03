@@ -9,8 +9,10 @@
 
 #include <Availability.h>
 #include <DriverKit/IOService.iig>
-#include <USBDriverKit/IOUSBHostDevice.iig>
 #include <USBDriverKit/IOUSBHostInterface.iig>
+#include <USBDriverKit/IOUSBHostPipe.iig>
+#include <DriverKit/IODataQueueDispatchSource.iig>
+#include <DriverKit/IOTimerDispatchSource.iig>
 #include <NetworkingDriverKit/IOUserNetworkEthernet.iig>
 
 class SMSC95xxDriver: public IOUserNetworkEthernet
@@ -27,6 +29,49 @@ public:
     virtual kern_return_t writeRegister(uint32_t offset, uint32_t value) LOCALONLY;
     virtual kern_return_t miiRead(uint8_t phy, uint8_t reg, uint16_t *value) LOCALONLY;
     virtual kern_return_t eepromRead(uint16_t offset, uint8_t *buf, size_t len) LOCALONLY;
+
+    /* USB bulk completion callbacks. TYPE(IOUSBHostPipe::CompleteAsyncIO) is what makes
+     * iig generate CreateActionRxComplete/CreateActionTxComplete on this class; there is
+     * no CreateActionCompleteAsyncIO in the SDK, and CompleteAsyncIO itself is pure
+     * virtual on the pipe and marked TARGET, so it must not be overridden here. */
+    virtual void RxComplete(OSAction *action, IOReturn status, uint32_t actualByteCount,
+                            uint64_t completionTimestamp) TYPE(IOUSBHostPipe::CompleteAsyncIO);
+    virtual void TxComplete(OSAction *action, IOReturn status, uint32_t actualByteCount,
+                            uint64_t completionTimestamp) TYPE(IOUSBHostPipe::CompleteAsyncIO);
+
+    /* The TX doorbell: the network stack enqueueing a packet on the TX submission queue
+     * makes that queue's shared-memory data queue non-empty, which is delivered here.
+     * TYPE(IODataQueueDispatchSource::DataAvailable) is what makes iig generate
+     * CreateActionTxDataAvailable on this class -- the same mechanism as the pipe
+     * completions above, and DataAvailable itself is pure virtual and TARGET on the
+     * source, so it must not be overridden here. */
+    virtual void TxDataAvailable(OSAction *action)
+        TYPE(IODataQueueDispatchSource::DataAvailable);
+
+    /* The idle-RX backoff timer. TYPE(IOTimerDispatchSource::TimerOccurred) is what makes
+     * iig generate CreateActionRxBackoffExpired on this class -- the same mechanism as the
+     * pipe completions and the TX doorbell above. Fires once, SMSC95XX_RX_BACKOFF_NS after
+     * a run of completions that delivered nothing, and re-arms the bulk IN read; that is
+     * what keeps an idle device from costing a CPU core without leaving the interface deaf.
+     * TimerOccurred itself is private and TARGET on the source, so it must not be
+     * overridden here. */
+    virtual void RxBackoffExpired(OSAction *action, uint64_t time)
+        TYPE(IOTimerDispatchSource::TimerOccurred);
+
+    /* Datapath, implemented in SMSC95xxDriver_datapath.cpp. */
+    virtual kern_return_t setupDatapath() LOCALONLY;
+    virtual void          teardownDatapath() LOCALONLY;
+    virtual kern_return_t armRxRead() LOCALONLY;
+    /* The single re-arm decision point for RxComplete. `carriedData` says whether the
+     * completion that is asking to re-arm actually delivered bytes; that is the only input
+     * the backoff needs. LOCALONLY -- it runs entirely in-process. */
+    virtual void          rearmRxRead(bool carriedData) LOCALONLY;
+    /* One permanent line of datapath totals, at each point where a run of traffic ends:
+     * the interface being disabled, and teardown. Separate from the DIAG6/DIAG7 tracing,
+     * which is scaffolding and gets stripped -- this is what remains for answering "did it
+     * move frames, and did it lose any" from `log show` after the fact. `why` names the
+     * moment so two lines from one attach/detach cycle are distinguishable. */
+    virtual void          logDatapathCounters(const char *why) LOCALONLY;
 
     /* Deprecated in the SDK but still pure virtual, so all nine must exist or the
      * class will not instantiate. v1 implements none of them: no multicast
@@ -79,6 +124,41 @@ public:
     virtual kern_return_t GetMaxTransferUnit(uint32_t *mtu) override;
     virtual kern_return_t SetHardwareAssists(uint32_t hardwareAssists) override;
     virtual kern_return_t GetHardwareAssists(uint32_t *hardwareAssists) override;
+
+    /* ===================================================================================
+     * TEMPORARY M5 DIAGNOSTIC INSTRUMENTATION -- REVERT THE WHOLE BLOCK.
+     *
+     * None of these overrides changes behaviour: each one logs that the family called it,
+     * with its arguments, and then chains to IOUserNetworkEthernet's own implementation
+     * and returns that result. They exist only to record what NetworkingDriverKit asks of
+     * the driver between registerEthernetInterface() and the first TX enqueue, which is
+     * the interval in which the datapath is currently stuck. All are LOCALONLY in
+     * IOUserNetworkEthernet.iig, so `super::` is the correct chain -- NOT SUPERDISPATCH --
+     * and every one of them has a real exported base implementation to chain to
+     * (verified against NetworkingDriverKit.tbd).
+     *
+     * Each declaration below cites the IOUserNetworkEthernet.iig line it was copied from;
+     * the signatures are the header's, not a guess.
+     * =================================================================================== */
+    virtual bool          start(IOService *provider) override;              /* iig:176 */
+    virtual void          stop(IOService *provider) override;               /* iig:179 */
+    virtual IOReturn      setPowerState(unsigned long powerState,
+                                        IOService *whatDevice) override;    /* iig:182 */
+    virtual IOReturn      setMulticastAddresses(const ether_addr_t *addresses,
+                                                uint32_t count) override;   /* iig:128 */
+    virtual const char   *getBSDName() const override;                      /* iig:207 */
+    virtual IOReturn      setAllMulticastModeEnable(bool enable) override;  /* iig:213 */
+    virtual IOReturn      handleChosenMedia(MediaWord chosenMedia) override;/* iig:216 */
+    virtual IOReturn      processInterfaceCommand(ifdrv_t *cmd_data) override; /* iig:233 */
+    virtual int           bpfTap(uint32_t dataLinkType, uint32_t mode) override; /* iig:262 */
+    virtual IOReturn      setHardwareAddress(ether_addr_t *addr) override;  /* iig:321 */
+    virtual uint32_t      getFeatureFlags() override;                       /* iig:324 */
+    virtual uint32_t      getInterfaceSubFamily() override;                 /* iig:331 */
+    virtual const char   *getBSDNamePrefix() override;                      /* iig:338 */
+    virtual int32_t       getBSDUnitNumber() override;                      /* iig:345 */
+    virtual MediaWord     getInitialMedia() override;                       /* iig:352 */
+    virtual uint16_t      getTxDataOffset() override;                       /* iig:360 */
+    /* ============================ END TEMPORARY BLOCK ================================= */
 };
 
 #endif /* SMSC95xxDriver_h */

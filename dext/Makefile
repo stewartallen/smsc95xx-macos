@@ -139,6 +139,25 @@ IIG_FLAGS    := -D__IIG=1 -x c++ -std=gnu++17 -isysroot $(DK_SDK) -Wno-deprecate
 # not covering up an accidental use of a deprecated call.
 DK_CXXFLAGS  := -target $(DK_TARGET) -isysroot $(DK_SDK) -std=gnu++17 \
                 -fno-exceptions -fno-rtti -Wall -Wextra -Wno-deprecated-declarations -I$(GEN) -I$(COMMON)
+
+# TRACE=1 compiles in the per-call and per-frame datapath tracing: the DIAG5 family-callback
+# trace, the DIAG6 transmit trace and the DIAG7 receive trace. OFF BY DEFAULT, deliberately.
+#
+# Every one of those lines earned its keep -- between them they found the queue-enable
+# ordering, the offload answer, the RX busy loop and both framing bugs -- so they are compiled
+# out rather than deleted. But they must not be in a normal build: os_log throttles hard, and
+# ~364,000 messages in one burst once caused later attach-time logs to vanish from the store
+# entirely, which is worse than having no tracing at all.
+#
+#   make app                 quiet: errors, refusals, guards and the counter totals only
+#   make app TRACE=1         everything, for chasing a datapath bug
+#
+# The macros compile to `if (0) os_log(...)` when this is unset, so the format strings and
+# arguments stay type-checked either way and a stale trace line cannot rot unnoticed.
+ifneq ($(strip $(TRACE)),)
+DK_CXXFLAGS  += -DSMSC95XX_TRACE=1
+endif
+
 DK_CFLAGS    := -target $(DK_TARGET) -isysroot $(DK_SDK) -std=c11 \
                 -Wall -Wextra -I$(COMMON)
 DK_LDFLAGS   := -target $(DK_TARGET) -isysroot $(DK_SDK) \
@@ -155,7 +174,13 @@ all: dext app
 # Editing a constant in common/ must rebuild the objects that consumed it. Without
 # these prerequisites make relinks unchanged objects and produces a dext built from
 # the old values -- signed and staged, with no signal that anything is stale.
-COMMON_HDRS  := $(COMMON)/smsc95xx_proto.h $(COMMON)/smsc95xx_regs.h
+COMMON_HDRS  := $(COMMON)/smsc95xx_proto.h $(COMMON)/smsc95xx_regs.h \
+                $(COMMON)/smsc95xx_init.h
+
+# The ivar layout is shared by the two translation units that make up SMSC95xxDriver, so
+# both objects must rebuild when it changes -- a stale object built against the old layout
+# links cleanly and then reads the wrong offsets.
+DEXT_HDRS    := $(DEXT_NAME)/$(DEXT_NAME)_ivars.h
 
 $(GEN)/$(DEXT_NAME).h: $(DEXT_NAME)/$(DEXT_NAME).iig
 	@mkdir -p $(GEN)
@@ -170,9 +195,15 @@ $(GEN)/$(DEXT_NAME).h: $(DEXT_NAME)/$(DEXT_NAME).iig
 # declaring a second target keeps `make -j` from running iig twice.
 $(GEN)/$(DEXT_NAME).iig.cpp: $(GEN)/$(DEXT_NAME).h
 
-$(BUILD)/$(DEXT_NAME).o: $(DEXT_NAME)/$(DEXT_NAME).cpp $(GEN)/$(DEXT_NAME).h $(COMMON_HDRS)
+$(BUILD)/$(DEXT_NAME).o: $(DEXT_NAME)/$(DEXT_NAME).cpp $(GEN)/$(DEXT_NAME).h $(COMMON_HDRS) $(DEXT_HDRS)
 	@mkdir -p $(BUILD)
-	xcrun -sdk driverkit clang++ $(DK_CXXFLAGS) -c $< -o $@
+	xcrun -sdk driverkit clang++ $(DK_CXXFLAGS) -I$(DEXT_NAME) -c $< -o $@
+
+# The second translation unit of the same class: the bulk datapath. Shares
+# SMSC95xxDriver_IVars with the file above via $(DEXT_HDRS).
+$(BUILD)/$(DEXT_NAME)_datapath.o: $(DEXT_NAME)/$(DEXT_NAME)_datapath.cpp $(GEN)/$(DEXT_NAME).h $(COMMON_HDRS) $(DEXT_HDRS)
+	@mkdir -p $(BUILD)
+	xcrun -sdk driverkit clang++ $(DK_CXXFLAGS) -I$(DEXT_NAME) -c $< -o $@
 
 $(BUILD)/$(DEXT_NAME).iig.o: $(GEN)/$(DEXT_NAME).iig.cpp
 	xcrun -sdk driverkit clang++ $(DK_CXXFLAGS) -c $< -o $@
@@ -181,7 +212,38 @@ $(BUILD)/smsc95xx_proto.o: $(COMMON)/smsc95xx_proto.c $(COMMON_HDRS)
 	@mkdir -p $(BUILD)
 	xcrun -sdk driverkit clang $(DK_CFLAGS) -c $< -o $@
 
-DEXT_OBJS := $(BUILD)/$(DEXT_NAME).o $(BUILD)/$(DEXT_NAME).iig.o $(BUILD)/smsc95xx_proto.o
+# The chip initialisation sequence, shared verbatim with the probe. Compiled as C for
+# the dext with no platform headers involved, which is the whole reason it can live in
+# common/ and be unit-tested on the host.
+$(BUILD)/smsc95xx_init.o: $(COMMON)/smsc95xx_init.c $(COMMON_HDRS)
+	@mkdir -p $(BUILD)
+	xcrun -sdk driverkit clang $(DK_CFLAGS) -c $< -o $@
+
+DEV_NAME     := SMSC95xxUSBDevice
+
+$(GEN)/$(DEV_NAME).h: $(DEV_NAME)/$(DEV_NAME).iig
+	@mkdir -p $(GEN)
+	xcrun -sdk driverkit iig \
+	    --def $< \
+	    --header $(GEN)/$(DEV_NAME).h \
+	    --impl $(GEN)/$(DEV_NAME).iig.cpp \
+	    --deployment-target 24.0 \
+	    -- $(IIG_FLAGS)
+
+$(GEN)/$(DEV_NAME).iig.cpp: $(GEN)/$(DEV_NAME).h
+
+$(BUILD)/$(DEV_NAME).o: $(DEV_NAME)/$(DEV_NAME).cpp $(GEN)/$(DEV_NAME).h
+	@mkdir -p $(BUILD)
+	xcrun -sdk driverkit clang++ $(DK_CXXFLAGS) -I$(DEV_NAME) -c $< -o $@
+
+$(BUILD)/$(DEV_NAME).iig.o: $(GEN)/$(DEV_NAME).iig.cpp
+	@mkdir -p $(BUILD)
+	xcrun -sdk driverkit clang++ $(DK_CXXFLAGS) -I$(DEV_NAME) -c $< -o $@
+
+DEXT_OBJS := $(BUILD)/$(DEXT_NAME).o $(BUILD)/$(DEXT_NAME).iig.o $(BUILD)/smsc95xx_proto.o \
+             $(BUILD)/smsc95xx_init.o \
+             $(BUILD)/$(DEV_NAME).o $(BUILD)/$(DEV_NAME).iig.o \
+             $(BUILD)/$(DEXT_NAME)_datapath.o
 
 # ---- entitlements ----
 
