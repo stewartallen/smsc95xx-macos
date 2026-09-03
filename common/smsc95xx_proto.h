@@ -1,11 +1,13 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
+ * Copyright (C) 2026 Stewart Allen
+ * Derived from the Linux smsc95xx driver, Copyright (C) 2007-2008 SMSC. See NOTICE.
+ *
  * Pure encode/decode helpers for the smsc95xx register protocol.
  *
- * Nothing in this header performs I/O. Over integer arguments, all functions are
- * total. Out-parameter functions require their pointer arguments to be non-NULL.
- * No I/O or allocation, so testable on the host without hardware and liftable
- * unchanged into the DriverKit extension later.
+ * Nothing here performs I/O or allocates, so everything is testable on the host
+ * without hardware. Over integer arguments, all functions are total. Out-parameter
+ * functions require their pointer arguments to be non-NULL.
  */
 #ifndef SMSC95XX_PROTO_H
 #define SMSC95XX_PROTO_H
@@ -33,12 +35,11 @@ void smsc95xx_id_rev_split(uint32_t id_rev, uint16_t *chip, uint16_t *rev);
 void smsc95xx_mac_to_regs(const uint8_t mac[6], uint32_t *addrl, uint32_t *addrh);
 void smsc95xx_regs_to_mac(uint32_t addrl, uint32_t addrh, uint8_t mac[6]);
 
-/* True only for the EEPROM signature byte that marks a trustworthy read.
- *
- * A read that does not carry this byte at offset 0 must be discarded however
- * plausible the rest looks: on marginal hardware a failed read is systematically
- * shifted rather than random, so it is stable across re-reads and passes ordinary
- * pattern checks. See the README's Known findings. */
+/* True only for the EEPROM signature byte that marks a trustworthy read. A read that
+ * does not carry this byte at offset 0 must be discarded however plausible the rest
+ * looks: on marginal hardware a failed read is systematically shifted rather than
+ * random, so it is stable across re-reads and passes ordinary pattern checks (see the
+ * README's Known findings). */
 bool smsc95xx_eeprom_sig_valid(uint8_t sig);
 
 /* Decode BMSR. */
@@ -78,15 +79,11 @@ bool smsc95xx_rx_next(const uint8_t *buf, size_t len, size_t *offset,
  * Returns false and leaves output arguments untouched on any malformed input. */
 bool smsc95xx_parse_vid_pid(const char *s, uint16_t *vid, uint16_t *pid);
 
-/* Why a MAC read out of EEPROM must be rejected even though the 0xA5 signature
- * matched. The signature is the real gate; these are a guard against a signature
- * byte that matched by accident.
- *
- * Note what is deliberately NOT rejected: a locally-administered address. The
- * known-bad MAC this hardware produces when its EEPROM mis-clocks,
- * 4a:f8:f8:c2:c2:f2, is locally administered but unicast, so it passes every
- * pattern check here. That is precisely why provenance, not plausibility, decides
- * whether an address is trustworthy. */
+/* Pattern checks applied to a MAC after the EEPROM signature matched; they guard
+ * against a signature byte that matched by accident. A locally-administered address is
+ * deliberately NOT rejected: the MAC this hardware produces when its EEPROM mis-clocks
+ * (4a:f8:f8:c2:c2:f2) is locally administered but unicast, so it passes every pattern
+ * check -- which is why provenance, not plausibility, is the real gate. */
 typedef enum {
     SMSC95XX_MAC_PLAUSIBLE = 0,
     SMSC95XX_MAC_ALL_ZEROS,

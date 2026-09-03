@@ -17,8 +17,8 @@ Get mangled names from the SDK stub, which lists every export:
 )/System/DriverKit/System/Library/Frameworks/NetworkingDriverKit.framework/NetworkingDriverKit.tbd"
 
 Why this beats guessing: it answers "what does the family actually do" from the family's
-own machine code, with no hardware cycle and no dext install. Two M5 root causes were
-settled this way -- see the M5 plan's "Reading the family's implementation" section.
+own machine code, with no hardware cycle and no dext install. Two datapath root causes in
+this project were settled this way.
 """
 import struct
 import sys

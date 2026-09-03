@@ -48,13 +48,11 @@ public:
     virtual void TxDataAvailable(OSAction *action)
         TYPE(IODataQueueDispatchSource::DataAvailable);
 
-    /* The idle-RX backoff timer. TYPE(IOTimerDispatchSource::TimerOccurred) is what makes
-     * iig generate CreateActionRxBackoffExpired on this class -- the same mechanism as the
-     * pipe completions and the TX doorbell above. Fires once, SMSC95XX_RX_BACKOFF_NS after
-     * a run of completions that delivered nothing, and re-arms the bulk IN read; that is
-     * what keeps an idle device from costing a CPU core without leaving the interface deaf.
-     * TimerOccurred itself is private and TARGET on the source, so it must not be
-     * overridden here. */
+    /* The idle-RX backoff timer. TYPE(IOTimerDispatchSource::TimerOccurred) makes iig
+     * generate CreateActionRxBackoffExpired on this class. Fires once, SMSC95XX_RX_BACKOFF_NS
+     * after a run of completions that delivered nothing, and re-arms the bulk IN read, so an
+     * idle device does not spin. TimerOccurred is private and TARGET on the source, so it
+     * must not be overridden here. */
     virtual void RxBackoffExpired(OSAction *action, uint64_t time)
         TYPE(IOTimerDispatchSource::TimerOccurred);
 
@@ -66,11 +64,10 @@ public:
      * completion that is asking to re-arm actually delivered bytes; that is the only input
      * the backoff needs. LOCALONLY -- it runs entirely in-process. */
     virtual void          rearmRxRead(bool carriedData) LOCALONLY;
-    /* One permanent line of datapath totals, at each point where a run of traffic ends:
-     * the interface being disabled, and teardown. Separate from the DIAG6/DIAG7 tracing,
-     * which is scaffolding and gets stripped -- this is what remains for answering "did it
-     * move frames, and did it lose any" from `log show` after the fact. `why` names the
-     * moment so two lines from one attach/detach cycle are distinguishable. */
+    /* One line of datapath totals at each point a run of traffic ends (interface disable
+     * and teardown). Survives a default build, unlike the DIAG6/DIAG7 tracing, so it
+     * answers "did it move frames, and did it lose any" from `log show`. `why` names the
+     * moment. */
     virtual void          logDatapathCounters(const char *why) LOCALONLY;
 
     /* Deprecated in the SDK but still pure virtual, so all nine must exist or the
@@ -81,18 +78,13 @@ public:
      * capital-S pure virtual above. */
     virtual IOReturn      setInterfaceEnable(bool enable) override;
 
-    /* SetPromiscuousModeEnable is a TENTH pure virtual (iig:118). Unlike the other nine
-     * it is not marked __deprecated, and the class instantiated without it -- so "pure
-     * virtual means you must override it" is not the real mechanism. Overridden anyway
-     * because the deprecated/live split is the same as everywhere else, and M6's BPF tap
-     * work lands directly on it. */
+    /* The live/deprecated promiscuous pair. Accepted but not yet acted on. */
     virtual kern_return_t SetPromiscuousModeEnable(bool enable) override;
     virtual IOReturn      setPromiscuousModeEnable(bool enable) override;
 
-    /* The MTU pair the stack actually calls. Overriding only the deprecated
-     * SetMTU/GetMaxTransferUnit left the 1500-only gate on a dead path, so the framework
-     * default would have accepted any MTU -- handing M5 frames larger than the
-     * 2048-byte pool buffers. */
+    /* The MTU pair the stack actually calls. The deprecated SetMTU/GetMaxTransferUnit are
+     * on a dead path, so overriding only those would let the framework default accept any
+     * MTU and hand us frames larger than the pool buffers. */
     virtual IOReturn      setMaxTransferUnit(uint32_t mtu) override;
     virtual uint32_t      getMaxTransferUnit() override;
     /* Serve the EEPROM MAC read by Start() to the network stack. LOCALONLY NDK_21
@@ -100,17 +92,13 @@ public:
     virtual kern_return_t getHardwareAddress(ether_addr_t *addr) override;
     virtual IOReturn getSupportedMediaArray(MediaWord *mediaArray,
                                             uint32_t *mediaCount) override;
-    /* The live getHardwareAssists returns the flags value directly (LOCALONLY NDK_21),
-     * not through a pointer parameter. It must override the base class default to
-     * prevent the stack from using offloads we do not implement. */
+    /* Live getHardwareAssists returns the flags directly (LOCALONLY NDK_21). Overrides the
+     * base default to keep the stack from using offloads we do not implement. */
     virtual uint32_t getHardwareAssists() override;
-    /* Experiment to suppress TSO advertisement. Declared per IOUserNetworkEthernet.iig:375
-     * (LOCALONLY NDK_22). Returns a zero-initialised struct if TSO options need to be
-     * explicitly suppressed. */
+    /* Advertise no TSO. IOUserNetworkEthernet.iig:375 (LOCALONLY NDK_22). */
     virtual IOReturn getTSOOptions(IOUserNetworkTSOOptions *options) override;
-    /* The live setHardwareAssists is called with the assists the stack wishes to enable.
-     * Per IOUserNetworkEthernet.iig:369 (LOCALONLY NDK_22). Logging the requested values
-     * is diagnostic; we support none of them. */
+    /* Live setHardwareAssists, called with the assists the stack wishes to enable.
+     * IOUserNetworkEthernet.iig:369 (LOCALONLY NDK_22). We support none of them. */
     virtual IOReturn setHardwareAssists(uint32_t hardwareAssists, uint32_t hardwareAssistsMask) override;
     /* These two must name deprecated SDK types, because the pure virtuals they
      * override are themselves declared with them. See DK_CXXFLAGS in the Makefile
@@ -125,40 +113,9 @@ public:
     virtual kern_return_t SetHardwareAssists(uint32_t hardwareAssists) override;
     virtual kern_return_t GetHardwareAssists(uint32_t *hardwareAssists) override;
 
-    /* ===================================================================================
-     * TEMPORARY M5 DIAGNOSTIC INSTRUMENTATION -- REVERT THE WHOLE BLOCK.
-     *
-     * None of these overrides changes behaviour: each one logs that the family called it,
-     * with its arguments, and then chains to IOUserNetworkEthernet's own implementation
-     * and returns that result. They exist only to record what NetworkingDriverKit asks of
-     * the driver between registerEthernetInterface() and the first TX enqueue, which is
-     * the interval in which the datapath is currently stuck. All are LOCALONLY in
-     * IOUserNetworkEthernet.iig, so `super::` is the correct chain -- NOT SUPERDISPATCH --
-     * and every one of them has a real exported base implementation to chain to
-     * (verified against NetworkingDriverKit.tbd).
-     *
-     * Each declaration below cites the IOUserNetworkEthernet.iig line it was copied from;
-     * the signatures are the header's, not a guess.
-     * =================================================================================== */
-    virtual bool          start(IOService *provider) override;              /* iig:176 */
-    virtual void          stop(IOService *provider) override;               /* iig:179 */
-    virtual IOReturn      setPowerState(unsigned long powerState,
-                                        IOService *whatDevice) override;    /* iig:182 */
-    virtual IOReturn      setMulticastAddresses(const ether_addr_t *addresses,
-                                                uint32_t count) override;   /* iig:128 */
-    virtual const char   *getBSDName() const override;                      /* iig:207 */
-    virtual IOReturn      setAllMulticastModeEnable(bool enable) override;  /* iig:213 */
-    virtual IOReturn      handleChosenMedia(MediaWord chosenMedia) override;/* iig:216 */
-    virtual IOReturn      processInterfaceCommand(ifdrv_t *cmd_data) override; /* iig:233 */
-    virtual int           bpfTap(uint32_t dataLinkType, uint32_t mode) override; /* iig:262 */
-    virtual IOReturn      setHardwareAddress(ether_addr_t *addr) override;  /* iig:321 */
-    virtual uint32_t      getFeatureFlags() override;                       /* iig:324 */
-    virtual uint32_t      getInterfaceSubFamily() override;                 /* iig:331 */
-    virtual const char   *getBSDNamePrefix() override;                      /* iig:338 */
-    virtual int32_t       getBSDUnitNumber() override;                      /* iig:345 */
-    virtual MediaWord     getInitialMedia() override;                       /* iig:352 */
-    virtual uint16_t      getTxDataOffset() override;                       /* iig:360 */
-    /* ============================ END TEMPORARY BLOCK ================================= */
+    /* The TX data offset the stack reserves ahead of every packet: room for the 8-byte
+     * command header. LOCALONLY NDK per IOUserNetworkEthernet.iig:360. */
+    virtual uint16_t      getTxDataOffset() override;
 };
 
 #endif /* SMSC95xxDriver_h */

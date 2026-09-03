@@ -24,10 +24,13 @@ they are the **same device** — identical endpoints, identical initialization s
 link configuration — differing only in USB ID and MAC address. One implementation covers both;
 only the IOKit matching dictionary needs two entries.
 
-> **Status: M1 complete, driver not started.** Both devices are characterized against a working
-> Linux reference (see [`reference/`](reference/)), the architecture is settled, and
-> [`tools/smsc95xx-probe`](tools/smsc95xx-probe/) validates the register protocol against real
-> hardware from userspace. No DriverKit code has been written yet.
+> **Status: M5 complete — the driver moves frames.** The DriverKit extension builds, loads with
+> SIP disabled, matches both dongles, reads the MAC from EEPROM with provenance checks, initialises
+> the chip, and carries Ethernet frames over the bulk pipes in both directions — `ping` works
+> end to end across the T1S segment (see [`reference/m5-datapath.txt`](reference/m5-datapath.txt)).
+> One USB transfer is outstanding per direction and every frame is copied once, so M5 is about
+> correctness, not throughput; a descriptor ring and BPF-tap throughput work are M6. See the
+> [milestones](#milestones) below for the full state.
 
 ---
 
@@ -179,45 +182,55 @@ register, with the register offset in `wIndex` and a little-endian `u32` payload
 
 ## Architecture
 
-Three units with narrow interfaces, so that the hard parts can be tested independently.
+Two DriverKit classes plus a shared protocol layer and a userspace probe, with narrow interfaces
+so the hard parts can be tested independently.
 
-**1. `tools/smsc95xx-probe` — userspace protocol validation**
+**1. `common/` — the pure protocol layer**
 
-An ordinary userspace program driving the chip over `IOUSBHost`. Needs no entitlements, no
-SIP changes, and no dext loading. Its job is to prove the register sequence and framing
-against real hardware with a fast edit-run loop. The two hard problems in this project — *is
-my protocol code right* and *can I get a dext signed and loaded* — are independent, and this
-lets us solve the first one without touching the second.
+Register offsets and bit layouts, the parameterised power-on initialisation sequence, TX/RX
+framing, and MAC-plausibility checks. No I/O, no allocation, no platform headers, and C++-safe,
+so the probe and the dext share exactly one copy. TX command-word construction, RX status-word
+parsing, and the init sequence become pure functions over byte buffers, unit-tested on the host
+with no DriverKit involved (`tools/smsc95xx-probe/tests`).
 
-**2. `SMSC95xxDevice` — register access layer**
+**2. `tools/smsc95xx-probe` — userspace protocol validation**
 
-Owns the `IOUSBHostInterface` and its three pipes. Exposes `readRegister`/`writeRegister`,
-`miiRead`/`miiWrite` via the `MII_ADDR`/`MII_DATA` pair, `eepromRead` via `E2P_CMD`/`E2P_DATA`,
-and `reset()`. Knows nothing about the network stack.
+An ordinary userspace program driving the chip over `IOUSBHost`. Needs no entitlements, no SIP
+changes, and no dext loading. It proves the register sequence and framing against real hardware
+with a fast edit-run loop — the two hard problems in this project (*is my protocol code right*
+and *can I get a dext signed and loaded*) are independent, and this solves the first without
+touching the second.
 
-**3. `SMSC95xxEthernet` — the `IOUserNetworkEthernet` subclass**
+**3. `SMSC95xxUSBDevice` — the device-level class**
 
-Owns the packet buffer pool, the four queues, frame framing, and link state. Knows nothing
-about USB control transfers.
+Matches `IOUSBHostDevice` and does one thing: selects configuration 1 with interface matching so
+the `IOUSBHostInterface` node the driver binds to actually appears. It touches no registers and
+no network state. See "Device matching" below for why this level is required.
 
-The seam between 2 and 3 is what makes framing logic testable off-device: TX command-word
-construction and RX status-word parsing become pure functions over byte buffers, unit-testable
-on the host with no DriverKit involved.
+**4. `SMSC95xxDriver` — the `IOUserNetworkEthernet` subclass**
+
+Matches the resulting `IOUSBHostInterface` and owns everything else: the three pipes, register /
+MII / EEPROM access over vendor control transfers, chip initialisation, the packet buffer pool
+and four queues, frame framing, and link state. It is built from two translation units sharing
+one ivar layout — `SMSC95xxDriver.cpp` (control path: registers, MII, EEPROM, init, network-stack
+plumbing) and `SMSC95xxDriver_datapath.cpp` (the bulk endpoints and the TX/RX loops).
 
 ### Data flow
 
-- **TX** — stack → `IOUserNetworkTxSubmissionQueue` → `TxDispatchQueue` → prepend `TX_CMD_A`
-  (length + first/last segment flags) and `TX_CMD_B` → async bulk OUT on `0x02` →
-  `IOUserNetworkTxCompletionQueue`.
-- **RX** — pre-posted bulk IN reads on `0x81` sized to `BURST_CAP` → walk the buffer parsing
-  32-bit RX status words (frame length in bits 29:16, error bits below), each frame 4-byte
-  aligned → wrap into `IOUserNetworkPacket` → `IOUserNetworkRxCompletionQueue` → stack.
-- **Link** — `BMSR` bit 2 is **not usable for link detection** on this hardware: with the
-  10BASE-T1S cable physically unplugged it still reads set across multiple direct reads, because
-  T1S is a multidrop bus with no continuous idle signalling while the medium is quiet. Real link
-  and PLCA state are in clause-45 MMD registers, reachable via the standard clause-22 indirect
-  registers 13/14 (no new transport needed). Link state can be taken from the interrupt endpoint,
-  or polled from clause-45 registers, then `reportLinkStatus(kIOUserNetworkLinkStatusActive, 10BaseT|HDX)`.
+- **TX** — stack → `IOUserNetworkTxSubmissionQueue` → a doorbell (`TxDataAvailable`) → prepend the
+  8-byte header (`TX_CMD_A` length + first/last-segment flags, `TX_CMD_B` length) → async bulk OUT
+  on `0x02` → `TxComplete` returns the packet on `IOUserNetworkTxCompletionQueue`.
+- **RX** — a bulk IN read on `0x81` into a 4 KB buffer → `RxComplete` walks the buffer parsing
+  32-bit RX status words (frame length in bits 29:16, error bits below), each record 4-byte
+  aligned → copy into an `IOUserNetworkPacket` from the RX submission queue → deliver on
+  `IOUserNetworkRxCompletionQueue`. An idle-RX backoff timer keeps a device with nothing to say
+  from spinning a CPU core.
+- **Link** — `BMSR` bit 2 is **not usable for link detection** on this hardware: with the T1S
+  cable physically unplugged it still reads set, because T1S is a multidrop bus with no continuous
+  idle signalling while the medium is quiet. So v1 reports `reportLinkStatus(kIOUserNetworkLinkStatusActive,
+  10BaseT|HDX)` for as long as the dongle is attached rather than polling a signal that would lie.
+  Real link and PLCA state live in clause-45 MMD registers (reachable via clause-22 indirect
+  registers 13/14) or on the interrupt endpoint — both are future work, not wired up in v1.
 
 ### NetworkingDriverKit surface
 
@@ -240,6 +253,8 @@ with `kIOUserNetworkMediaOptionHalfDuplex` is the honest approximation.
 
 ## Requirements
 
+- **Apple Silicon.** The dext is built `arm64e` (DriverKit on Apple Silicon requires pointer
+  authentication); this has not been built or run on an Intel Mac.
 - **Xcode** with the DriverKit SDK (developed against Xcode 26.6 / DriverKit 25.5)
 - **macOS 11+** for `NetworkingDriverKit` (introduced DriverKit 19.0); developed on macOS 26.6
 - Entitlements: `com.apple.developer.driverkit`,
@@ -335,6 +350,10 @@ tools/        decode-usbmon.py        turn a usbmon pcap into a named register t
               capture-usb-bringup.sh  capture a device's bring-up on a Linux host
               smsc95xx-probe/         userspace protocol validation against real hardware
               usb-reenumerate/        force a USB re-enumeration so IOKit re-runs matching
+              watch-attach/           watch the dext attach/match live during a plug-in
+              inspect-profile/        show what a provisioning profile grants
+              probe-entitlements/     measure which entitlement shape a profile authorises
+              dsc-disasm/             disassemble a framework from the dyld shared cache
 ```
 
 ### Device matching
@@ -393,9 +412,16 @@ alone — `0424:9E00` is the chip default and genuinely shared.
 
 ## License and provenance
 
-**GPL-2.0.** This is a port of the Linux `smsc95xx` driver: its reset sequencing, register
-programming order, and half-duplex handling are derived from that GPL-2.0 source, so this work
-is derivative and carries the same license.
+**GPL-2.0.** This is a port of the Linux `smsc95xx` driver
+(`drivers/net/usb/smsc95xx.c`, `SPDX-License-Identifier: GPL-2.0-or-later`,
+Copyright (C) 2007-2008 SMSC — now Microchip Technology Inc.). Its reset sequencing, register
+programming order, and half-duplex handling are derived from that source, so this work is
+derivative and licensed GPL-2.0 (a permitted narrowing of the upstream "or later"). The full
+attribution is in [`NOTICE`](NOTICE), and the license text is in [`LICENSE`](LICENSE); every
+source file carries an `SPDX-License-Identifier: GPL-2.0` tag.
 
 Register addresses and bit definitions are facts from Microchip's LAN9500A datasheet, but the
 *sequences* come from Linux, and that is the part worth having.
+
+Linking a GPL work against Apple's DriverKit system frameworks is covered by the GPL's system-library
+exception (those frameworks are a normal part of the macOS platform, not distributed with this code).

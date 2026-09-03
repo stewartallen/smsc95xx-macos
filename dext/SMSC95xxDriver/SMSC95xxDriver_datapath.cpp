@@ -45,31 +45,16 @@
 
 #define Log(fmt, ...) os_log(OS_LOG_DEFAULT, "SMSC95xx: " fmt, ##__VA_ARGS__)
 
-/* THE PER-FRAME TRACES. Both are compiled in only with `make TRACE=1`, and the Makefile's
- * TRACE block explains why they must stay out of a normal build: these are the lines that fire
- * once per frame, and os_log throttling under a burst has already destroyed one attach's log
- * completely. What remains in a quiet build is every error, every refusal, every guard, and
- * logDatapathCounters()'s two lines of totals -- which is what answers "did it work" after the
- * fact. These answer "what happened to this particular frame", which is a question worth
- * asking only while a bug is being chased.
+/* THE PER-FRAME TRACES, compiled in only with `make TRACE=1`. These fire once per frame,
+ * and os_log throttles hard enough under a burst to lose an entire attach's log, so they
+ * must stay out of a normal build; what remains there is every error, refusal and guard
+ * plus logDatapathCounters()'s totals. Disabled, they compile to `if (0) os_log(...)` so
+ * format strings and arguments stay type-checked (see the DIAG5 macro in
+ * SMSC95xxDriver.cpp). No trace argument may have a side effect.
  *
- * Disabled, they compile to `if (0) os_log(...)` rather than to nothing, so every format
- * string and argument stays type-checked in a default build. See the DIAG5 macro in
- * SMSC95xxDriver.cpp for the full reasoning, including why discarding the evaluation is safe.
- *
- * DIAG7 -- the receive half. Every completion, every record, every drop with its reason,
- * every enqueue and every re-arm:
- *   log stream --predicate 'eventMessage CONTAINS "DIAG7:"'
- *
- * DIAG6 -- the transmit half. Every doorbell, every dequeue, every framed transfer with its
- * length, every completion with its status and byte count, and every packet handed back to
- * the stack. That last one matters more than it looks: the failure mode of getting the
- * accounting wrong -- a packet consumed and never completed -- is silent for exactly 64
- * packets and then looks like a hang:
- *   log stream --predicate 'eventMessage CONTAINS "DIAG6:"'
- *
- * All three prefixes together, plus everything else this driver logs:
- *   log stream --predicate 'eventMessage CONTAINS "SMSC95xx"'
+ *   DIAG7 -- receive half:  log stream --predicate 'eventMessage CONTAINS "DIAG7:"'
+ *   DIAG6 -- transmit half: log stream --predicate 'eventMessage CONTAINS "DIAG6:"'
+ *   everything this driver logs: eventMessage CONTAINS "SMSC95xx"
  */
 #if SMSC95XX_TRACE
 #define Diag7(fmt, ...) os_log(OS_LOG_DEFAULT, "SMSC95xx: DIAG7: " fmt, ##__VA_ARGS__)
@@ -92,18 +77,12 @@
  * plus headers and padding. The host chooses the transfer length, so the device cannot
  * overrun this. */
 #define SMSC95XX_RX_BUFFER_LEN 4096
-/* Largest frame the transmit path will copy into the TX buffer, as a memory-safety bound.
- *
- * NOT an offload question -- that one is closed. Measured over a real run, the lengths the
- * stack hands this driver were 42 to 1372 with a maximum of 1372 and nothing at all over
- * 1514: the TSO4/TSO6/PARTIAL_CSUM in `ifconfig` is Skywalk performing those offloads in
- * software above the driver, not a request for the driver to perform them. This bound stays
- * because the memcpy below is only as safe as the length driving it, and 1518 (a VLAN-tagged
- * maximum-length frame) is the largest thing that could legitimately arrive. Anything above
- * it is corruption, and the frame is refused rather than copied. Note that
- * smsc95xx_tx_prepend applies the stricter protocol limit of SMSC95XX_FRAME_MAX (1514)
- * immediately afterwards, so 1515..1518 is refused too -- just with a different log line,
- * which is the point: "implausible length" and "the protocol says no" are different faults. */
+/* Largest frame the transmit path will copy into the TX buffer, as a memory-safety
+ * bound: the memcpy below is only as safe as the length driving it, and 1518 (a
+ * VLAN-tagged maximum-length frame) is the largest thing that could legitimately arrive.
+ * Anything larger is refused. smsc95xx_tx_prepend then applies the stricter protocol
+ * limit SMSC95XX_FRAME_MAX (1514), so 1515..1518 is refused too, with a different log
+ * line -- "implausible length" and "the protocol says no" are different faults. */
 #define SMSC95XX_TX_MAX_FRAME 1518
 
 /* Worst case one frame plus its 8-byte TX header, and the exact bound smsc95xx_tx_prepend is
@@ -112,83 +91,58 @@
  * appends the CRC itself, so those bytes are headroom, not payload. */
 #define SMSC95XX_TX_BUFFER_LEN (SMSC95XX_TX_HEADER_LEN + SMSC95XX_TX_MAX_FRAME)
 
-/* How many transmitted packets get the full framing trace, including the data offset the
- * family handed us. The offset answers whether getTxDataOffset()'s 8 bytes of headroom were
- * actually reserved, which is a fixed property of the family and the pool -- so it is worth
- * a handful of lines at the start of each attach and nothing after that. Every transmit is
- * still logged with its length; this is the extra detail. */
+/* How many transmitted packets get the full framing trace, including the data offset.
+ * Whether the reserved headroom is present is a fixed property of the family and pool, so
+ * a handful of lines at the start of each attach answers it. */
 #define SMSC95XX_TX_TRACE_PACKETS 8
 
-/* Frames are handed to the stack ONE AT A TIME, not batched. This is not a simplification:
- * enqueuePackets() reports only whether the accepted count was zero, so a partially accepted
- * batch is indistinguishable from a fully accepted one and the refused packets leak. See
- * deliverPacket() for the disassembly that establishes it. A batch constant used to live here.
- *
- * How many received packets get the full acquisition trace. The question it answers -- does
- * the RX submission queue actually supply buffers -- is a fixed property of the family, so it
- * is worth a handful of lines at the start of an attach and nothing after that. */
+/* How many received packets get the full acquisition trace: whether the RX submission
+ * queue supplies buffers is a fixed property of the family, so a handful of lines at the
+ * start of an attach answers it and nothing after that is needed. (Frames are handed to
+ * the stack one at a time, not batched -- see deliverPacket for why.) */
 #define SMSC95XX_RX_TRACE_PACKETS 8
 
-/* Largest RX payload (frame without its CRC) that will be copied into a packet.
- *
- * This is a memory-safety bound, not a policy: smsc95xx_rx_next only guarantees that a
- * record fits inside the transfer buffer, so a corrupt status word can legitimately yield a
- * length of nearly SMSC95XX_RX_BUFFER_LEN -- and the pool's buffers are 2048 bytes
- * (SMSC95xxDriver.cpp), so copying that blindly would overrun the packet. 1518 is a
- * VLAN-tagged maximum-length Ethernet frame, i.e. the largest thing this interface could
- * legitimately receive; anything above it is either corruption or a configuration this
- * driver does not support, and either way must be dropped rather than copied. It is
- * deliberately larger than SMSC95XX_FRAME_MAX (1514) so that a tagged frame is not silently
- * discarded, and comfortably smaller than 2048 so the copy always fits. */
+/* Largest RX payload (frame without its CRC) that will be copied into a packet, as a
+ * memory-safety bound: smsc95xx_rx_next only guarantees a record fits the transfer
+ * buffer, so a corrupt status word can yield a length near SMSC95XX_RX_BUFFER_LEN, which
+ * would overrun the 2048-byte packet buffer. 1518 is a VLAN-tagged maximum-length frame
+ * -- larger than SMSC95XX_FRAME_MAX (1514) so a tagged frame is not dropped, and well
+ * under 2048 so the copy always fits. */
 #define SMSC95XX_RX_MAX_PAYLOAD 1518
 
-/* The pool's per-packet buffer size, as passed to CreateWithOptions in SMSC95xxDriver.cpp.
- * Duplicated here rather than shared because the two files describe different things -- there
- * it is a pool parameter, here it is the bound on a memcpy -- but they must agree.
+/* SMSC95XX_POOL_BUFFER_SIZE (shared via the ivars header) bounds every copy in and out
+ * of a packet. Neither direction can use a frame-length bound alone: the copy starts at
+ * getDataOff() bytes into the buffer, so offset plus length is what has to fit. On TX
+ * that bounds a READ past the end of a packet, which is exactly as fatal as a bad write.
  *
- * Both directions need it, and neither can use a frame-length bound alone: the copy starts at
- * getDataOff() bytes into the buffer, so offset plus length is what has to fit. On TX that
- * bounds a READ past the end of a packet, which is exactly as fatal as a bad write -- a fault
- * on every frame is a kernel panic by way of IOKit's respawn loop, not merely a crash. */
-#define SMSC95XX_POOL_BUFFER_SIZE 2048
+ * Per-frame fault paths log their first few occurrences in full and then fall silent;
+ * the totals stay visible through logDatapathCounters. os_log throttles hard under a
+ * sustained burst, and one line per damaged frame at wire rate can wipe the rest of the
+ * attach's log from the store. */
+#define SMSC95XX_RX_FAULT_LOG_LIMIT 8
 
 /* ---- the idle-RX backoff -------------------------------------------------------------
  *
- * THE DEFECT THIS FIXES: RxComplete used to re-arm unconditionally on success, and a
- * zero-length completion counts as success. A device that has nothing to give completes
- * the next read immediately, so the two form a tight loop with no I/O wait in it at all --
- * measured at ~364,000 arms and 19% of a CPU core. The immediate cause was that the chip
- * was never initialised, which is fixed separately in Start(); this guard is independent of
- * that, because "the device has nothing to say" must never cost measurable CPU whatever the
- * reason. An error completion is treated the same way: a stalled pipe that fails instantly
- * has exactly the same shape.
+ * A completion that delivers nothing -- a zero-length success or a failed transfer --
+ * can complete the next read instantly, so re-arming unconditionally spins a CPU core
+ * with no I/O wait in the loop. This bounds that: after a run of empty completions,
+ * re-arming is handed to a timer.
  *
- * SMSC95XX_RX_IDLE_RUN_LIMIT -- how many consecutive completions that delivered nothing are
- * re-armed immediately before the timer takes over. 8 is chosen to be comfortably above any
- * legitimate transient (the completion that can follow an abort, the first read after
- * enable, one lost transfer) and far below the point where spinning costs anything: eight
- * control-free iterations is microseconds of work, against the 364,000 the unguarded loop
- * produced.
+ * SMSC95XX_RX_IDLE_RUN_LIMIT -- consecutive empty completions re-armed immediately before
+ *   the timer takes over. 8 is above any legitimate transient (the completion after an
+ *   abort, the first read after enable) and far below any measurable cost.
+ * SMSC95XX_RX_BACKOFF_NS -- 100 ms, so at most 10 arms/second while idle. Bounds the
+ *   extra latency on the first frame after an idle period to 100 ms, well inside ARP and
+ *   TCP SYN retransmit timers. Fixed, not escalating: escalation would trade a negligible
+ *   cost for a non-obvious worst-case latency.
+ * SMSC95XX_RX_BACKOFF_LEEWAY_NS -- 50 ms of coalescing slack; an idle poll need not be
+ *   punctual.
  *
- * SMSC95XX_RX_BACKOFF_NS -- 100 ms, giving at most 10 arms per second once the backoff
- * engages. That is unmeasurable CPU, while bounding the extra latency on the first frame
- * after an idle period to 100 ms, which is well inside the timeouts of anything that would
- * be waiting for it (ARP retransmits at 1 s, TCP SYN retry at 1 s). Deliberately a FIXED
- * interval rather than an escalating one: escalation would trade a cost that is already
- * negligible for a worst-case latency that is not obvious from the code.
- *
- * SMSC95XX_RX_BACKOFF_LEEWAY_NS -- 50 ms of slack the system may use to coalesce this timer
- * with others, since nothing about a 100 ms idle poll needs to be punctual.
- *
- * WHAT HAPPENS TO A REAL FRAME THAT ARRIVES DURING THE BACKOFF: it is not lost. The chip
- * buffers received frames in its own RX FIFO and hands them over on the next bulk IN
- * transfer, so the frame is delivered up to one backoff interval late. That completion
- * carries bytes, which resets the run to zero and returns the path to immediate re-arming,
- * so the degraded window is at most a single interval and never persists. NOT FULLY
- * VERIFIED, and stated as the honest limit of what is known: the FIFO is finite, so a burst
- * arriving entirely inside one 100 ms window could in principle overflow it and lose
- * frames. That has not been observed and cannot be provoked without hardware. The interface
- * is never left permanently deaf, which is the property that matters most here. */
+ * A frame arriving during the backoff is not lost: the chip buffers it in its RX FIFO and
+ * hands it over on the next transfer, up to one interval late, which resets the run to
+ * immediate re-arming. The FIFO is finite, so a burst filling one 100 ms window could in
+ * principle overflow it -- not observed, and unprovable without hardware -- but the
+ * interface is never left permanently deaf. */
 #define SMSC95XX_RX_IDLE_RUN_LIMIT     8
 #define SMSC95XX_RX_BACKOFF_NS         (100ull * 1000ull * 1000ull)
 #define SMSC95XX_RX_BACKOFF_LEEWAY_NS  (50ull * 1000ull * 1000ull)
@@ -216,9 +170,8 @@ allocBuffer(uint64_t len, IOBufferMemoryDescriptor **buf, uint8_t **bytes)
         OSSafeReleaseNULL(*buf);
         return ret;
     }
-    /* Create() is not documented to round down, but the whole point of these buffers is
-     * that a transfer length we chose is written into them, so check rather than assume:
-     * a short segment would turn every transfer into an overrun. */
+    /* A transfer length we chose is written into these buffers, so a short segment would
+     * turn every transfer into an overrun: check rather than assume. */
     if (range.length < len) {
         OSSafeReleaseNULL(*buf);
         return kIOReturnNoMemory;
@@ -265,14 +218,11 @@ SMSC95xxDriver::setupDatapath(void)
         return ret;
     }
 
-    /* The TX doorbell. Create() gave the submission queue a shared-memory data queue backed
-     * by ivars->dispatchQueue; CopyDataQueue hands us that same source (Copy, so it comes
-     * retained and teardownDatapath releases it), and SetDataAvailableHandler asks to be
-     * called when the stack makes it non-empty. This is the mechanism every shipping Apple
-     * network dext uses -- AppleUserECM, the USB Ethernet one, included -- and unlike a
-     * withPool DequeueAction it says where the callback runs: "the DataAvailable handler is
-     * invoked on the queue set for the target method of the OSAction", i.e. the same queue
-     * as RxComplete/TxComplete, so the datapath keeps one serialisation context. */
+    /* The TX doorbell. CopyDataQueue hands us the submission queue's shared-memory data
+     * queue (Copy, so retained; teardownDatapath releases it), and SetDataAvailableHandler
+     * asks to be called when the stack makes it non-empty. The handler runs on the queue
+     * set for its OSAction's target method -- the same queue as RxComplete/TxComplete --
+     * so the datapath keeps one serialisation context. */
     ret = ivars->txSubmit->CopyDataQueue(&ivars->txDataQueue);
     if (ret != kIOReturnSuccess || ivars->txDataQueue == nullptr) {
         Log("CopyDataQueue(TX submission) failed: 0x%x", ret);
@@ -289,13 +239,10 @@ SMSC95xxDriver::setupDatapath(void)
         return ret;
     }
 
-    /* The idle-RX backoff timer, on the SAME dispatch queue as everything else, so its
-     * handler serialises with RxComplete and needs no locking -- the queue is ivars->
-     * dispatchQueue, which by this point is the driver's own Default queue.
-     *
-     * A failure here fails setup rather than degrading quietly. Without the timer the only
-     * two available behaviours are the hot loop this exists to prevent and a receive path
-     * that stops for good, and neither is something to fall back to silently. */
+    /* The idle-RX backoff timer, on the same dispatch queue as everything else so its
+     * handler serialises with RxComplete and needs no locking. A failure fails setup:
+     * without the timer the only alternatives are the hot loop it prevents and a receive
+     * path that stops for good. */
     ret = IOTimerDispatchSource::Create(ivars->dispatchQueue, &ivars->rxBackoffTimer);
     if (ret != kIOReturnSuccess || ivars->rxBackoffTimer == nullptr) {
         Log("IOTimerDispatchSource::Create(RX backoff) failed: 0x%x", ret);
@@ -319,10 +266,9 @@ SMSC95xxDriver::setupDatapath(void)
         return ret;
     }
 
-    /* LAST, after every object the transmit path dereferences exists: this is the flag that
-     * lets the drain loop consume packets, and teardownDatapath clears it before it aborts
-     * anything. Setting it earlier would open a window in which a doorbell could hand a
-     * packet to a pipe that setup had not finished acquiring. */
+    /* LAST, after every object the transmit path dereferences exists: this flag lets the
+     * drain loop consume packets. Setting it earlier would let a doorbell hand a packet to
+     * a pipe setup had not finished acquiring; teardownDatapath clears it first. */
     ivars->txDatapathReady = true;
 
     Log("datapath ready: pipes 0x%02x/0x%02x, rx buffer %u bytes, tx buffer %u bytes "
@@ -335,19 +281,15 @@ SMSC95xxDriver::setupDatapath(void)
     return kIOReturnSuccess;
 }
 
-/* The permanent datapath totals. Two lines, TX then RX, rather than one unreadable one.
+/* The permanent datapath totals: two lines, TX then RX. Unlike the DIAG6/DIAG7 tracing,
+ * these survive a default build, so `log show` can answer "did the interface move
+ * traffic, and did it lose anything" after the fact.
  *
- * This is NOT part of the DIAG6/DIAG7 tracing and must outlive it: the trace answers "what
- * happened to this frame", which is only useful while a bug is being chased, whereas these two
- * lines answer "did the interface move traffic, and did it lose anything", which is the
- * question after every hardware run and the only one `log show` can still answer once the
- * per-frame lines have been throttled away.
- *
- * The numbers to read first are the two accounting identities, because a break in either is a
- * leak rather than a slowdown:
+ * The numbers to read first are the accounting identities, because a break in either is
+ * a leak rather than a slowdown:
  *   TX  dequeued == returned + lost + (1 if a transfer is in flight)
- *   RX  records  == frames + dropped, and frames == enqueued + enqFail
- * fromSubmitQ against submitQEmpty then says which source the receive path is actually using.
+ *   RX  records  == frames + dropped, and frames == enqueued
+ * fromSubmitQ against submitQEmpty says which source the receive path is actually using.
  */
 void
 SMSC95xxDriver::logDatapathCounters(const char *why)
@@ -361,57 +303,52 @@ SMSC95xxDriver::logDatapathCounters(const char *why)
         ivars->txErrors, ivars->txStalls, ivars->txAborted);
 
     Log("counters at %{public}s -- RX: completions %llu errors %llu zeroLen %llu arms %llu "
-        "armFail %llu | bytes %llu records %llu frames %llu dropped %llu | enqueued %llu "
-        "enqFail %llu lost %llu | fromSubmitQ %llu submitQEmpty %llu poolFail %llu",
+        "armFail %llu | bytes %llu records %llu zeroRec %llu frames %llu dropped %llu | "
+        "enqueued %llu enqFail %llu lost %llu | fromSubmitQ %llu submitQEmpty %llu "
+        "poolFail %llu",
         why, ivars->rxCompletions, ivars->rxCompletionErrors, ivars->rxZeroLength,
         ivars->rxArmCount, ivars->rxArmFailures, ivars->rxByteCount, ivars->rxRecords,
-        ivars->rxFrames, ivars->rxDropped, ivars->rxEnqueued, ivars->rxEnqueueFailures,
-        ivars->rxLost, ivars->rxSubmitDequeued, ivars->rxSubmitEmpty,
-        ivars->rxPoolFailures);
+        ivars->rxZeroRecords, ivars->rxFrames, ivars->rxDropped, ivars->rxEnqueued,
+        ivars->rxEnqueueFailures, ivars->rxLost, ivars->rxSubmitDequeued,
+        ivars->rxSubmitEmpty, ivars->rxPoolFailures);
 }
 
 void
 SMSC95xxDriver::teardownDatapath(void)
 {
-    /* Stop the receive loop BEFORE anything is aborted or released, and before the TX
-     * doorbell is touched. Two reasons, both about the abort below:
+    /* Stop the receive loop BEFORE anything is aborted or released. The synchronous Abort
+     * below can deliver the aborted transfer's completion while this function is still on
+     * the stack; RxComplete is what would re-arm, and with rxRunning already false it will
+     * not, so the abort cannot race a fresh AsyncIO into the buffer about to be released.
      *
-     *  - Abort(kIOUSBAbortSynchronous) does not return until the aborted IO has completed,
-     *    and the header notes that new IO is blocked "unless they are submitted from an
-     *    aborted IO's completion routine" -- i.e. the aborted completion may be delivered
-     *    while this function is still on the stack. RxComplete is what would re-arm, and
-     *    with rxRunning already false it will not, so the abort cannot race a fresh AsyncIO
-     *    into the buffer this function is about to release.
-     *  - RxComplete's aborted branch returns before it looks at ivars->rxBytes, and its
-     *    teardown branch checks for the released objects, so either ordering is safe -- but
-     *    this makes "no re-arm after teardown starts" true by state rather than by timing.
-     *
-     * rxArmed is NOT cleared here: the completion for the aborted transfer clears it, and
+     * rxArmed is NOT cleared here: the aborted transfer's completion clears it, and
      * clearing it early would let a late armRxRead() double-arm. */
-    /* The totals go through logDatapathCounters so they survive the DIAG7 strip; what stays
-     * here as tracing is the datapath STATE, which only matters while teardown ordering is
-     * being reasoned about. */
     logDatapathCounters("datapath teardown");
     Diag7("teardownDatapath: entered. rxRunning=%{public}s rxArmed=%{public}s",
           ivars->rxRunning ? "true" : "false", ivars->rxArmed ? "true" : "false");
+    /* Is teardown running ON the driver's Default dispatch queue? DriverKit does not
+     * document that it quiesces the queue before Stop, so this is the load-bearing
+     * empirical question: if true, the queue is serial FIFO and no timer/doorbell handler
+     * can be mid-flight here, so SetEnable(false)+release is safe by serialization; if
+     * false, a handler could run concurrently and teardown would have to join it (Cancel
+     * with a heap completion, or a DispatchSync barrier) before releasing shared buffers. */
+    Diag7("teardownDatapath: OnQueue(Default)=%{public}s",
+          (ivars->dispatchQueue != nullptr && ivars->dispatchQueue->OnQueue()) ? "true" : "false");
     Diag7("teardownDatapath: idle-RX backoff state: idleRun=%llu active=%{public}s "
           "episodes=%llu wakes=%llu", ivars->rxIdleRun,
           ivars->rxBackoffActive ? "true" : "false", ivars->rxBackoffEpisodes,
           ivars->rxBackoffWakes);
     ivars->rxRunning = false;
 
-    /* The transmit path is closed to new work BEFORE anything is aborted or released, and
-     * for the same reason rxRunning is cleared first. The bulk OUT Abort below is
-     * synchronous, and the header is explicit that an aborted transfer's completion may be
-     * delivered while the abort is still on the stack -- so TxComplete can run from inside
-     * this function. With this flag already false, that completion returns its own packet to
-     * the stack (the TX completion queue is still alive: TearDown releases the four queues
-     * only after this function returns) and then stops, instead of dequeuing more packets
-     * and framing them into a buffer that is about to be released.
+    /* Close the transmit path to new work before aborting or releasing, for the same
+     * reason. The synchronous bulk OUT Abort can deliver TxComplete from inside this
+     * function; with this flag false that completion returns its own packet (the TX
+     * completion queue outlives this function -- TearDown releases the queues afterwards)
+     * and then stops, rather than framing more packets into a buffer about to be released.
      *
-     * txInFlight is deliberately NOT cleared here, exactly as rxArmed is not: the aborted
-     * transfer's own completion clears it, and clearing it early would let a drain slip a
-     * second transfer past the one-in-flight rule during teardown. */
+     * txInFlight is NOT cleared here, like rxArmed: the aborted completion clears it, and
+     * clearing it early would let a drain slip a second transfer past the one-in-flight
+     * rule. */
     ivars->txDatapathReady = false;
     Diag6("teardownDatapath: TX state: inFlight=%{public}s packet=%{public}s doorbells=%llu "
           "drains=%llu dequeued=%llu submitted=%llu completions=%llu frames=%llu "
@@ -424,56 +361,29 @@ SMSC95xxDriver::teardownDatapath(void)
           ivars->txBytesSent, ivars->txRejected, ivars->txSubmitFailures, ivars->txStalls,
           ivars->txAborted, ivars->txDeferred, ivars->txErrors);
 
-    /* The backoff timer goes down FIRST, for the same reason rxRunning is cleared first: a
-     * pending wake would call armRxRead() against the buffer this function is about to
-     * release.
+    /* The backoff timer goes down FIRST: a pending wake would call armRxRead() against the
+     * buffer about to be released.
      *
-     * SetEnable(false) ONLY. Do NOT call Cancel() here.
-     *
-     * This function used to call `Cancel(^{ })`, on the reasoning that the source is ours
-     * and the SDK says a cancelled source can only be freed. That crashed the driver:
-     *
-     *   EXC_BAD_ACCESS (SIGSEGV), KERN_INVALID_ADDRESS at 0x0000000000000008
-     *     invocation function for block in IOTimerDispatchSource::Cancel_Impl(...)
-     *     _dispatch_source_cancel_callout
-     *
-     * `^{ }` is a STACK block. Cancel stores it and invokes it asynchronously, by which
-     * time this function has returned and that stack frame is gone, so the cancel callout
-     * dereferences a dead block descriptor -- hence the fault at a tiny offset.
-     *
-     * The cost of getting this wrong was not a single crash. The driver crashed on EVERY
-     * received frame, IOKit relaunched it through xpcproxy each time, and the respawn loop
-     * exhausted SPTM shared regions and PANICKED THE MACHINE:
-     *   panic ... [SPTM] VIOLATION_SHARED_REGIONS_EXHAUSTED: shared_region_alloc
-     * with xpcproxy as the panicking task. A userspace fault in a dext becomes a system
-     * panic if it can be made to repeat quickly enough, which is worth remembering before
-     * treating any dext crash as merely a restart.
-     *
-     * SetEnable(false) stops the source firing, and releasing our reference below is then
-     * all that is ours to do. This matches what the txDataQueue teardown a few lines down
-     * already does deliberately, and that path never crashed. If a cancel handler is ever
-     * genuinely needed here, it must be a heap block whose lifetime outlives this frame,
-     * and the source must not be released until it has run. */
+     * SetEnable(false) ONLY, never Cancel(): Cancel takes a completion block and invokes
+     * it asynchronously, so a stack block would be dereferenced after this frame returns
+     * (a use-after-free that crashes on every subsequent frame). SetEnable(false) stops
+     * the source firing, and releasing our reference below is then all that is ours to do.
+     * A cancel handler, if ever needed, must be a heap block outliving this frame, and the
+     * source must not be released until it has run. */
     if (ivars->rxBackoffTimer != nullptr) {
         kern_return_t er = ivars->rxBackoffTimer->SetEnable(false);
-        Diag7("teardownDatapath: RX backoff timer SetEnable(false) -> 0x%x "
-              "(no Cancel: see the comment above)", er);
+        Diag7("teardownDatapath: RX backoff timer SetEnable(false) -> 0x%x", er);
     }
     OSSafeReleaseNULL(ivars->rxBackoffAction);
     OSSafeReleaseNULL(ivars->rxBackoffTimer);
     ivars->rxBackoffActive = false;
     ivars->rxIdleRun       = 0;
 
-    /* The doorbell goes next, and before anything is released: TxDataAvailable
-     * dereferences ivars->txSubmit and ivars->txComplete, and TearDown releases both queues
-     * the moment this function returns. SetEnable(false) stops further DataAvailable
-     * callbacks; a handler already queued behind us still cannot run early, because it is
-     * dispatched on the same queue as this teardown, and by the time it does run the null
-     * guards at the top of TxDataAvailable see the released queues and return.
-     * Not Cancel(): the source belongs to the submission queue, which created it and frees
-     * it with itself, so cancelling it here would be tearing down someone else's object.
-     * Releasing our CopyDataQueue reference and our action reference is all that is ours to
-     * do -- the source drops its own retain on the action when the queue frees it. */
+    /* The doorbell goes next. SetEnable(false) stops further DataAvailable callbacks; one
+     * already queued behind us is dispatched on this same queue, so it cannot run early,
+     * and the null guards at the top of TxDataAvailable catch the released queues.
+     * Not Cancel(): the source belongs to the submission queue, which frees it with
+     * itself. Releasing our CopyDataQueue and action references is all that is ours to do. */
     if (ivars->txDataQueue != nullptr) {
         ivars->txDataQueue->SetEnable(false);
     }
@@ -510,13 +420,11 @@ SMSC95xxDriver::teardownDatapath(void)
     OSSafeReleaseNULL(ivars->rxBuffer);
     OSSafeReleaseNULL(ivars->txBuffer);
 
-    /* Both pipes have been aborted synchronously, so every completion has run and this
-     * should already be false with no packet held. If it is not, the one-in-flight
-     * bookkeeping is broken somewhere and the packet cannot safely be completed now: a
-     * completion that has not been delivered yet still might be, and completing the same
-     * packet twice hands the stack a packet we also hold a pointer to. Dropping it costs
-     * nothing here in particular -- TearDown releases the whole 64-packet pool a few lines
-     * later, which reclaims it -- so the honest action is to account for it and say so. */
+    /* After a synchronous abort every completion has run, so this should already be false
+     * with no packet held. If not, the one-in-flight bookkeeping is broken: the packet
+     * cannot safely be completed now (a not-yet-delivered completion might still arrive,
+     * and completing twice hands the stack a packet we still point at), so it is dropped
+     * and counted. The pool is reclaimed when TearDown releases it. */
     if (ivars->txPacket != nullptr || ivars->txInFlight) {
         ivars->txLost++;
         Log("teardownDatapath: a TX was STILL in flight after a synchronous abort "
@@ -528,20 +436,18 @@ SMSC95xxDriver::teardownDatapath(void)
     }
     ivars->txPacket   = nullptr;
     ivars->txInFlight = false;
-    /* Only now, with the pipe released and the buffer gone, is it certain that no transfer
-     * can be outstanding -- so this is where rxArmed stops being a claim about the hardware
-     * and becomes just a cleared flag. */
+    /* Only now, with the pipe released and the buffer gone, is it certain no transfer can
+     * be outstanding, so rxArmed becomes just a cleared flag. */
     ivars->rxArmed = false;
     Diag7("teardownDatapath: complete; pipes, buffers and actions released");
 }
 
 /* Submit one bulk IN transfer into ivars->rxBuffer.
  *
- * IDEMPOTENT by design: if a transfer is already outstanding this returns success without
- * submitting a second one. There is exactly one RX buffer, so two overlapping AsyncIOs would
- * have the device writing the same memory twice; the postcondition callers care about ("a
- * read is outstanding") already holds, so refusing quietly is the honest answer rather than
- * an error the caller would have to special-case. */
+ * Idempotent: with a transfer already outstanding it returns success without submitting a
+ * second one. There is one RX buffer, so two overlapping AsyncIOs would have the device
+ * writing the same memory twice; the postcondition callers care about ("a read is
+ * outstanding") already holds. */
 kern_return_t
 SMSC95xxDriver::armRxRead(void)
 {
@@ -702,22 +608,15 @@ IMPL(SMSC95xxDriver, RxBackoffExpired)
 
 /* ---- transmit ------------------------------------------------------------------------
  *
- * THE ACCOUNTING RULE THE WHOLE TRANSMIT PATH IS BUILT AROUND: every packet that comes out
- * of DequeuePackets is handed back to the stack EXACTLY ONCE, on every path -- transmitted,
- * refused for its length, refused by the framing, refused by the pipe, or aborted at
- * teardown. A packet consumed and never completed is gone from the 64-packet pool for good,
- * so 64 of them wedge transmit with no error anywhere; a packet completed twice is worse,
- * because the stack then owns a packet this driver still holds a pointer to.
+ * THE ACCOUNTING RULE THE WHOLE TRANSMIT PATH IS BUILT AROUND: every packet DequeuePackets
+ * yields is handed back to the stack EXACTLY ONCE, on every path -- transmitted, refused,
+ * or aborted at teardown. A packet consumed and never completed is gone from the pool for
+ * good, so 64 of them wedge transmit silently; a packet completed twice hands the stack a
+ * packet this driver still points at.
  *
- * Two things make that rule auditable rather than merely intended:
- *
- *  - txReturnPacket below is the ONLY place a packet goes back, so "exactly once" is a
- *    property of its call sites, which all fit in one screen, instead of a property of the
- *    whole file.
- *  - the drain loop takes ONE packet at a time and disposes of it before taking another, so
- *    there is never a batch of packets held in a local array with an early return able to
- *    strand it. A batch is how a partially-handled group leaks.
- */
+ * Two things keep the rule auditable: txReturnPacket is the ONLY place a packet goes back,
+ * and the drain loop takes ONE packet at a time and disposes of it before taking another,
+ * so no batch of packets is ever held where an early return could strand it. */
 
 /* Hand ONE packet back to the network stack. The single exit for a consumed packet.
  *
@@ -731,10 +630,9 @@ txReturnPacket(SMSC95xxDriver_IVars *ivars, IOUserNetworkPacket *packet, const c
         return;
     }
     if (ivars->txComplete == nullptr) {
-        /* Only reachable if the completion queue was released while a packet was held, which
-         * teardown ordering is meant to prevent (TearDown releases the queues only after
-         * teardownDatapath has aborted both pipes and every completion has run). The packet
-         * is reclaimed when the pool goes, but it never reached the stack, so count it. */
+        /* Only reachable if the completion queue was released while a packet was held,
+         * which teardown ordering prevents. The packet is reclaimed with the pool, but it
+         * never reached the stack, so count it. */
         ivars->txLost++;
         Log("TX: cannot complete a packet (%{public}s): the TX completion queue is gone -- "
             "1 packet LOST (total lost %llu)", why, ivars->txLost);
@@ -743,10 +641,8 @@ txReturnPacket(SMSC95xxDriver_IVars *ivars, IOUserNetworkPacket *packet, const c
 
     IOReturn ret = ivars->txComplete->enqueuePackets(&packet, 1);
     if (ret != kIOReturnSuccess) {
-        /* One packet, one call: unlike the RX batch there is no partial-success ambiguity to
-         * reason about. It is out of the submission queue and cannot be put back, so it is
-         * lost -- said loudly, because silent loss surfaces much later as a pool that never
-         * refills and looks nothing like this. */
+        /* Out of the submission queue and unable to go back, so it is lost -- logged
+         * loudly, because silent loss surfaces later as a pool that never refills. */
         ivars->txLost++;
         Log("TX: enqueuePackets(1) on the TX completion queue FAILED: 0x%x (%{public}s) -- "
             "1 packet LOST (total lost %llu)", ret, why, ivars->txLost);
@@ -774,34 +670,15 @@ txSubmitPacket(SMSC95xxDriver_IVars *ivars, IOUserNetworkPacket *packet)
 {
     uint32_t frameLen = packet->getDataLength();
 
-    /* WHERE THE FRAME ACTUALLY STARTS, and the bug this used to be.
+    /* Where the frame starts: getDataVirtualAddress() returns the buffer BASE and does NOT
+     * add the packet's data offset, so the frame begins at base + getDataOff(). Adding
+     * getDataOff() is correct whatever getTxDataOffset() returns.
      *
-     * getDataVirtualAddress() returns the base of the packet's buffer. It does NOT add the
-     * packet's data offset -- in the DriverKit 25.5 NetworkingDriverKit it is three
-     * instructions, `ldr x8, [x0, #0x30]; ldr x0, [x8, #0x10]; ret`, a bare ivar load, and
-     * getDataOff() reads a different ivar entirely. The frame begins at base + getDataOff().
-     *
-     * getTxDataOffset() returns SMSC95XX_TX_HEADER_LEN, so the family reserves 8 bytes of
-     * headroom on every TX packet and getDataOff() is 8. Copying frameLen bytes from the base
-     * therefore sent 8 bytes of reserved headroom followed by only the first frameLen - 8
-     * bytes of the frame. On the wire that looked like eight leading zero bytes and a frame
-     * truncated by eight at the tail -- which was misread as the chip failing to strip our TX
-     * command header. It strips it correctly; the source pointer was wrong.
-     *
-     * Adding getDataOff() is right whatever getTxDataOffset() returns, which is why the
-     * override stays at 8 rather than reverting to the family's default of 0: a non-zero
-     * offset keeps this arithmetic exercised instead of adding zero on every frame.
-     *
-     * Note what this build does NOT do with the headroom, and why: even with 8 writable bytes
-     * in front of the frame, transmitting in place is not possible through AsyncIO, which
-     * takes an IOMemoryDescriptor and a length and NO offset. The packet's bytes live
-     * somewhere inside the pool's memory, so a zero-copy transmit needs a descriptor covering
-     * exactly [frame - 8, frame + len), i.e. pool->CopyMemoryDescriptor() once plus an
-     * IOMemoryDescriptor::CreateSubMemoryDescriptor per packet -- a kernel round trip and an
-     * object allocation on every frame, against a memcpy of at most 1518 bytes. That is a
-     * throughput question for M6 (AsyncIOBundled with a ring of pre-made sub-descriptors),
-     * not a correctness one for M5, so the copy into the persistent scratch buffer stays: it
-     * is known-safe and its cost is a memcpy the CPU does in well under a microsecond. */
+     * The frame is copied into a persistent scratch buffer rather than transmitted in
+     * place: AsyncIO takes a descriptor and a length but no offset, so a zero-copy
+     * transmit would need a per-frame sub-descriptor (a kernel round trip and an
+     * allocation per frame) against a memcpy of at most 1518 bytes. That trade-off is a
+     * throughput question for later; the copy is known-safe. */
     size_t   dataOff = packet->getDataOff();
     uint64_t frameAt = packet->getDataVirtualAddress() + dataOff;
 
@@ -815,9 +692,8 @@ txSubmitPacket(SMSC95xxDriver_IVars *ivars, IOUserNetworkPacket *packet)
               (unsigned int)packet->getLinkHeaderLength());
     }
 
-    /* THE LENGTH GUARD. Kept as a guard, not as an open question: the offload investigation
-     * is closed (see SMSC95XX_TX_MAX_FRAME). A length outside the plausible range is refused
-     * rather than memcpy'd, because the copy below is only as safe as this number. */
+    /* Length guard: the copy below is only as safe as this number, so a length outside
+     * the plausible range is refused rather than memcpy'd. */
     if (frameLen == 0 || frameLen > SMSC95XX_TX_MAX_FRAME) {
         ivars->txRejected++;
         Log("TX: REFUSING implausible length %u (0 or over %u) -- not a framing fault "
@@ -853,10 +729,9 @@ txSubmitPacket(SMSC95xxDriver_IVars *ivars, IOUserNetworkPacket *packet)
         return kIOReturnBadArgument;
     }
 
-    /* The same safety net the receive path carries, for the same reason and in the opposite
-     * direction: a fault here is not one crash but a per-frame crash, and IOKit's respawn loop
-     * turns that into a kernel panic (see the RX guard in RxComplete for the full account).
-     * Reading a bad address is as fatal as writing one, so refuse rather than memcpy. */
+    /* Address sanity check before the copy, the mirror of the receive-side guard:
+     * reading past a buffer faults on every frame, which IOKit's respawn loop escalates
+     * to a kernel panic. Refuse rather than memcpy. */
     if (frameAt < 0x100000ull || dataOff + frameLen > SMSC95XX_POOL_BUFFER_SIZE) {
         ivars->txRejected++;
         Log("TX: REFUSING to copy: frame address 0x%llx = base 0x%llx + offset %zu, length %u, "
@@ -872,19 +747,16 @@ txSubmitPacket(SMSC95xxDriver_IVars *ivars, IOUserNetworkPacket *packet)
 
     uint32_t xferLen = (uint32_t)(hdrLen + frameLen);
 
-    /* Set BEFORE AsyncIO, not after: the completion is delivered on this same dispatch queue
-     * so it cannot run while this function is on the stack -- but ordering the state first
-     * means there is no window in which the flags disagree with reality, and it is the
-     * failure branch below that has to undo them rather than the success path that has to
-     * remember to set them. */
+    /* Set BEFORE AsyncIO: the completion cannot run until this returns (same dispatch
+     * queue), but ordering the state first leaves no window where the flags disagree with
+     * reality, and the failure branch below undoes them rather than the success path
+     * remembering to set them. */
     ivars->txInFlight = true;
     ivars->txPacket   = packet;
 
-    /* completionTimeoutMs 0, the same as the bulk IN arm. A bulk transfer that is never
-     * completed would leave txInFlight set forever and wedge transmit, but the USB stack
-     * completes every accepted transfer one way or another -- with an error on device
-     * removal, with kIOReturnAborted on Abort -- so a timeout would only be insurance
-     * against a stack bug, at the price of turning a slow device into dropped frames. */
+    /* completionTimeoutMs 0: the USB stack completes every accepted transfer one way or
+     * another (an error on device removal, kIOReturnAborted on Abort), so a timeout would
+     * only guard against a stack bug at the cost of dropping frames to a slow device. */
     kern_return_t ret = ivars->pipeOut->AsyncIO(ivars->txBuffer, xferLen, ivars->txAction, 0);
     if (ret != kIOReturnSuccess) {
         ivars->txInFlight = false;
@@ -916,18 +788,14 @@ txSubmitPacket(SMSC95xxDriver_IVars *ivars, IOUserNetworkPacket *packet)
  *    not pull it, it would sit in the queue until the next unrelated enqueue happened to ring
  *    the bell again -- which looks exactly like a stall.
  *
- * ONE packet per DequeuePackets call, not a batch. With one transfer in flight there is
- * nothing to do with a second packet except hold it, and a held packet is precisely what the
- * accounting rule above is trying to avoid; taking them one at a time means the only packet
- * this function is ever responsible for is the one in `packet`. Backpressure is applied by
- * simply not consuming: the packets stay in the submission queue, which is the queue's own
- * mechanism, so nothing is dropped and nothing needs to be requeued.
+ * ONE packet per DequeuePackets call, not a batch: with one transfer in flight a second
+ * packet can only be held, and a held packet is what the accounting rule avoids. Taking
+ * them one at a time keeps the only packet this function is responsible for in `packet`.
+ * Backpressure is applied by not consuming -- the packets stay in the submission queue.
  *
- * requestDequeue() is deliberately NOT used to ask for more. The submission queue was built
- * with the dispatch-queue overload of Create, so it has no DequeueAction for requestDequeue
- * to call; and this runs on the driver's dispatch queue in both callers, which is where a
- * dequeue is allowed to happen, so calling the drain directly is both simpler and free of
- * assumptions about what requestDequeue does on a queue with no dequeue handler. */
+ * requestDequeue() is not used: the queue was built with the dispatch-queue overload of
+ * Create and has no DequeueAction, and this already runs on the driver's dispatch queue,
+ * so calling the drain directly is both simpler and free of assumptions. */
 static void
 txDrainSubmission(SMSC95xxDriver_IVars *ivars, const char *why)
 {
@@ -940,10 +808,9 @@ txDrainSubmission(SMSC95xxDriver_IVars *ivars, const char *why)
             ivars->txComplete != nullptr ? "set" : "null");
         return;
     }
-    /* The teardown gate. See the ivar comment: teardownDatapath clears this before it aborts
-     * the bulk OUT pipe, and the aborted transfer's completion can call this from inside that
-     * abort. Consuming a packet here would frame it into a buffer that is about to be
-     * released, and there would be no completion left to hand it back. */
+    /* The teardown gate: teardownDatapath clears this before aborting the bulk OUT pipe,
+     * and the aborted transfer's completion can call this from inside that abort.
+     * Consuming a packet here would frame it into a buffer about to be released. */
     if (!ivars->txDatapathReady) {
         Diag6("TX drain (%{public}s): the datapath is being torn down -- not consuming "
               "(anything still queued is the stack's, and is never taken from it)", why);
@@ -954,9 +821,9 @@ txDrainSubmission(SMSC95xxDriver_IVars *ivars, const char *why)
     uint32_t sent  = 0;
     uint32_t failed = 0;
 
-    /* Bounded without needing a counter: each iteration either submits (which sets
-     * txInFlight and ends the loop) or disposes of one packet, and the pool holds 64 packets
-     * in total, so the stack cannot present more than 64 without first getting some back. */
+    /* Bounded without a counter: each iteration either submits (setting txInFlight and
+     * ending the loop) or disposes of one packet, and the pool holds a fixed number, so
+     * the stack cannot present more without first getting some back. */
     while (!ivars->txInFlight) {
         IOUserNetworkPacket *packet = nullptr;
         uint32_t             count  = ivars->txSubmit->DequeuePackets(&packet, 1);
@@ -1012,21 +879,15 @@ IMPL(SMSC95xxDriver, TxDataAvailable)
 
     ivars->txDoorbells++;
 
-    /* Tests the spec's "everything serialises on one dispatch queue" assumption. It should
-     * now hold by construction -- this handler runs on the queue set for the target method
-     * of its OSAction, the same queue as the pipe completions -- so if this ever fires the
-     * assumption is wrong somewhere it was believed safe: stop and reconsider rather than
-     * adding a lock and moving on. */
+    /* Guards on the "everything serialises on one dispatch queue, so no locking"
+     * assumption. It holds by construction -- this handler runs on the same queue as the
+     * pipe completions -- so a fire here means the assumption is void and the design must
+     * be revisited, not patched with a lock. OnQueue() is inclusive, so a quiet run is
+     * weak evidence but a false is proof. */
     if (ivars->inTxDataAvailable) {
         Log("*** TxDataAvailable RE-ENTERED: callbacks are NOT serialised ***");
     }
     ivars->inTxDataAvailable = true;
-
-    /* The other half of the same assumption, and checkable rather than asserted: this handler
-     * is meant to run on the driver's Default queue, which is the queue the four packet
-     * queues were built with. OnQueue() is inclusive -- it can also return true for a queue
-     * that invoked ours -- so a quiet run is weak evidence, but a false here is proof the
-     * datapath is split across two queues and the no-locking assumption is void. */
     if (ivars->dispatchQueue != nullptr && !ivars->dispatchQueue->OnQueue()) {
         Log("*** TxDataAvailable NOT on the driver's dispatch queue ***");
     }
@@ -1051,75 +912,56 @@ IMPL(SMSC95xxDriver, TxDataAvailable)
 
 /* Hand ONE received frame to the network stack, and account for the packet either way.
  *
- * ONE packet per call, not a batch, and that is a correctness requirement rather than a
- * simplification. enqueuePackets() in DriverKit 25.5 is a sixteen-instruction wrapper:
+ * ONE packet per call, not a batch: enqueuePackets' IOReturn only says whether the
+ * accepted count was zero, and EnqueuePackets stops at the first packet it cannot take.
+ * A partially accepted batch is therefore indistinguishable from a fully accepted one,
+ * and the refused packets would be neither enqueued nor deallocated -- a leak that
+ * surfaces minutes later as a pool that never refills. With count == 1 the return value
+ * is unambiguous, and one call per frame costs nothing at 10 Mb/s.
  *
- *     ldr x16,[x0] ... ldr x8,[x16,#0x58]! ; blraa  -> virtual EnqueuePackets(packets, count)
- *     cmp  w0, #0x0
- *     mov  w8, #0x2e8 ; movk w8, #0xe000, lsl #16   ; kIOReturnOverrun
- *     csel w0, w8, wzr, eq
- *
- * So its IOReturn carries exactly one bit of information: whether the count EnqueuePackets
- * accepted was zero. A batch of sixteen of which one is accepted returns kIOReturnSuccess and
- * gives no way to learn that the other fifteen were refused -- and EnqueuePackets breaks out
- * of its loop on the first packet it cannot take, so a partial accept is the normal shape of
- * failure, not a corner case. Those refused packets would be neither enqueued nor deallocated,
- * i.e. leaked, and a pool that quietly shrinks looks like a stall minutes later rather than
- * like the enqueue failure it is. With count == 1 the return value is unambiguous.
- *
- * The cost is one call per frame on a 10 Mb/s half-duplex segment, which is nothing.
- *
- * Returns true if the stack took the packet. On failure the packet is returned to the pool,
- * because the alternative is to lose it.
- *
- * `fromSubmitQueue` only shapes the log: a packet that came off the RX submission queue and is
- * being handed back to the pool is a last-resort disposal of a buffer the kernel considers
- * part of its RX ring, and that is worth being able to see in the trace. */
+ * Returns true if the stack took the packet. On failure the packet goes back to the
+ * pool, because the alternative is to lose it. `fromSubmitQueue` only shapes the log:
+ * handing a packet that came off the RX submission queue back to the pool disposes of a
+ * buffer the kernel considers part of its RX ring, which is worth seeing in the trace. */
 static bool
-deliverPacket(IOUserNetworkRxCompletionQueue *queue, IOUserNetworkPacketBufferPool *pool,
-              IOUserNetworkPacket *packet, bool fromSubmitQueue)
+deliverPacket(SMSC95xxDriver_IVars *ivars, IOUserNetworkPacket *packet,
+              bool fromSubmitQueue)
 {
-    IOReturn ret = queue->enqueuePackets(&packet, 1);
+    IOReturn ret = ivars->rxComplete->enqueuePackets(&packet, 1);
     if (ret == kIOReturnSuccess) {
         return true;
     }
 
-    Log("RxComplete: enqueuePackets(1) FAILED: 0x%x%{public}s -- the stack accepted ZERO "
-        "packets (that is all this status means; it is not a capacity report). Returning the "
-        "packet, which came from %{public}s, to the pool",
-        ret, (ret == kIOReturnOverrun) ? " (kIOReturnOverrun)" : "",
-        fromSubmitQueue ? "the RX submission queue" : "the pool");
+    ivars->rxEnqueueFailures++;
+    if (ivars->rxEnqueueFailures <= SMSC95XX_RX_FAULT_LOG_LIMIT) {
+        Log("RxComplete: enqueuePackets(1) FAILED: 0x%x%{public}s -- the stack accepted "
+            "ZERO packets (that is all this status means; it is not a capacity report). "
+            "Returning the packet, which came from %{public}s, to the pool (failure %llu)",
+            ret, (ret == kIOReturnOverrun) ? " (kIOReturnOverrun)" : "",
+            fromSubmitQueue ? "the RX submission queue" : "the pool",
+            ivars->rxEnqueueFailures);
+    }
 
-    IOReturn dret = pool->deallocatePacket(packet);
+    IOReturn dret = ivars->pool->deallocatePacket(packet);
     if (dret != kIOReturnSuccess) {
+        ivars->rxLost++;
         Log("RxComplete: deallocatePacket after the failed enqueue also failed: 0x%x -- 1 "
-            "packet is LOST to the pool", dret);
+            "packet LOST (total lost %llu)", dret, ivars->rxLost);
     }
     return false;
 }
 
 /* Obtain one empty packet to receive a frame into.
  *
- * THE RX SUBMISSION QUEUE IS THE SOURCE, and getting that wrong is why receive used to fail
- * with kIOReturnOverrun on the very first frame.
+ * The RX submission queue is the source, mirroring transmit: the stack supplies empty
+ * buffers on the RX submission queue, the driver dequeues them, fills them, and returns
+ * them on the RX completion queue. A packet must be enqueued on the completion queue it
+ * was submitted from -- EnqueuePackets completes each packet against its submission queue
+ * -- so a buffer allocated straight from the pool has nothing to complete against and the
+ * enqueue fails with kIOReturnOverrun.
  *
- * The family's model is symmetric with transmit, which works: the stack enqueues packets on
- * the TX SUBMISSION queue, the driver dequeues them, transmits, and returns them on the TX
- * COMPLETION queue. Receive is the mirror -- the stack supplies empty buffers on the RX
- * SUBMISSION queue, the driver dequeues those, fills them, and returns them on the RX
- * COMPLETION queue. This driver used to allocate straight from the pool instead and never
- * touch rxSubmit at all, so it was handing rxComplete packets the kernel had never given it.
- *
- * The mechanism, read out of NetworkingDriverKit: EnqueuePackets calls
- * packet->_CompleteWithQueue(queue, direction) on each packet -- a kernel RPC -- and stops at
- * the first one that fails. A packet is "completed with" a queue it was submitted on, so a
- * bare pool allocation has nothing to complete against.
- *
- * The pool fallback is kept deliberately, not as belt and braces but as the experiment: if the
- * stack does not put anything on rxSubmit, the log says so explicitly and the enqueue then
- * fails exactly as before, which is itself the answer. The remaining lead in that case is
- * IOUserNetworkPacketPoller (NetworkingDriverKit/IOUserNetworkPacketPoller.iig), whose
- * PollAction is documented as checking "for packets that can be dequeued or enqueued". */
+ * The pool fallback exists only for the case where the stack supplies nothing on
+ * rxSubmit; the enqueue then fails, which the log records explicitly. */
 static IOUserNetworkPacket *
 rxAcquirePacket(SMSC95xxDriver_IVars *ivars, bool *fromSubmitQueue)
 {
@@ -1139,21 +981,19 @@ rxAcquirePacket(SMSC95xxDriver_IVars *ivars, bool *fromSubmitQueue)
             return packet;
         }
 
-        /* Loud, but only for the first few: if this is the steady state then receive cannot
-         * work at all and the reason must be in the log, whereas an occasional empty queue
-         * under load is just backpressure and must not flood. */
+        /* Loud, but only for the first few: a steady state here means receive cannot work
+         * and the reason must be in the log, while an occasional empty queue under load is
+         * just backpressure and must not flood. */
         ivars->rxSubmitEmpty++;
         if (ivars->rxSubmitEmpty <= SMSC95XX_RX_TRACE_PACKETS) {
             Log("RxComplete: the RX submission queue gave nothing (DequeuePackets -> %u, "
-                "packet=%{public}s, empty #%llu). Falling back to allocating from the pool, "
-                "which is what used to fail at enqueue -- if this repeats, the stack is not "
-                "supplying RX buffers on this queue and the poller model is the next lead",
+                "packet=%{public}s, empty #%llu) -- falling back to the pool, whose enqueue "
+                "will fail if the stack is not supplying RX buffers on this queue",
                 count, packet != nullptr ? "set" : "null", ivars->rxSubmitEmpty);
         }
     } else {
-        /* Rate-limited for the same reason as the branch above: this is called once per
-         * received frame, and os_log throttles hard enough under a burst that a flood here
-         * would take the rest of the attach's log with it. */
+        /* Rate-limited for the same reason: called once per frame, and a flood would take
+         * the rest of the attach's log with it. */
         ivars->rxSubmitEmpty++;
         if (ivars->rxSubmitEmpty <= SMSC95XX_RX_TRACE_PACKETS) {
             Log("RxComplete: there is no RX submission queue (rxSubmit is null, empty #%llu) "
@@ -1181,17 +1021,14 @@ IMPL(SMSC95xxDriver, RxComplete)
 {
     (void)action;
 
-    /* First, before any branch can return: the transfer this completion belongs to is over,
-     * so the buffer is free for the next one. Clearing it here rather than at each exit is
-     * what makes armRxRead's "already outstanding" check mean the hardware state and not
-     * merely "we have been here before". */
+    /* First, before any branch can return: this transfer is over, so the buffer is free
+     * for the next one. Clearing rxArmed here rather than at each exit is what makes
+     * armRxRead's "already outstanding" check reflect the hardware state. */
     ivars->rxArmed = false;
     ivars->rxCompletions++;
 
-    /* The RX half of the serialisation check TxDataAvailable already carries, and the pair
-     * the code comment in this file asked Task 7 to add. Both are diagnostics, not locks: if
-     * either fires, the "one dispatch queue, therefore no locking" design is wrong and has to
-     * be revisited rather than patched. */
+    /* The RX half of the serialisation guard TxDataAvailable carries: if either fires, the
+     * "one dispatch queue, therefore no locking" design is void and must be revisited. */
     if (ivars->inRxComplete) {
         Log("*** RxComplete RE-ENTERED: callbacks are NOT serialised ***");
     }
@@ -1297,9 +1134,8 @@ IMPL(SMSC95xxDriver, RxComplete)
             records++;
             ivars->rxRecords++;
 
-            /* The raw status word for EVERY record, decoded, whether or not it is dropped
-             * below. Six of these bits have never been observed set on this hardware, so a
-             * frame that trips one is worth having in the log verbatim. */
+            /* The raw status word for every record, decoded, dropped or not: several of
+             * these bits have never been observed set on this hardware. */
             Diag7("RxComplete: record %u: status 0x%08x len-field %u frame_len %zu "
                   "next-offset %zu | ERRSUM=%d FILTFAIL=%d BCAST=%d MCAST=%d FTYPE=%d "
                   "LENERR=%d RUNT=%d TOOLONG=%d COLL=%d WDOG=%d MIIERR=%d DRIB=%d CRCERR=%d",
@@ -1323,11 +1159,13 @@ IMPL(SMSC95xxDriver, RxComplete)
             if ((rxStatus & (SMSC95XX_RX_STS_ERROR_SUM | SMSC95XX_RX_STS_FILTER_FAIL)) != 0) {
                 ivars->rxDropped++;
                 dropped++;
-                Log("RxComplete: DROP record %u: status 0x%08x has%{public}s%{public}s "
-                    "(total dropped %llu)", records, rxStatus,
-                    (rxStatus & SMSC95XX_RX_STS_ERROR_SUM)   ? " ERROR_SUM"   : "",
-                    (rxStatus & SMSC95XX_RX_STS_FILTER_FAIL) ? " FILTER_FAIL" : "",
-                    ivars->rxDropped);
+                if (ivars->rxDropped <= SMSC95XX_RX_FAULT_LOG_LIMIT) {
+                    Log("RxComplete: DROP record %u: status 0x%08x has%{public}s%{public}s "
+                        "(total dropped %llu)", records, rxStatus,
+                        (rxStatus & SMSC95XX_RX_STS_ERROR_SUM)   ? " ERROR_SUM"   : "",
+                        (rxStatus & SMSC95XX_RX_STS_FILTER_FAIL) ? " FILTER_FAIL" : "",
+                        ivars->rxDropped);
+                }
                 continue;
             }
             /* frame_len INCLUDES the trailing 4-byte Ethernet CRC the hardware leaves in
@@ -1336,26 +1174,30 @@ IMPL(SMSC95xxDriver, RxComplete)
             if (frameLen <= SMSC95XX_RX_CRC_LEN) {
                 ivars->rxDropped++;
                 dropped++;
-                Log("RxComplete: DROP record %u: frame_len %zu is not longer than the %u-byte "
-                    "CRC, status 0x%08x (total dropped %llu)", records, frameLen,
-                    (unsigned int)SMSC95XX_RX_CRC_LEN, rxStatus, ivars->rxDropped);
+                if (ivars->rxDropped <= SMSC95XX_RX_FAULT_LOG_LIMIT) {
+                    Log("RxComplete: DROP record %u: frame_len %zu is not longer than the "
+                        "%u-byte CRC, status 0x%08x (total dropped %llu)", records, frameLen,
+                        (unsigned int)SMSC95XX_RX_CRC_LEN, rxStatus, ivars->rxDropped);
+                }
                 continue;
             }
             size_t payloadLen = frameLen - SMSC95XX_RX_CRC_LEN;
-            /* Memory safety, not policy: smsc95xx_rx_next only checks that the record fits
-             * the 4096-byte transfer buffer, and the pool's packet buffers are 2048 bytes. */
+            /* Memory safety: smsc95xx_rx_next only checks the record fits the transfer
+             * buffer, which is larger than a packet buffer. */
             if (payloadLen > SMSC95XX_RX_MAX_PAYLOAD) {
                 ivars->rxDropped++;
                 dropped++;
-                Log("RxComplete: DROP record %u: payload %zu exceeds the %u-byte maximum this "
-                    "driver will copy, status 0x%08x (total dropped %llu)", records,
-                    payloadLen, (unsigned int)SMSC95XX_RX_MAX_PAYLOAD, rxStatus,
-                    ivars->rxDropped);
+                if (ivars->rxDropped <= SMSC95XX_RX_FAULT_LOG_LIMIT) {
+                    Log("RxComplete: DROP record %u: payload %zu exceeds the %u-byte maximum "
+                        "this driver will copy, status 0x%08x (total dropped %llu)", records,
+                        payloadLen, (unsigned int)SMSC95XX_RX_MAX_PAYLOAD, rxStatus,
+                        ivars->rxDropped);
+                }
                 continue;
             }
 
             /* A buffer to receive into: the RX submission queue first, the pool as the
-             * labelled fallback. See rxAcquirePacket. */
+             * fallback. See rxAcquirePacket. */
             bool                 fromSubmitQueue = false;
             IOUserNetworkPacket *packet = rxAcquirePacket(ivars, &fromSubmitQueue);
             if (packet == nullptr) {
@@ -1364,55 +1206,49 @@ IMPL(SMSC95xxDriver, RxComplete)
                 ivars->rxDropped++;
                 dropped++;
                 noBuffer = true;
-                Log("RxComplete: no packet available from the submission queue or the pool at "
-                    "record %u -- abandoning the rest of this transfer (total dropped %llu)",
-                    records, ivars->rxDropped);
+                if (ivars->rxDropped <= SMSC95XX_RX_FAULT_LOG_LIMIT) {
+                    Log("RxComplete: no packet available from the submission queue or the "
+                        "pool at record %u -- abandoning the rest of this transfer (total "
+                        "dropped %llu)", records, ivars->rxDropped);
+                }
                 break;
             }
 
-            /* SAFETY NET, deliberately kept even though the pool is now created with
-             * PoolFlagMapToDext and this address should always be valid.
+            /* Address sanity check before the copy. A fault here is not one crash: the
+             * driver would die on every received frame, and IOKit's respawn loop turns a
+             * repeating dext crash into a kernel panic. Anything below 1 MB cannot be a
+             * mapped buffer in this address space (an unmapped pool hands back small
+             * pool-relative offsets), so refuse and drop rather than memcpy.
              *
-             * When the pool was created without that flag, getDataVirtualAddress()
-             * returned pool-relative OFFSETS -- 0xa800, 0xc000, 0xd800 were packets 21,
-             * 24 and 27 at 2048 bytes each -- and the memcpy below faulted inside
-             * _platform_memmove. That alone would be a driver crash, but IOKit relaunches
-             * a dead dext, the driver died on every received frame, and the respawn loop
-             * exhausted SPTM shared regions and PANICKED THE KERNEL.
-             *
-             * So the cost of a bad address here is not a crash, it is the user's machine.
-             * A one-comparison check that turns it into a dropped frame and a log line is
-             * worth keeping permanently. Anything below 1 MB cannot be a mapped buffer in
-             * this address space, while it comfortably covers every offset this pool could
-             * produce (64 x 2048 = 128 KB).
-             *
-             * getDataOff() is added because getDataVirtualAddress() returns the buffer BASE and
-             * does NOT include the packet's data offset -- it is a bare ivar load in the family,
-             * and getDataOff() reads a different ivar. This used to write at the base while the
-             * stack read from base + offset, which put every received frame 8 bytes early. Same
-             * root cause as the transmit-side misalignment; see txSubmitPacket. */
+             * getDataOff() is added because getDataVirtualAddress() returns the buffer
+             * BASE and does not include the packet's data offset; the stack reads the
+             * frame from base + offset. Same arithmetic as the transmit side. */
             size_t   dataOff = packet->getDataOff();
             uint64_t base    = packet->getDataVirtualAddress();
             uint64_t dst     = base + dataOff;
             if (base < 0x100000ull) {
                 ivars->rxDropped++;
                 dropped++;
-                Log("RxComplete: REFUSING to copy: getDataVirtualAddress() returned "
-                    "0x%llx, which is not a mapped address -- this is the pool-not-mapped "
-                    "bug (PoolFlagMapToDext missing) and copying would fault and, via the "
-                    "dext respawn loop, panic the kernel. Dropping record %u "
-                    "(total dropped %llu)", base, records, ivars->rxDropped);
+                if (ivars->rxDropped <= SMSC95XX_RX_FAULT_LOG_LIMIT) {
+                    Log("RxComplete: REFUSING to copy: getDataVirtualAddress() returned "
+                        "0x%llx, which is not a mapped address (is the pool missing "
+                        "PoolFlagMapToDext?) -- copying would fault. Dropping record %u "
+                        "(total dropped %llu)", base, records, ivars->rxDropped);
+                }
                 ivars->pool->deallocatePacket(packet);
                 break;
             }
-            /* The offset eats into the 2048-byte buffer, so the bound has to account for it
+            /* The offset eats into the packet buffer, so the bound has to account for it
              * rather than assume SMSC95XX_RX_MAX_PAYLOAD alone is safe. */
             if (dataOff + payloadLen > SMSC95XX_POOL_BUFFER_SIZE) {
                 ivars->rxDropped++;
                 dropped++;
-                Log("RxComplete: DROP record %u: data offset %zu plus payload %zu exceeds the "
-                    "%u-byte packet buffer (total dropped %llu)", records, dataOff, payloadLen,
-                    (unsigned int)SMSC95XX_POOL_BUFFER_SIZE, ivars->rxDropped);
+                if (ivars->rxDropped <= SMSC95XX_RX_FAULT_LOG_LIMIT) {
+                    Log("RxComplete: DROP record %u: data offset %zu plus payload %zu "
+                        "exceeds the %u-byte packet buffer (total dropped %llu)", records,
+                        dataOff, payloadLen, (unsigned int)SMSC95XX_POOL_BUFFER_SIZE,
+                        ivars->rxDropped);
+                }
                 ivars->pool->deallocatePacket(packet);
                 continue;
             }
@@ -1424,9 +1260,11 @@ IMPL(SMSC95xxDriver, RxComplete)
                  * packet whose length did not take cannot be delivered. Return it. */
                 ivars->rxDropped++;
                 dropped++;
-                Log("RxComplete: setDataLength(%zu) failed: 0x%x at record %u -- returning "
-                    "the packet to the pool (total dropped %llu)", payloadLen, sret, records,
-                    ivars->rxDropped);
+                if (ivars->rxDropped <= SMSC95XX_RX_FAULT_LOG_LIMIT) {
+                    Log("RxComplete: setDataLength(%zu) failed: 0x%x at record %u -- "
+                        "returning the packet to the pool (total dropped %llu)", payloadLen,
+                        sret, records, ivars->rxDropped);
+                }
                 IOReturn dret = ivars->pool->deallocatePacket(packet);
                 if (dret != kIOReturnSuccess) {
                     ivars->rxLost++;
@@ -1441,36 +1279,37 @@ IMPL(SMSC95xxDriver, RxComplete)
                   records, payloadLen, frameLen, (unsigned int)SMSC95XX_RX_CRC_LEN,
                   dst, base, dataOff);
 
-            ivars->rxFrames++;
-
             /* Delivered immediately rather than batched: see deliverPacket. The packet is
              * either the stack's now or back in the pool; either way it is accounted for
-             * before the next record is decoded, so no exit from this loop can leak it. */
-            if (deliverPacket(ivars->rxComplete, ivars->pool, packet, fromSubmitQueue)) {
+             * before the next record is decoded, so no exit from this loop can leak it.
+             * rxFrames counts only delivered frames, so the accounting identities hold:
+             * records == frames + dropped, and frames == enqueued. */
+            if (deliverPacket(ivars, packet, fromSubmitQueue)) {
                 delivered++;
+                ivars->rxFrames++;
                 ivars->rxEnqueued++;
             } else {
-                ivars->rxEnqueueFailures++;
                 ivars->rxDropped++;
                 dropped++;
             }
         }
 
-        /* "walk ended at offset N of M", not "N of M consumed": the offset is advanced by the
-         * 4-byte-ALIGNED record size, so after the last record it can legitimately sit past
-         * actualByteCount -- a 106-byte transfer of one 102-byte record ends at 108. The loop
-         * then terminates on the next bounds check, which is correct. Reporting that as
-         * "108 of 106 bytes consumed" read like a buffer overrun and was purely a wording bug.
-         * An offset well SHORT of actualByteCount is the interesting case: it means the walk
-         * stopped early on a malformed record. */
+        /* "walk ended at offset N", not "N consumed": the offset advances by the 4-byte-
+         * aligned record size, so after the last record it can sit slightly past
+         * actualByteCount, and the loop terminates on the next bounds check. An offset well
+         * SHORT of actualByteCount means the walk stopped early on a malformed record. */
         Diag7("RxComplete #%llu: %u bytes -> %u records, %u delivered, %u dropped, walk ended "
               "at offset %zu of %u%{public}s", ivars->rxCompletions, actualByteCount,
               records, delivered, dropped, offset, actualByteCount,
               noBuffer ? "  <-- NO RECEIVE BUFFER AVAILABLE, remainder of the transfer discarded"
                             : "");
         if (records == 0) {
-            Log("RxComplete: %u bytes decoded to ZERO records -- the first status word is "
-                "malformed or the transfer is not framed as expected", actualByteCount);
+            ivars->rxZeroRecords++;
+            if (ivars->rxZeroRecords <= SMSC95XX_RX_FAULT_LOG_LIMIT) {
+                Log("RxComplete: %u bytes decoded to ZERO records -- the first status word "
+                    "is malformed or the transfer is not framed as expected (occurrence "
+                    "%llu)", actualByteCount, ivars->rxZeroRecords);
+            }
         }
     }
 
@@ -1495,25 +1334,22 @@ IMPL(SMSC95xxDriver, TxComplete)
 {
     (void)action;
 
-    /* FIRST, before any branch or log line: this transfer is over, so the scratch buffer is
-     * free and the packet is ours to dispose of. Taking the pointer and clearing the ivar in
-     * the same breath is what makes double completion impossible -- a second completion for
-     * the same transfer, however it arose, would find a null packet and return nothing. */
+    /* FIRST, before any branch or log line: this transfer is over, so the scratch buffer
+     * is free and the packet is ours to dispose of. Taking the pointer and clearing the
+     * ivar together makes double completion impossible -- a second completion for the same
+     * transfer finds a null packet and returns nothing. */
     IOUserNetworkPacket *packet = ivars->txPacket;
     ivars->txPacket   = nullptr;
     ivars->txInFlight = false;
     ivars->txCompletions++;
 
-    /* The TX half of the serialisation diagnostic the other two callbacks carry. */
+    /* The TX half of the serialisation guard the other two callbacks carry. Skipped once
+     * teardown has started: the synchronous Abort delivers this completion on whichever
+     * thread runs Stop(), not the dispatch queue, so the check would fire every teardown. */
     if (ivars->inTxComplete) {
         Log("*** TxComplete RE-ENTERED: callbacks are NOT serialised ***");
     }
     ivars->inTxComplete = true;
-    /* Skipped once teardown has started, and this is not laziness: teardownDatapath calls
-     * Abort(kIOUSBAbortSynchronous), whose completion the SDK says may be delivered while the
-     * abort is still on the stack -- i.e. on whichever thread is running Stop(), which is not
-     * the driver's dispatch queue. Checking it there would report a serialisation failure
-     * every single teardown and teach the reader to ignore the line. */
     if (ivars->txDatapathReady && ivars->dispatchQueue != nullptr
             && !ivars->dispatchQueue->OnQueue()) {
         Log("*** TxComplete NOT on the driver's dispatch queue ***");

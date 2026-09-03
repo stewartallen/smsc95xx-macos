@@ -1,4 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0 */
+/*
+ * Copyright (C) 2026 Stewart Allen
+ * Derived from the Linux smsc95xx driver, Copyright (C) 2007-2008 SMSC. See NOTICE.
+ */
 #include "smsc95xx_proto.h"
 #include "smsc95xx_regs.h"
 
@@ -106,10 +110,9 @@ bool smsc95xx_rx_next(const uint8_t *buf, size_t len, size_t *offset,
     size_t flen = (size_t)((sts & SMSC95XX_RX_STS_LEN_MASK) >>
                            SMSC95XX_RX_STS_LEN_SHIFT);
 
-    /* The frame length must include the 4-byte CRC appended by the hardware.
-     * A length below that minimum is not decodable. Also reject zero and any
-     * frame that runs past the buffer. */
-    if (flen < SMSC95XX_RX_CRC_LEN || flen == 0)
+    /* The reported length includes the 4-byte CRC the hardware appends, so a
+     * shorter record is not decodable; reject one that runs past the buffer. */
+    if (flen < SMSC95XX_RX_CRC_LEN)
         return false;
     if (at + SMSC95XX_RX_HEADER_LEN + flen > len)
         return false;

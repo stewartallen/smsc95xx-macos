@@ -3,14 +3,13 @@
  * SMSC95xxDriver's instance variables.
  *
  * The class is built from two translation units -- SMSC95xxDriver.cpp owns the control
- * path (registers, MII, EEPROM, chip init, the network-stack plumbing) and
- * SMSC95xxDriver_datapath.cpp owns the bulk endpoints -- and both dereference `ivars`,
- * so the layout has to be one shared definition rather than a copy in each file. iig
- * only forward-declares SMSC95xxDriver_IVars in the generated header; defining it is
- * ours to do, exactly once.
+ * path (registers, MII, EEPROM, chip init, network-stack plumbing) and
+ * SMSC95xxDriver_datapath.cpp owns the bulk endpoints -- and both dereference `ivars`, so
+ * the layout is one shared definition. iig only forward-declares SMSC95xxDriver_IVars in
+ * the generated header; defining it is ours to do, exactly once.
  *
  * Pointer members are forward-declared rather than #included: nothing here calls a
- * method, and each .cpp already includes the real headers for the objects it touches.
+ * method, and each .cpp includes the real headers for the objects it touches.
  */
 
 #ifndef SMSC95xxDriver_ivars_h
@@ -19,6 +18,14 @@
 #include <stdint.h>
 
 #include "smsc95xx_regs.h"      /* SMSC95XX_MAC_LEN */
+
+/* The packet pool shared by both directions, created in SMSC95xxDriver.cpp and used as
+ * a memcpy bound in SMSC95xxDriver_datapath.cpp -- defined once here so the pool's real
+ * geometry and the bounds checks against it cannot drift apart. 2048 bytes comfortably
+ * holds a 1518-byte maximum frame plus the 8-byte TX command header at any data offset
+ * the family reserves. */
+#define SMSC95XX_POOL_PACKET_COUNT 64
+#define SMSC95XX_POOL_BUFFER_SIZE  2048
 
 class IOUSBHostInterface;
 class IOUSBHostPipe;
@@ -36,15 +43,13 @@ class IOUserNetworkRxCompletionQueue;
 
 /* `interface` is the matched provider and the ONLY USB object this class holds, so it is
  * BORROWED: close it if we opened it, never release it. There is deliberately no device
- * handle here. Vendor control transfers do reach the device, but IOUSBHostInterface is
- * the object that carries them: DeviceRequest with kIOUSBDeviceRequestRecipientDevice
- * issues the request to the device on our behalf (see readRegister/writeRegister), and
- * the datapath takes its pipes from the interface too. Selecting the configuration is
- * SMSC95xxUSBDevice's job. So do not re-add a CopyDevice() handle: nothing would read it,
- * and it could not be opened anyway -- IOUSBHostDevice admits one opener and the
- * device-level driver holds that session.
- * `ctrlBuffer` is a 4-byte IOBufferMemoryDescriptor used for all vendor control
- * transfers (reads and writes). `ctrlBytes` is the mapped address of ctrlBuffer. */
+ * handle: DeviceRequest with kIOUSBDeviceRequestRecipientDevice carries vendor control
+ * transfers to the device (see readRegister/writeRegister), and the datapath takes its
+ * pipes from the interface. Configuration selection is SMSC95xxUSBDevice's job, and
+ * IOUSBHostDevice admits one opener which that driver holds -- so a CopyDevice() handle
+ * here could not be opened anyway.
+ * `ctrlBuffer` is a 4-byte IOBufferMemoryDescriptor for all vendor control transfers;
+ * `ctrlBytes` is its mapped address. */
 struct SMSC95xxDriver_IVars {
     IOUSBHostInterface      *interface;
     IOBufferMemoryDescriptor *ctrlBuffer;
@@ -64,8 +69,7 @@ struct SMSC95xxDriver_IVars {
     IOUserNetworkTxCompletionQueue *txComplete;
     IOUserNetworkRxCompletionQueue *rxComplete;
 
-    /* Datapath. One transfer in flight in each direction -- M5 is correctness, M6 is
-     * throughput (AsyncIOBundled is the upgrade path). */
+    /* Datapath. One transfer in flight in each direction. */
     IOUSBHostPipe            *pipeIn;      /* bulk IN  0x81, retained by CopyPipe */
     IOUSBHostPipe            *pipeOut;     /* bulk OUT 0x02, retained by CopyPipe */
     IOBufferMemoryDescriptor *rxBuffer;
@@ -88,36 +92,21 @@ struct SMSC95xxDriver_IVars {
      * it before doing anything else. */
     bool                      txInFlight;
     IOUserNetworkPacket      *txPacket;    /* the packet the in-flight TX belongs to */
-    /* True between the end of setupDatapath() and the FIRST statement of
-     * teardownDatapath(), and it is the drain loop's gate. teardownDatapath aborts the bulk
-     * OUT pipe synchronously, and the aborted transfer's TxComplete can be delivered while
-     * that abort is still on the stack -- so without this, that completion would pull fresh
-     * packets out of the submission queue and hand them to a pipe and a buffer that are
-     * about to be released. With it, the aborted completion still returns its own packet to
-     * the stack (the TX completion queue outlives teardownDatapath: TearDown releases the
-     * queues only after it returns) and then stops. */
+    /* True between the end of setupDatapath() and the first statement of
+     * teardownDatapath(); the drain loop's gate. teardownDatapath aborts the bulk OUT pipe
+     * synchronously, and the aborted transfer's TxComplete can be delivered while that
+     * abort is still on the stack -- with this flag false that completion returns its own
+     * packet (the TX completion queue outlives teardownDatapath) and then stops, rather
+     * than pulling fresh packets into a buffer about to be released. */
     bool                      txDatapathReady;
-    /* Diagnostic, not synchronisation. The design assumes every datapath callback
-     * serialises on one dispatch queue and therefore needs no locking. That should now
-     * hold by construction -- a DataAvailable handler runs on the queue set for the target
-     * method of its OSAction, which for TxDataAvailable is the same queue the pipe
-     * completions use -- so this flag exists to check the load-bearing assumption rather
-     * than to assume it. Set on entry to TxDataAvailable and cleared on every exit: if it
-     * is already set on entry, callbacks are NOT serialised and the design has to be
-     * revisited rather than patched with a lock. Being a plain bool it can miss a genuine
-     * race, so a clean run is weak evidence, not proof. */
+    /* Re-entrancy guards on the "every datapath callback serialises on one dispatch queue,
+     * so no locking" assumption. Set on entry to each callback and cleared on exit; a set
+     * flag on entry means callbacks are NOT serialised and the design must be revisited,
+     * not patched with a lock. Plain bools, so a clean run is weak evidence, not proof.
+     * inTxComplete's OnQueue() check is skipped once txDatapathReady is false: the aborted
+     * completion at teardown is delivered off the dispatch queue and would fire it. */
     bool                      inTxDataAvailable;
-    /* The RX half of the same diagnostic. Set on entry to RxComplete and cleared on every
-     * exit; a true reading on entry means the completion handler re-entered, i.e. the
-     * "one dispatch queue, therefore no locking" assumption is void. Same caveat as
-     * inTxDataAvailable: a plain bool can miss a genuine race, so quiet is weak evidence. */
     bool                      inRxComplete;
-    /* The TX-completion half of the same diagnostic, which the datapath file asked for when
-     * TxComplete grew a body. Note the ONE expected exception, handled in TxComplete rather
-     * than here: the completion of a transfer aborted by teardownDatapath is delivered on
-     * whichever thread called Abort(kIOUSBAbortSynchronous), which is not necessarily the
-     * driver's dispatch queue -- so the OnQueue() check is skipped once txDatapathReady is
-     * false, or teardown would print a spurious "not serialised" line every time. */
     bool                      inTxComplete;
     /* True while a bulk IN transfer is outstanding against ivars->rxBuffer. One buffer means
      * one transfer: two overlapping AsyncIOs would write the same memory, so armRxRead()
@@ -128,21 +117,12 @@ struct SMSC95xxDriver_IVars {
      * down after at most one more completion instead of reading into a released buffer. */
     bool                      rxRunning;
 
-    /* The idle-RX backoff. Without it, a completion that delivers nothing is re-armed
-     * immediately, and a device with nothing to give completes the next read instantly:
-     * measured at ~364,000 arms and 19% of a CPU core. This is STATE, not a diagnostic --
-     * RxComplete branches on it.
-     *
-     * rxIdleRun counts CONSECUTIVE completions that delivered no bytes: a zero-length
-     * success or a failed transfer both count, because both leave nothing to hand the
-     * stack and both can repeat instantly. Any completion carrying data resets it to 0,
-     * which is what returns the receive path to immediate re-arming.
-     *
-     * rxBackoffTimer re-arms the read after SMSC95XX_RX_BACKOFF_NS once the run passes
-     * SMSC95XX_RX_IDLE_RUN_LIMIT, so the loop settles at a handful of arms per second
-     * instead of spinning, and the interface is never left permanently deaf.
-     * rxBackoffActive exists so the log line is emitted once per episode rather than once
-     * per completion -- the busy loop being diagnosed produced its own log flood. */
+    /* The idle-RX backoff state (RxComplete branches on it). rxIdleRun counts consecutive
+     * completions that delivered no bytes -- a zero-length success or a failed transfer
+     * both count; a completion carrying data resets it to 0. Past SMSC95XX_RX_IDLE_RUN_LIMIT,
+     * rxBackoffTimer re-arms the read every SMSC95XX_RX_BACKOFF_NS so an idle device settles
+     * at a few arms per second instead of spinning. rxBackoffActive gates the log line to
+     * once per episode. */
     uint64_t                  rxIdleRun;
     bool                      rxBackoffActive;
     IOTimerDispatchSource    *rxBackoffTimer;
@@ -153,14 +133,11 @@ struct SMSC95xxDriver_IVars {
     uint64_t                  rxDropped;
     uint64_t                  txFrames;             /* transfers that completed successfully */
     uint64_t                  txErrors;
-    /* TX diagnostics (M5). Counters, not state: nothing branches on them.
-     *
-     * THE ONE THAT MATTERS IS THE PAIR txDequeued / (txReturned + txLost). Every packet
-     * taken off the submission queue must be handed back to the stack exactly once, so
-     * txDequeued == txReturned + txLost + (1 if a transfer is in flight else 0) at every
-     * quiescent point. A shortfall means packets are being consumed and never completed,
-     * which drains the 64-packet pool and wedges transmit silently -- so this is the
-     * accounting identity to read out of the log, not a nice-to-have. */
+    /* TX counters, not state: nothing branches on them. The load-bearing pair is
+     * txDequeued vs (txReturned + txLost): every packet taken off the submission queue is
+     * handed back exactly once, so txDequeued == txReturned + txLost + (1 if in flight) at
+     * every quiescent point. A shortfall means packets consumed and never completed, which
+     * drains the pool and wedges transmit silently. */
     uint64_t                  txDoorbells;          /* TxDataAvailable callbacks           */
     uint64_t                  txDrains;             /* drain-loop calls, either caller     */
     uint64_t                  txDequeued;           /* packets taken off txSubmit          */
@@ -174,13 +151,14 @@ struct SMSC95xxDriver_IVars {
     uint64_t                  txStalls;             /* bulk OUT stalls cleared             */
     uint64_t                  txAborted;            /* completions with kIOReturnAborted   */
     uint64_t                  txDeferred;           /* drains that stopped on txInFlight   */
-    /* RX diagnostics (M5). Counters, not state: nothing branches on them, they exist so a
-     * single log line can say how far the receive path got. */
+    /* RX counters, not state: they exist so a single log line can say how far the receive
+     * path got. records == frames + dropped, and frames == enqueued, are the identities. */
     uint64_t                  rxCompletions;        /* RxComplete callbacks, all statuses  */
     uint64_t                  rxCompletionErrors;   /* completions with a failure status   */
     uint64_t                  rxZeroLength;         /* successful completions of 0 bytes   */
     uint64_t                  rxByteCount;          /* bytes delivered by the bulk IN pipe */
     uint64_t                  rxRecords;            /* status-word records decoded         */
+    uint64_t                  rxZeroRecords;        /* transfers with bytes but no records */
     uint64_t                  rxEnqueued;           /* packets accepted by the stack       */
     uint64_t                  rxEnqueueFailures;    /* enqueuePackets calls that failed    */
     /* rxSubmitDequeued vs rxSubmitEmpty is the load-bearing pair: it says whether the stack

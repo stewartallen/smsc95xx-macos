@@ -1,0 +1,31 @@
+smsc95xx-macos
+Copyright (C) 2026 Stewart Allen
+
+This program is free software licensed under the GNU General Public License,
+version 2. See the LICENSE file for the full text.
+
+-------------------------------------------------------------------------------
+Derived work
+-------------------------------------------------------------------------------
+
+This driver is a port of the Linux kernel driver for the SMSC/Microchip LAN95xx
+USB-Ethernet controllers:
+
+    drivers/net/usb/smsc95xx.c
+    SPDX-License-Identifier: GPL-2.0-or-later
+    Copyright (C) 2007-2008 SMSC (now Microchip Technology Inc.)
+
+The chip initialisation sequence, register programming order, register/bit
+definitions, and half-duplex configuration are derived from that source. The
+present work is therefore a derivative work and is distributed under GPL-2.0, a
+permitted narrowing of the upstream "or later" grant.
+
+The upstream driver has had additional contributors and copyright holders over
+its history. Anyone redistributing this project should confirm the copyright
+line above against the exact upstream revision they are tracking; the notice
+here reflects the header of the current mainline file
+(drivers/net/usb/smsc95xx.c).
+
+Register addresses and bit definitions also correspond to facts published in
+Microchip's LAN9500A datasheet. The programming *sequences* are the part derived
+from the GPL-licensed Linux source.

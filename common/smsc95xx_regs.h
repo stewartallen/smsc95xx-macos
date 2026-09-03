@@ -1,5 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
+ * Copyright (C) 2026 Stewart Allen
+ * Derived from the Linux smsc95xx driver, Copyright (C) 2007-2008 SMSC. See NOTICE.
+ *
  * LAN9500A register map. Offsets and bit masks follow the Linux smsc95xx
  * driver's definitions; values observed on real hardware are recorded in
  * reference/mach-init-sequence.txt or reference/evb-init-sequence.txt.
@@ -102,12 +105,10 @@ extern "C" {
 /* MAC address bit: locally administered vs. globally unique. */
 #define SMSC95XX_MAC_LOCALLY_ADMINISTERED 0x02u
 
-/* TX framing. Each frame sent on the bulk OUT endpoint is preceded by two
- * little-endian 32-bit command words.
- *
- * Verified against ten frames in reference/mach-bringup.pcap: every one had
- * TX_CMD_A == (FIRST_SEG | LAST_SEG | len) and TX_CMD_B == len, with the bulk
- * transfer being exactly 8 + len bytes and no padding. */
+/* TX framing. Each frame sent on the bulk OUT endpoint is preceded by two little-endian
+ * 32-bit command words: TX_CMD_A == (FIRST_SEG | LAST_SEG | len) and TX_CMD_B == len,
+ * the transfer being exactly 8 + len bytes with no padding (verified against captured
+ * transfers in reference/mach-bringup.pcap). */
 #define SMSC95XX_TX_HEADER_LEN     8
 #define SMSC95XX_TX_CMD_A_LEN_MASK 0x000007FFu
 #define SMSC95XX_TX_CMD_A_LAST_SEG 0x00001000u
@@ -120,35 +121,18 @@ extern "C" {
 #define SMSC95XX_FRAME_MIN         42
 #define SMSC95XX_FRAME_MAX         1514
 
-/* RX framing. Each frame in a bulk IN transfer is preceded by one
- * little-endian 32-bit status word, and each record is padded so the next
- * status word starts on a 4-byte boundary.
+/* RX framing. Each frame in a bulk IN transfer is preceded by one little-endian 32-bit
+ * status word, and each record is padded so the next status word starts on a 4-byte
+ * boundary.
  *
- * VERIFIED against measured hardware:
- *   4-byte header and LEN_MASK/LEN_SHIFT -- confirmed on three transfers whose
- *     4 + len exactly equalled the observed size (68/70/108 for len 64/66/104).
- *   length includes the Ethernet CRC.
- *   BROADCAST, MULTICAST, FRAME_TYPE -- confirmed across all three address
- *     classes, which separates the bits from one another rather than just
- *     showing them set:
- *       broadcast (ff:ff:ff:ff:ff:ff)      low bits 0x2420  BC+MC+FT
- *       multicast (33:33:.. / 01:00:5E:..) low bits 0x0420  MC+FT, BC clear
- *       unicast                            low bits 0x0020  FT only
- *     Multicast is the discriminating case: a defect treating BROADCAST and
- *     MULTICAST as one bit would pass the broadcast and unicast samples but
- *     fail here.
- *   FILTER_FAIL and ERROR_SUM were clear on every known-good frame observed,
- *     which is consistent but is not a positive confirmation.
+ * Verified on hardware: the 4-byte header, the length field (including the trailing
+ * Ethernet CRC), and BROADCAST/MULTICAST/FRAME_TYPE, confirmed independently across
+ * broadcast, multicast and unicast frames.
  *
- * NOT VERIFIED (transcribed from Linux smsc95xx, never provoked):
- * LENGTH_ERROR, RUNT, TOO_LONG, COLLISION, WATCHDOG, MII_ERROR, DRIBBLING,
- * CRC_ERROR. These are error conditions awaiting real hardware observations.
- * Also not verified: the multi-frame record padding and 4-byte alignment rule.
- * Only single-record transfers have been received on this hardware; multi-frame
- * transfers are reachable via HW_CFG_INIT_2's MEF enable but have never been
- * observed. The padding calculation (4 - (used % 4)) % 4 comes from the Linux
- * driver and is mirrored in the test builder, so the tests cannot distinguish a
- * correct rule from an incorrect one that both sides agree on. */
+ * Transcribed from the Linux smsc95xx driver but not yet observed on this hardware:
+ * the error bits (LENGTH_ERROR, RUNT, TOO_LONG, COLLISION, WATCHDOG, MII_ERROR,
+ * DRIBBLING, CRC_ERROR) and the multi-frame record padding rule -- only single-record
+ * transfers have been captured, although MEF is enabled. */
 #define SMSC95XX_RX_HEADER_LEN     4
 #define SMSC95XX_RX_STS_FILTER_FAIL  0x40000000u
 #define SMSC95XX_RX_STS_LEN_MASK     0x3FFF0000u

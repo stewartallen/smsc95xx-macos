@@ -158,6 +158,16 @@ ifneq ($(strip $(TRACE)),)
 DK_CXXFLAGS  += -DSMSC95XX_TRACE=1
 endif
 
+# The TRACE flag must participate in dependency tracking: without this stamp, switching
+# between `make` and `make TRACE=1` over an existing build/ reuses up-to-date objects and
+# silently ships the previous tracing state. The stamp file's name encodes the state, so
+# flipping the flag invalidates every object that compiles with DK_CXXFLAGS.
+TRACE_STAMP  := $(BUILD)/.trace-$(if $(strip $(TRACE)),on,off)
+$(TRACE_STAMP):
+	@mkdir -p $(BUILD)
+	@rm -f $(BUILD)/.trace-on $(BUILD)/.trace-off
+	@touch $@
+
 DK_CFLAGS    := -target $(DK_TARGET) -isysroot $(DK_SDK) -std=c11 \
                 -Wall -Wextra -I$(COMMON)
 DK_LDFLAGS   := -target $(DK_TARGET) -isysroot $(DK_SDK) \
@@ -195,17 +205,17 @@ $(GEN)/$(DEXT_NAME).h: $(DEXT_NAME)/$(DEXT_NAME).iig
 # declaring a second target keeps `make -j` from running iig twice.
 $(GEN)/$(DEXT_NAME).iig.cpp: $(GEN)/$(DEXT_NAME).h
 
-$(BUILD)/$(DEXT_NAME).o: $(DEXT_NAME)/$(DEXT_NAME).cpp $(GEN)/$(DEXT_NAME).h $(COMMON_HDRS) $(DEXT_HDRS)
+$(BUILD)/$(DEXT_NAME).o: $(DEXT_NAME)/$(DEXT_NAME).cpp $(GEN)/$(DEXT_NAME).h $(COMMON_HDRS) $(DEXT_HDRS) $(TRACE_STAMP)
 	@mkdir -p $(BUILD)
 	xcrun -sdk driverkit clang++ $(DK_CXXFLAGS) -I$(DEXT_NAME) -c $< -o $@
 
 # The second translation unit of the same class: the bulk datapath. Shares
 # SMSC95xxDriver_IVars with the file above via $(DEXT_HDRS).
-$(BUILD)/$(DEXT_NAME)_datapath.o: $(DEXT_NAME)/$(DEXT_NAME)_datapath.cpp $(GEN)/$(DEXT_NAME).h $(COMMON_HDRS) $(DEXT_HDRS)
+$(BUILD)/$(DEXT_NAME)_datapath.o: $(DEXT_NAME)/$(DEXT_NAME)_datapath.cpp $(GEN)/$(DEXT_NAME).h $(COMMON_HDRS) $(DEXT_HDRS) $(TRACE_STAMP)
 	@mkdir -p $(BUILD)
 	xcrun -sdk driverkit clang++ $(DK_CXXFLAGS) -I$(DEXT_NAME) -c $< -o $@
 
-$(BUILD)/$(DEXT_NAME).iig.o: $(GEN)/$(DEXT_NAME).iig.cpp
+$(BUILD)/$(DEXT_NAME).iig.o: $(GEN)/$(DEXT_NAME).iig.cpp $(TRACE_STAMP)
 	xcrun -sdk driverkit clang++ $(DK_CXXFLAGS) -c $< -o $@
 
 $(BUILD)/smsc95xx_proto.o: $(COMMON)/smsc95xx_proto.c $(COMMON_HDRS)
@@ -232,11 +242,11 @@ $(GEN)/$(DEV_NAME).h: $(DEV_NAME)/$(DEV_NAME).iig
 
 $(GEN)/$(DEV_NAME).iig.cpp: $(GEN)/$(DEV_NAME).h
 
-$(BUILD)/$(DEV_NAME).o: $(DEV_NAME)/$(DEV_NAME).cpp $(GEN)/$(DEV_NAME).h
+$(BUILD)/$(DEV_NAME).o: $(DEV_NAME)/$(DEV_NAME).cpp $(GEN)/$(DEV_NAME).h $(TRACE_STAMP)
 	@mkdir -p $(BUILD)
 	xcrun -sdk driverkit clang++ $(DK_CXXFLAGS) -I$(DEV_NAME) -c $< -o $@
 
-$(BUILD)/$(DEV_NAME).iig.o: $(GEN)/$(DEV_NAME).iig.cpp
+$(BUILD)/$(DEV_NAME).iig.o: $(GEN)/$(DEV_NAME).iig.cpp $(TRACE_STAMP)
 	@mkdir -p $(BUILD)
 	xcrun -sdk driverkit clang++ $(DK_CXXFLAGS) -I$(DEV_NAME) -c $< -o $@
 

@@ -17,10 +17,12 @@ make test       # runs unit tests for the pure protocol layer (no hardware)
 ./smsc95xx-probe --device 0424:9e00 id
 ```
 
-**Note:** On the MACH SYSTEMS dongle (`0424:9e00`), the `./smsc95xx-probe eeprom` and
-`./smsc95xx-probe all` commands exit with code 1, because the EEPROM read returns invalid
-data (all zeros). This is a hardware finding, not a tool bug. Anyone scripting this tool
-should expect that exit code.
+**Note:** On the MACH SYSTEMS dongle in its `0424:9e00` (EEPROM auto-load failed) state, the
+`./smsc95xx-probe eeprom` and `./smsc95xx-probe all` commands exit with code 1. The read does
+not fail electrically — it returns a systematically mis-clocked image whose offset-0 byte is
+`0x4A` instead of the `0xA5` signature and whose MAC reads as `4a:f8:f8:c2:c2:f2`, so the probe
+rejects it on the provenance check rather than trust it. This is a hardware finding, not a tool
+bug; anyone scripting this tool should expect that exit code.
 
 ## Subcommands
 

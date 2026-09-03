@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0
 """Decode a Linux usbmon pcap into an annotated smsc95xx register/MII trace.
 
 Reads a usbmon capture of the smsc95xx driver bringing up a LAN9500A and prints

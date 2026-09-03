@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 
+#include <os/log.h>
 #include <DriverKit/IOLib.h>
 #include <DriverKit/IOService.h>
 #include <USBDriverKit/IOUSBHostDevice.h>
@@ -76,6 +77,9 @@ IMPL(SMSC95xxUSBDevice, Start)
     ret = ivars->device->Open(this, 0, 0);
     if (ret != kIOReturnSuccess) {
         Log("device Open failed: 0x%x", ret);
+        /* Null before Stop: ivars->device non-null is what tells Stop to Close, and
+         * closing a device that was never opened unbalances the opener accounting. */
+        ivars->device = nullptr;
         Stop(provider, SUPERDISPATCH);
         return ret;
     }
@@ -85,10 +89,8 @@ IMPL(SMSC95xxUSBDevice, Start)
         Log("device already configured");
         OSSafeReleaseNULL(probe);
     } else {
-        /* matchInterfaces MUST be true here: the interface nodes this creates are
-         * exactly what SMSC95xxDriver's personality matches against. M4 passed false
-         * because one driver owned everything; in the split that would leave the
-         * interface driver with nothing to match. */
+        /* matchInterfaces MUST be true: the interface nodes this creates are what
+         * SMSC95xxDriver's personality matches against. */
         ret = ivars->device->SetConfiguration(1, true);
         if (ret != kIOReturnSuccess) {
             Log("SetConfiguration(1) failed: 0x%x", ret);
@@ -100,22 +102,10 @@ IMPL(SMSC95xxUSBDevice, Start)
         Log("device arrived unconfigured; selected configuration 1 with interface matching");
     }
 
-    /* The session is deliberately held for this driver's lifetime, NOT released after
-     * configuring. Two reasons, one measured here:
-     *
-     * Holding it open does not hide the interfaces. Measured on hardware: CopyInterface
-     * reports one interface both before and after Close, and the interface node is
-     * published in the IOService plane either way. An earlier round of this work closed
-     * the device on the theory that exclusive access suppressed interface publication;
-     * that theory was wrong, and it came from reading the IOUSB plane, which does not
-     * show interface nodes as device children.
-     *
-     * And it keeps other openers out. This device attracts them: with the session held,
-     * the registry shows Google Chrome and cef_server both parked on it as
-     * AppleUSBHostDeviceUserClient children, and the log shows their open attempts being
-     * refused because the provider is already opened for exclusive access. Releasing the
-     * session would let an arbitrary process claim the device between configuration and
-     * our own interface driver starting. */
+    /* The session is held for this driver's lifetime, NOT released after configuring:
+     * holding it open keeps other processes from claiming the device between
+     * configuration and the interface driver starting, and it does not hide the
+     * interface nodes (they are published in the IOService plane either way). */
     Log("Start: done, holding the device open");
     return kIOReturnSuccess;
 }

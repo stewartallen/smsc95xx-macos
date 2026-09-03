@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
 # Capture the USB bring-up of an smsc95xx-class device on a Linux host.
 #
 # Starts a usbmon capture, waits for the device to enumerate and its network

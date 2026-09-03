@@ -1,20 +1,19 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * The LAN9500A power-on initialisation sequence, parameterised by register I/O.
+ * Copyright (C) 2026 Stewart Allen
+ * Derived from the Linux smsc95xx driver, Copyright (C) 2007-2008 SMSC. See NOTICE.
  *
- * This is the one thing that MUST be identical in the userspace probe and in the
- * DriverKit extension, so it lives in common/ alongside the framing helpers rather
- * than being written twice. Everything here is pure C with no platform headers, no
- * allocation and no sleeping: the two reset waits are read-polls, and the caller
- * supplies register access through a pair of callbacks. That is what makes the
- * sequence testable on the host with a mock that simply records every write.
+ * LAN9500A power-on initialisation, parameterised by register I/O callbacks.
  *
- * Provenance: the register values and their ORDER are transcribed from the decoded
- * capture of the real Linux driver bringing this hardware up
- * (reference/mach-init-sequence.txt) and were proven end to end at milestone M2,
- * where the probe used exactly this sequence to transmit and receive Ethernet
- * frames over 10BASE-T1S. The ordering is load-bearing -- see the comments at the
- * MAC_CR/TX_CFG writes -- so it must not be tidied or reordered.
+ * Shared verbatim by the userspace probe and the DriverKit extension so the two cannot
+ * drift. Pure C with no platform headers, no allocation and no sleeping: the reset wait
+ * is a read-poll, and the caller supplies register access through callbacks, which is
+ * what makes the sequence unit-testable on the host.
+ *
+ * The register values and their ORDER are transcribed from a capture of the Linux
+ * smsc95xx driver bringing this hardware up (reference/mach-init-sequence.txt). The
+ * ordering encodes undocumented hardware requirements -- see the MAC_CR/TX_CFG comments
+ * in smsc95xx_init.c -- so it must not be reordered.
  */
 #ifndef SMSC95XX_INIT_H
 #define SMSC95XX_INIT_H
@@ -29,14 +28,14 @@ extern "C" {
 
 /* Register access, supplied by the caller.
  *
- * Both callbacks return 0 on success and any non-zero value on failure; that value
- * is propagated to the caller of smsc95xx_init_seq unchanged, so a caller whose
- * transport speaks IOReturn gets its own IOReturn back. `ctx` is passed through
- * untouched and is never dereferenced here.
+ * Both callbacks return 0 on success and any non-zero value on failure; that value is
+ * propagated to the caller of smsc95xx_init_seq unchanged, so a caller whose transport
+ * speaks IOReturn gets its own IOReturn back. `ctx` is passed through untouched and is
+ * never dereferenced here.
  *
- * `read` must leave *value untouched on failure. `write` must not retry: the
- * sequence stops at the first failure on purpose, because a chip that rejected one
- * register write is not in a state where the remaining writes mean anything. */
+ * `read` must leave *value untouched on failure. `write` must not retry: the sequence
+ * stops at the first failure, because a chip that rejected one register write is not in
+ * a state where the remaining writes mean anything. */
 typedef struct {
     void *ctx;
     int (*read)(void *ctx, uint16_t offset, uint32_t *value);
@@ -45,49 +44,42 @@ typedef struct {
 
 /* Failures that originate here rather than in a callback.
  *
- * Deliberately NOT IOReturn values: common/ carries no platform headers, so it
- * cannot name kIOReturnTimeout. They are small negatives, which no IOReturn ever
- * is (IOReturn failure codes are 0xe00002xx), so a caller can tell the two apart
- * and map these onto its own error space -- both callers do. */
+ * Deliberately NOT IOReturn values: common/ carries no platform headers, so it cannot
+ * name kIOReturnTimeout. They are small negatives, which no IOReturn failure ever is
+ * (those are 0xe00002xx), so a caller can tell the two apart and map these onto its own
+ * error space. */
 #define SMSC95XX_INIT_ERR_BAD_ARG       (-1)
 #define SMSC95XX_INIT_ERR_RESET_TIMEOUT (-2)
 
-/* Read-polls of HW_CFG allowed while waiting for the chip to clear LRST itself.
- * The captured traces show it clear on the first read; the bound exists only so
- * broken hardware cannot hang the caller. */
+/* Maximum read-polls of HW_CFG while waiting for the chip to clear LRST itself. The
+ * chip clears it almost immediately; the bound only keeps broken hardware from hanging
+ * the caller. */
 #define SMSC95XX_INIT_RESET_POLLS       100
 
 /* Number of register WRITES the sequence performs when every callback succeeds.
- * Exported so a caller can log progress meaningfully and so the unit tests can
- * assert the count rather than only the contents. */
+ * Exported so a caller can log progress and the unit tests can assert the count. */
 #define SMSC95XX_INIT_WRITE_COUNT       20
 
-/* Run the full initialisation sequence and leave the chip receiving and
- * transmitting.
+/* Run the full initialisation sequence and leave the chip receiving and transmitting.
  *
- * Writes 20 registers in a fixed order, including MAC_CR three times -- the last
- * of which carries RXEN and TXEN, i.e. this is the call that switches the datapath
- * on -- plus the station address in ADDRL/ADDRH, TX_CFG, HW_CFG (with the
- * multiple-Ethernet-frames bit the RX decoder depends on), BURST_CAP, BULK_IN_DLY,
- * AFC_CFG, FLOW, HASHH/HASHL, VLAN1, LED_GPIO_CFG, PM_CTRL and INT_STS.
+ * Writes 20 registers in a fixed order, including the station address in ADDRL/ADDRH
+ * and the final MAC_CR write that switches the datapath on. Configures the MAC for
+ * 10 Mb/s half duplex -- RCVOWN set, FDPX clear, the low nibble of AFC_CFG set -- which
+ * is what this hardware runs at; it has no autonegotiation. When `promiscuous` is true,
+ * MAC_CR.PRMS is set as well.
  *
  * Two registers the captured Linux bring-up writes are deliberately NOT written:
  * checksum offload (COE_CR), which is out of scope and would add two bytes to every
- * received frame; and the interrupt endpoint (INT_EP_CTL), because link state is
- * polled instead.
- *
- * Configures the MAC for 10 Mb/s half duplex -- RCVOWN set, FDPX clear, and the low
- * nibble of AFC_CFG set -- which is what this hardware runs at; it has no
- * autonegotiation. When `promiscuous` is true, MAC_CR.PRMS is set as well.
+ * received frame; and the interrupt endpoint (INT_EP_CTL), because link state is polled
+ * instead.
  *
  * Returns 0 on success, a callback's own non-zero error otherwise, or one of the
- * SMSC95XX_INIT_ERR_* codes above. On failure the chip is left partially
- * initialised: the caller must not present a working interface. */
+ * SMSC95XX_INIT_ERR_* codes above. On failure the chip is left partially initialised:
+ * the caller must not present a working interface. */
 int smsc95xx_init_seq(const smsc95xx_io *io, const uint8_t mac[6], bool promiscuous);
 
-/* Name of a register offset, for logging. Returns a static string, never NULL;
- * unknown offsets come back as "?". Pure lookup -- no I/O, no allocation -- so it
- * is usable from a completion handler or a dext log line. */
+/* Name of a register offset, for logging. Returns a static string, never NULL; unknown
+ * offsets come back as "?". Pure lookup -- no I/O, no allocation. */
 const char *smsc95xx_reg_name(uint16_t offset);
 
 #ifdef __cplusplus

@@ -1,11 +1,14 @@
 /* SPDX-License-Identifier: GPL-2.0 */
+/*
+ * Copyright (C) 2026 Stewart Allen
+ * Derived from the Linux smsc95xx driver, Copyright (C) 2007-2008 SMSC. See NOTICE.
+ */
 #include "smsc95xx_init.h"
 
 #include "smsc95xx_proto.h"
 #include "smsc95xx_regs.h"
 
-/* Write a register and stop at the first failure, to keep the sequence readable.
- * Moved here verbatim with the sequence it serves. */
+/* Write a register and stop at the first failure, to keep the sequence readable. */
 #define WR(off, val)                                     \
     do {                                                 \
         int wkr = io->write(io->ctx, (off), (val));       \
@@ -18,13 +21,13 @@ int smsc95xx_init_seq(const smsc95xx_io *io, const uint8_t mac[6], bool promiscu
     uint32_t v = 0;
     int kr;
 
-    /* Checked rather than assumed: a null callback here would be a null call in the
-     * middle of a partially initialised chip. */
+    /* A null callback here would be a null call in the middle of a partially
+     * initialised chip, so check rather than assume. */
     if (io == NULL || io->read == NULL || io->write == NULL || mac == NULL)
         return SMSC95XX_INIT_ERR_BAD_ARG;
 
-    /* Lite reset, then wait for the chip to clear the bit itself. A read-poll, not a
-     * sleep: that is what keeps this layer free of any platform timing API. */
+    /* Lite reset, then read-poll until the chip clears the bit itself -- no sleeping,
+     * which keeps this layer free of any platform timing API. */
     WR(SMSC95XX_REG_HW_CFG, SMSC95XX_HW_CFG_LRST);
     for (int i = 0; ; i++) {
         kr = io->read(io->ctx, SMSC95XX_REG_HW_CFG, &v);
@@ -32,12 +35,11 @@ int smsc95xx_init_seq(const smsc95xx_io *io, const uint8_t mac[6], bool promiscu
             return kr;
         if (!(v & SMSC95XX_HW_CFG_LRST))
             break;
-        if (i >= SMSC95XX_INIT_RESET_POLLS)
+        if (i + 1 >= SMSC95XX_INIT_RESET_POLLS)
             return SMSC95XX_INIT_ERR_RESET_TIMEOUT;
     }
 
-    /* The station address. smsc95xx_mac_to_regs is the shared packer, unit-tested
-     * against both dongles' measured ADDRL/ADDRH pairs -- not reimplemented here. */
+    /* The station address. */
     {
         uint32_t addrl = 0, addrh = 0;
         smsc95xx_mac_to_regs(mac, &addrl, &addrh);
@@ -66,10 +68,9 @@ int smsc95xx_init_seq(const smsc95xx_io *io, const uint8_t mac[6], bool promiscu
         mac_cr |= SMSC95XX_MAC_CR_PRMS;
 
     WR(SMSC95XX_REG_MAC_CR, 0);
-    /* The captured sequence enables the transmitter in MAC_CR BEFORE turning on
-     * the TX datapath in TX_CFG, then enables the receiver afterwards. Both
-     * captures agree on this ordering; preserve it rather than collapsing the
-     * writes, since these orderings encode undocumented hardware requirements. */
+    /* The captured bring-up enables the transmitter in MAC_CR BEFORE turning on the TX
+     * datapath in TX_CFG, then enables the receiver afterwards. The ordering encodes an
+     * undocumented hardware requirement; do not collapse these writes. */
     WR(SMSC95XX_REG_MAC_CR, SMSC95XX_MAC_CR_TXEN);
     WR(SMSC95XX_REG_TX_CFG, SMSC95XX_TX_CFG_ON);
     WR(SMSC95XX_REG_MAC_CR, mac_cr);
@@ -78,8 +79,9 @@ int smsc95xx_init_seq(const smsc95xx_io *io, const uint8_t mac[6], bool promiscu
     WR(SMSC95XX_REG_AFC_CFG,
        SMSC95XX_AFC_CFG_INIT | SMSC95XX_AFC_CFG_HALF_DUPLEX_BITS);
 
-    /* PHY reset is read-modify-write: the surrounding bits differ between
-     * devices and must be preserved. */
+    /* PHY reset is read-modify-write: the surrounding bits differ between devices and
+     * must be preserved. The captured bring-up does not poll for PHY_RST completion --
+     * it proceeds straight to MII traffic -- so neither does this. */
     kr = io->read(io->ctx, SMSC95XX_REG_PM_CTRL, &v);
     if (kr != 0)
         return kr;
