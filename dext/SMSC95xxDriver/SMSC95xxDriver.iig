@@ -56,9 +56,16 @@ public:
     virtual void RxBackoffExpired(OSAction *action, uint64_t time)
         TYPE(IOTimerDispatchSource::TimerOccurred);
 
-    /* Datapath, implemented in SMSC95xxDriver_datapath.cpp. */
+    /* Datapath, implemented in SMSC95xxDriver_datapath.cpp.
+     *
+     * Teardown is two phases because IOService::Stop requires cancelling in-flight
+     * asynchronous work and waiting for its cancellation handlers BEFORE calling super:
+     *   quiesceDatapath() stops new work and joins the USB pipes (synchronous Abort);
+     *   releaseDatapath() drops the objects, and must run only once every dispatch-source
+     *   cancellation handler has fired. Stop() sequences the two around its Cancel calls. */
     virtual kern_return_t setupDatapath() LOCALONLY;
-    virtual void          teardownDatapath() LOCALONLY;
+    virtual void          quiesceDatapath() LOCALONLY;
+    virtual void          releaseDatapath() LOCALONLY;
     virtual kern_return_t armRxRead() LOCALONLY;
     /* The single re-arm decision point for RxComplete. `carriedData` says whether the
      * completion that is asking to re-arm actually delivered bytes; that is the only input

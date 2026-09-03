@@ -1,0 +1,144 @@
+Teardown quiescence: why Stop() is asynchronous
+===============================================
+
+The driver runs every datapath callback -- both USB pipe completions, the TX doorbell
+(TxDataAvailable) and the idle-RX backoff timer (RxBackoffExpired) -- on its own Default
+dispatch queue, and takes no locks, on the grounds that a serial queue serialises them.
+Teardown has to end that safely: it releases the RX/TX transfer buffers, the packet
+queues, and the pool, all of which those callbacks dereference.
+
+Until this change, teardown disabled the timer and the doorbell with SetEnable(false) and
+released them immediately afterwards. That was not sound, and the reason is a documented
+gap rather than an observed failure.
+
+
+What Apple documents
+--------------------
+
+IOService::Stop (developer.apple.com, IOService/Stop discussion):
+
+    "Use your implementation of this method to stop all activity and put your driver in a
+    quiescent state. If your driver has any in-progress asynchronous tasks, cancel those
+    tasks and wait for DriverKit to call the associated cancellation handler before calling
+    the super version of this method."
+
+    "Call super at the end of your implementation. After you call super, it is a
+    programmer error to access the provider object."
+
+So quiescing is the DRIVER's responsibility. Nothing in the DriverKit headers or the
+documentation says the framework drains the Default queue before calling Stop.
+
+The join primitives, and which ones actually join:
+
+  IODispatchSource::Cancel(handler)          handler runs "after the dispatch source
+                                             finishes any in-flight callbacks". After
+                                             cancellation the source can only be freed.
+                                             ---> a real join.
+
+  IOTimerDispatchSource::SetEnableWithCompletion(false, h)
+                                             h runs "after any pending handlers of a newly
+                                             disabled timer finish executing".
+                                             ---> a real join, for the timer only.
+
+  IODataQueueDispatchSource::SetEnableWithCompletion(false, h)
+                                             h runs only "after this method successfully
+                                             disables the dispatch source" -- it says
+                                             nothing about in-flight handlers.
+                                             ---> NOT a join. Cancel is required here.
+
+  IODispatchSource::SetEnable(false)         documented only as "Enables or disables the
+                                             delivery of events to your code". No statement
+                                             about a handler that is already executing.
+                                             ---> NOT a join.
+
+  IOUSBHostPipe::Abort(kIOUSBAbortSynchronous, ...)
+                                             "abort() should not return until the aborted IO
+                                             has completed."
+                                             ---> a real join, for pipe completions.
+
+  IODispatchQueue::Cancel(handler)           "If a task is already executing, that task runs
+                                             to completion. After all tasks finish, the
+                                             dispatch queue executes the block in the
+                                             handler."
+                                             ---> a real join, whole-queue (heavy-handed).
+
+OSAction::Cancel(handler) is the equivalent join for an action whose lifetime is not
+fully under the driver's control (for example one handed to another process). The
+timer/doorbell actions here are internal, and the source drops its own reference to its
+action when the source is cancelled, so cancelling the sources is sufficient.
+
+
+Why the old code was wrong
+--------------------------
+
+SetEnable(false) prevents future deliveries but is not documented to wait for a handler
+that is already running. Releasing the source, and then the shared RX/TX buffers and the
+packet queues, straight after it therefore depended on the queue happening to be idle at
+that moment -- an assumption that rests on Stop being delivered on the same serial queue as
+the handlers, which the headers never promise.
+
+That assumption may well hold on any given machine. It is not something to ship: a
+different scheduler, a different platform, or heavier load can invalidate it, and the
+failure mode is a use-after-free in a dext. A dext fault that repeats -- and this one would
+repeat on every received frame -- is escalated by IOKit's respawn loop into a kernel panic,
+which this project has hit before for an unrelated reason. So the fix does not depend on
+the assumption at all.
+
+
+Why Stop cannot simply block and wait
+-------------------------------------
+
+The obvious reading of "wait for the cancellation handler before calling super" is to block
+inside Stop until the handler runs. That deadlocks: the handlers are delivered on the
+driver's Default queue, which is serial, and Stop is itself delivered on that queue, so a
+cancellation handler cannot start until Stop returns.
+
+Apple's own DriverKit sample code resolves this by making Stop asynchronous rather than
+blocking (see "Communicating between a DriverKit extension and a client app",
+NullDriverUserClient::Stop_Impl): count the objects to be cancelled into an atomic, Cancel
+each one with a shared handler block, and return WITHOUT calling super. The handler
+decrements the count, and whichever cancellation finishes last calls
+super::Stop(provider, SUPERDISPATCH). `this` and the provider are retained across the
+asynchronous gap and released once super has returned.
+
+
+What this driver now does
+-------------------------
+
+Stop():
+  1. quiesceDatapath() -- clear rxRunning and txDatapathReady so no new work starts, log the
+     counters, and Abort(kIOUSBAbortSynchronous) both bulk pipes. That is a documented join
+     for the pipe completions, so after it returns only the two dispatch-source handlers can
+     still run.
+  2. Count the cancellable sources (backoff timer, TX doorbell) into a __block atomic.
+     If the count is zero, release and call super in-frame and return.
+  3. Retain `this` and the provider.
+  4. Cancel(finalize) each source. Cancel copies the block to the heap, which is why the
+     same local block can be handed to both calls -- and note that a STACK block passed to
+     Cancel and invoked later is a use-after-free, which is what an earlier `Cancel(^{ })`
+     attempt in this driver crashed on.
+  5. Return kIOReturnSuccess without calling super.
+
+  finalize (runs on the dispatch queue, once per cancelled source):
+     atomically decrement; on the last one, releaseDatapath() and ReleaseResources() -- which
+     is the first moment it is safe to drop the buffers, queues and pool -- then
+     super::Stop(provider, SUPERDISPATCH), then release the provider and `this`.
+
+Ordering note: the interface Close happens inside ReleaseResources, i.e. BEFORE super::Stop,
+because after super the provider must not be touched. Releasing the retains afterwards is
+balancing our own references, which is what Apple's sample does too.
+
+The Start() failure path stays synchronous, and that is safe for a specific reason rather
+than by assumption: on that path no bulk IN read has been posted and no packet queue has
+been enabled (both happen in setInterfaceEnable(true)), and the backoff timer, although
+enabled, has never been given a WakeAtTime deadline, so it cannot fire. With no handler able
+to be in flight there is nothing to cancel and wait for.
+
+
+Residual diagnostics
+--------------------
+
+quiesceDatapath logs OnQueue(Default) under TRACE=1, and every datapath callback keeps its
+re-entrancy and OnQueue guards. Those are now a cross-check on the design rather than the
+thing keeping it safe: the correctness argument is the documented cancel-and-wait above, and
+does not rely on what those probes report.

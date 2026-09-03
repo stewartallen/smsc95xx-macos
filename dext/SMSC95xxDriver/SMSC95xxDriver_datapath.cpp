@@ -219,7 +219,7 @@ SMSC95xxDriver::setupDatapath(void)
     }
 
     /* The TX doorbell. CopyDataQueue hands us the submission queue's shared-memory data
-     * queue (Copy, so retained; teardownDatapath releases it), and SetDataAvailableHandler
+     * queue (Copy, so retained; releaseDatapath releases it), and SetDataAvailableHandler
      * asks to be called when the stack makes it non-empty. The handler runs on the queue
      * set for its OSAction's target method -- the same queue as RxComplete/TxComplete --
      * so the datapath keeps one serialisation context. */
@@ -268,7 +268,7 @@ SMSC95xxDriver::setupDatapath(void)
 
     /* LAST, after every object the transmit path dereferences exists: this flag lets the
      * drain loop consume packets. Setting it earlier would let a doorbell hand a packet to
-     * a pipe setup had not finished acquiring; teardownDatapath clears it first. */
+     * a pipe setup had not finished acquiring; quiesceDatapath clears it first. */
     ivars->txDatapathReady = true;
 
     Log("datapath ready: pipes 0x%02x/0x%02x, rx buffer %u bytes, tx buffer %u bytes "
@@ -313,44 +313,50 @@ SMSC95xxDriver::logDatapathCounters(const char *why)
         ivars->rxSubmitEmpty, ivars->rxPoolFailures);
 }
 
+/* PHASE 1 of teardown: stop new work and join the USB pipes. Releases nothing.
+ *
+ * IOService::Stop is documented to require that a driver "stop all activity and put your
+ * driver in a quiescent state", cancelling in-progress asynchronous tasks and waiting for
+ * their cancellation handlers before calling super. This is the half that can be done
+ * synchronously: clearing the two gate flags stops new work being started, and
+ * Abort(kIOUSBAbortSynchronous) is documented not to return until the aborted I/O has
+ * completed, which is a real join for the pipe completions.
+ *
+ * The dispatch sources (the backoff timer and the TX doorbell) cannot be joined here --
+ * their handlers run on the same queue and only Cancel()'s handler is documented to fire
+ * after in-flight callbacks finish. Stop() Cancels them and calls releaseDatapath() from
+ * the final cancellation handler. */
 void
-SMSC95xxDriver::teardownDatapath(void)
+SMSC95xxDriver::quiesceDatapath(void)
 {
-    /* Stop the receive loop BEFORE anything is aborted or released. The synchronous Abort
-     * below can deliver the aborted transfer's completion while this function is still on
-     * the stack; RxComplete is what would re-arm, and with rxRunning already false it will
-     * not, so the abort cannot race a fresh AsyncIO into the buffer about to be released.
+    /* Stop the receive loop BEFORE anything is aborted. The synchronous Abort below can
+     * deliver the aborted transfer's completion while this function is still on the stack;
+     * RxComplete is what would re-arm, and with rxRunning already false it will not.
      *
      * rxArmed is NOT cleared here: the aborted transfer's completion clears it, and
      * clearing it early would let a late armRxRead() double-arm. */
     logDatapathCounters("datapath teardown");
-    Diag7("teardownDatapath: entered. rxRunning=%{public}s rxArmed=%{public}s",
-          ivars->rxRunning ? "true" : "false", ivars->rxArmed ? "true" : "false");
-    /* Is teardown running ON the driver's Default dispatch queue? DriverKit does not
-     * document that it quiesces the queue before Stop, so this is the load-bearing
-     * empirical question: if true, the queue is serial FIFO and no timer/doorbell handler
-     * can be mid-flight here, so SetEnable(false)+release is safe by serialization; if
-     * false, a handler could run concurrently and teardown would have to join it (Cancel
-     * with a heap completion, or a DispatchSync barrier) before releasing shared buffers. */
-    Diag7("teardownDatapath: OnQueue(Default)=%{public}s",
+    Diag7("quiesceDatapath: entered. rxRunning=%{public}s rxArmed=%{public}s "
+          "OnQueue(Default)=%{public}s",
+          ivars->rxRunning ? "true" : "false", ivars->rxArmed ? "true" : "false",
           (ivars->dispatchQueue != nullptr && ivars->dispatchQueue->OnQueue()) ? "true" : "false");
-    Diag7("teardownDatapath: idle-RX backoff state: idleRun=%llu active=%{public}s "
+    Diag7("quiesceDatapath: idle-RX backoff state: idleRun=%llu active=%{public}s "
           "episodes=%llu wakes=%llu", ivars->rxIdleRun,
           ivars->rxBackoffActive ? "true" : "false", ivars->rxBackoffEpisodes,
           ivars->rxBackoffWakes);
     ivars->rxRunning = false;
 
-    /* Close the transmit path to new work before aborting or releasing, for the same
-     * reason. The synchronous bulk OUT Abort can deliver TxComplete from inside this
-     * function; with this flag false that completion returns its own packet (the TX
-     * completion queue outlives this function -- TearDown releases the queues afterwards)
-     * and then stops, rather than framing more packets into a buffer about to be released.
+    /* Close the transmit path to new work, for the same reason. The synchronous bulk OUT
+     * Abort can deliver TxComplete from inside this function; with this flag false that
+     * completion returns its own packet (the TX completion queue is still alive -- it is
+     * released in releaseDatapath's caller, after every cancellation has run) and then
+     * stops, rather than framing more packets.
      *
      * txInFlight is NOT cleared here, like rxArmed: the aborted completion clears it, and
      * clearing it early would let a drain slip a second transfer past the one-in-flight
      * rule. */
     ivars->txDatapathReady = false;
-    Diag6("teardownDatapath: TX state: inFlight=%{public}s packet=%{public}s doorbells=%llu "
+    Diag6("quiesceDatapath: TX state: inFlight=%{public}s packet=%{public}s doorbells=%llu "
           "drains=%llu dequeued=%llu submitted=%llu completions=%llu frames=%llu "
           "returned=%llu lost=%llu bytes=%llu rejected=%llu submitFail=%llu stalls=%llu "
           "aborted=%llu deferred=%llu errors=%llu",
@@ -361,52 +367,47 @@ SMSC95xxDriver::teardownDatapath(void)
           ivars->txBytesSent, ivars->txRejected, ivars->txSubmitFailures, ivars->txStalls,
           ivars->txAborted, ivars->txDeferred, ivars->txErrors);
 
-    /* The backoff timer goes down FIRST: a pending wake would call armRxRead() against the
-     * buffer about to be released.
-     *
-     * SetEnable(false) ONLY, never Cancel(): Cancel takes a completion block and invokes
-     * it asynchronously, so a stack block would be dereferenced after this frame returns
-     * (a use-after-free that crashes on every subsequent frame). SetEnable(false) stops
-     * the source firing, and releasing our reference below is then all that is ours to do.
-     * A cancel handler, if ever needed, must be a heap block outliving this frame, and the
-     * source must not be released until it has run. */
-    if (ivars->rxBackoffTimer != nullptr) {
-        kern_return_t er = ivars->rxBackoffTimer->SetEnable(false);
-        Diag7("teardownDatapath: RX backoff timer SetEnable(false) -> 0x%x", er);
-    }
-    OSSafeReleaseNULL(ivars->rxBackoffAction);
-    OSSafeReleaseNULL(ivars->rxBackoffTimer);
-    ivars->rxBackoffActive = false;
-    ivars->rxIdleRun       = 0;
-
-    /* The doorbell goes next. SetEnable(false) stops further DataAvailable callbacks; one
-     * already queued behind us is dispatched on this same queue, so it cannot run early,
-     * and the null guards at the top of TxDataAvailable catch the released queues.
-     * Not Cancel(): the source belongs to the submission queue, which frees it with
-     * itself. Releasing our CopyDataQueue and action references is all that is ours to do. */
-    if (ivars->txDataQueue != nullptr) {
-        ivars->txDataQueue->SetEnable(false);
-    }
-    OSSafeReleaseNULL(ivars->txDataAvailableAction);
-    OSSafeReleaseNULL(ivars->txDataQueue);
-
-    /* Abort before releasing, and abort SYNCHRONOUSLY: a transfer still in flight against
-     * a released buffer is a use-after-free inside the USB stack. kIOUSBAbortSynchronous
-     * does not return until the aborted IO has completed, which is the guarantee the
-     * releases below depend on. */
+    /* Abort SYNCHRONOUSLY: a transfer still in flight against a released buffer is a
+     * use-after-free inside the USB stack. kIOUSBAbortSynchronous is documented not to
+     * return until the aborted I/O has completed, so once these return the pipe
+     * completions have run and the pipe has dropped its reference to our actions. */
     if (ivars->pipeIn != nullptr) {
         kern_return_t ar = ivars->pipeIn->Abort(kIOUSBAbortSynchronous, kIOReturnAborted,
                                                 this);
-        Diag7("teardownDatapath: Abort(bulk IN, synchronous) -> 0x%x; rxArmed is now "
+        Diag7("quiesceDatapath: Abort(bulk IN, synchronous) -> 0x%x; rxArmed is now "
               "%{public}s", ar, ivars->rxArmed ? "true (completion not seen yet)" : "false");
     }
     if (ivars->pipeOut != nullptr) {
         kern_return_t ar = ivars->pipeOut->Abort(kIOUSBAbortSynchronous, kIOReturnAborted,
                                                  this);
-        Diag7("teardownDatapath: Abort(bulk OUT, synchronous) -> 0x%x", ar);
+        Diag7("quiesceDatapath: Abort(bulk OUT, synchronous) -> 0x%x", ar);
     }
+    Diag7("quiesceDatapath: complete; pipes aborted, no new work accepted");
+}
+
+/* PHASE 2 of teardown: release the datapath objects.
+ *
+ * MUST NOT be called until every dispatch-source cancellation handler has fired -- see
+ * Stop(). By that point nothing can still be executing on the dispatch queue, so these
+ * releases cannot pull an object out from under a running handler. */
+void
+SMSC95xxDriver::releaseDatapath(void)
+{
+    /* The sources have been cancelled by Stop() (or, on the Start() failure path, were
+     * never armed: no read is posted and no packet queue is enabled until
+     * setInterfaceEnable, and an enabled timer with no deadline never fires). Cancelling
+     * is terminal -- "after cancellation, the source can only be freed" -- so dropping our
+     * references is all that is left. */
+    OSSafeReleaseNULL(ivars->rxBackoffAction);
+    OSSafeReleaseNULL(ivars->rxBackoffTimer);
+    ivars->rxBackoffActive = false;
+    ivars->rxIdleRun       = 0;
+
+    OSSafeReleaseNULL(ivars->txDataAvailableAction);
+    OSSafeReleaseNULL(ivars->txDataQueue);
+
     /* Actions before pipes: an action is what a completion is delivered through, and
-     * nothing can still be pending once the aborts above have returned. */
+     * nothing can still be pending once quiesceDatapath's synchronous aborts returned. */
     OSSafeReleaseNULL(ivars->rxAction);
     OSSafeReleaseNULL(ivars->txAction);
     /* Retained by CopyPipe ("the caller must release the IOUSBHostPipe when finished"),
@@ -424,10 +425,10 @@ SMSC95xxDriver::teardownDatapath(void)
      * with no packet held. If not, the one-in-flight bookkeeping is broken: the packet
      * cannot safely be completed now (a not-yet-delivered completion might still arrive,
      * and completing twice hands the stack a packet we still point at), so it is dropped
-     * and counted. The pool is reclaimed when TearDown releases it. */
+     * and counted. The pool is reclaimed when it is released. */
     if (ivars->txPacket != nullptr || ivars->txInFlight) {
         ivars->txLost++;
-        Log("teardownDatapath: a TX was STILL in flight after a synchronous abort "
+        Log("releaseDatapath: a TX was STILL in flight after a synchronous abort "
             "(inFlight=%{public}s packet=%{public}s) -- the packet is dropped rather than "
             "risk completing it twice (total lost %llu). The one-in-flight bookkeeping is "
             "wrong if this line ever appears.",
@@ -436,10 +437,10 @@ SMSC95xxDriver::teardownDatapath(void)
     }
     ivars->txPacket   = nullptr;
     ivars->txInFlight = false;
-    /* Only now, with the pipe released and the buffer gone, is it certain no transfer can
+    /* Only now, with the pipes released and the buffers gone, is it certain no transfer can
      * be outstanding, so rxArmed becomes just a cleared flag. */
     ivars->rxArmed = false;
-    Diag7("teardownDatapath: complete; pipes, buffers and actions released");
+    Diag7("releaseDatapath: complete; pipes, buffers, sources and actions released");
 }
 
 /* Submit one bulk IN transfer into ivars->rxBuffer.
@@ -453,7 +454,7 @@ SMSC95xxDriver::armRxRead(void)
 {
     if (ivars->pipeIn == nullptr || ivars->rxAction == nullptr
             || ivars->rxBuffer == nullptr) {
-        /* Reached if something arms after teardownDatapath has run. Not an error worth
+        /* Reached if something arms after the datapath has been released. Not an error worth
          * failing an unrelated caller over, but it must never be silent. */
         Log("armRxRead: datapath is gone (pipeIn=%{public}s rxAction=%{public}s "
             "rxBuffer=%{public}s) -- not arming",
@@ -808,7 +809,7 @@ txDrainSubmission(SMSC95xxDriver_IVars *ivars, const char *why)
             ivars->txComplete != nullptr ? "set" : "null");
         return;
     }
-    /* The teardown gate: teardownDatapath clears this before aborting the bulk OUT pipe,
+    /* The teardown gate: quiesceDatapath clears this before aborting the bulk OUT pipe,
      * and the aborted transfer's completion can call this from inside that abort.
      * Consuming a packet here would frame it into a buffer about to be released. */
     if (!ivars->txDatapathReady) {
@@ -1042,7 +1043,7 @@ IMPL(SMSC95xxDriver, RxComplete)
           actualByteCount, completionTimestamp, ivars->rxRunning ? "true" : "false",
           ivars->rxFrames, ivars->rxDropped, ivars->rxEnqueued);
 
-    /* EXIT 1: aborted. Normal at teardown -- teardownDatapath aborts the pipe on purpose --
+    /* EXIT 1: aborted. Normal at teardown -- quiesceDatapath aborts the pipe on purpose --
      * and never fatal. Nothing has been allocated yet. Deliberately does NOT re-arm: the
      * buffer this would read into is about to be released. */
     if (status == kIOReturnAborted) {
@@ -1380,7 +1381,7 @@ IMPL(SMSC95xxDriver, TxComplete)
               "wire including %u-byte headers)", ivars->txCompletions, actualByteCount,
               ivars->txFrames, ivars->txBytesSent, (unsigned int)SMSC95XX_TX_HEADER_LEN);
     } else if (status == kIOReturnAborted) {
-        /* Normal at teardown -- teardownDatapath aborts the pipe on purpose -- and never
+        /* Normal at teardown -- quiesceDatapath aborts the pipe on purpose -- and never
          * fatal. Counted separately from real errors so an error total stays meaningful. */
         ivars->txAborted++;
         why = "transfer aborted";

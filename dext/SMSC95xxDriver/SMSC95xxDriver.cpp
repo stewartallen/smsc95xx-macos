@@ -73,9 +73,9 @@
  * SMSC95xxDriver_datapath.cpp: the class spans two translation units and both need the
  * layout. */
 
-/* Private helper for tearing down resources on Start() failure or Stop(). */
+/* Private helper for releasing resources on Start() failure or Stop(). */
 static void
-TearDown(SMSC95xxDriver *driver, IOService *provider);
+ReleaseResources(SMSC95xxDriver *driver, IOService *provider);
 
 bool
 SMSC95xxDriver::init(void)
@@ -336,17 +336,22 @@ publishProperty(SMSC95xxDriver *driver, const char *key, OSObject *value)
     OSSafeReleaseNULL(props);
 }
 
-/* Teardown for partial Start() failures and for Stop(). Must be safe to call after any
- * subset of ivars has been populated. The order is fixed: the datapath first, then the
- * four queues before the pool they hold references to, then the interface, then the
- * dispatch queue last. */
+/* Release every resource the driver holds. Must be safe to call after any subset of ivars
+ * has been populated, and is idempotent (OSSafeReleaseNULL nulls as it releases).
+ *
+ * MUST NOT be called while anything can still be running on the driver's dispatch queue:
+ * the datapath callbacks dereference the packet queues, the pool and the RX buffer, so
+ * releasing these under a live handler is exactly the use-after-free this ordering exists
+ * to prevent. Callers guarantee that by having quiesced and cancelled first -- see Stop().
+ *
+ * The order is fixed: the datapath first, then the four queues before the pool they hold
+ * references to, then the interface, then the dispatch queue last. */
 static void
-TearDown(SMSC95xxDriver *driver, IOService *provider __unused)
+ReleaseResources(SMSC95xxDriver *driver, IOService *provider __unused)
 {
-    /* The datapath goes FIRST: an in-flight bulk transfer references the RX buffer, and
-     * teardownDatapath aborts both pipes synchronously before releasing anything.
-     * Nothing below may run while a transfer is still live. */
-    driver->teardownDatapath();
+    /* The datapath goes FIRST: its buffers are what an in-flight transfer would have
+     * referenced, and its pipes must be released before the queues that outlive them. */
+    driver->releaseDatapath();
 
     /* Release queues before the pool (they hold references to it). */
     OSSafeReleaseNULL(driver->ivars->txSubmit);
@@ -776,18 +781,97 @@ mac_publish:
     return kIOReturnSuccess;
 
 fail:
-    ::TearDown(this, provider);
+    /* Synchronous teardown, unlike Stop() below, and that is safe here specifically because
+     * nothing asynchronous has been started yet on this path: no bulk IN read is posted and
+     * no packet queue is enabled until setInterfaceEnable(true), and the backoff timer,
+     * although enabled, has never been given a WakeAtTime deadline so it cannot fire. With
+     * no handler able to be in flight there is nothing to cancel and wait for. */
+    quiesceDatapath();
+    ::ReleaseResources(this, provider);
     Stop(provider, SUPERDISPATCH);
     return ret;
 }
 
+/* Stop is ASYNCHRONOUS: it returns without calling super, and super::Stop runs later from
+ * the last dispatch-source cancellation handler.
+ *
+ * This is what IOService::Stop's contract requires -- "stop all activity and put your
+ * driver in a quiescent state. If your driver has any in-progress asynchronous tasks,
+ * cancel those tasks and wait for DriverKit to call the associated cancellation handler
+ * before calling the super version of this method" -- and it is the shape Apple's own
+ * DriverKit sample code uses for exactly this situation.
+ *
+ * WHY IT CANNOT SIMPLY BLOCK AND WAIT: the two dispatch sources deliver their handlers on
+ * the driver's Default queue, which is serial, and Stop is itself delivered on that queue.
+ * A cancellation handler therefore cannot run until Stop returns, so waiting for one inside
+ * Stop would deadlock. Deferring super::Stop into the handler is the join.
+ *
+ * WHY SetEnable(false) IS NOT ENOUGH, which is what this used to do: only Cancel()'s
+ * handler is documented to fire "after any callbacks have completed". SetEnable(false)
+ * documents nothing about a handler that is already executing, so releasing the sources and
+ * the shared buffers straight afterwards relied on an undocumented assumption that the
+ * queue happened to be idle. On a different scheduler, platform or load that is a
+ * use-after-free, and a repeating dext fault becomes a kernel panic through IOKit's respawn
+ * loop -- so this does not rely on it.
+ *
+ * `this` and `provider` are retained across the asynchronous gap and released once
+ * super::Stop has returned. The atomic counter is what makes super::Stop run exactly once,
+ * on whichever cancellation completes last. */
 kern_return_t
 IMPL(SMSC95xxDriver, Stop)
 {
     Log("Stop");
     Diag("Stop(provider=0x%llx) entered", DiagPtr(provider));
-    ::TearDown(this, provider);
-    return Stop(provider, SUPERDISPATCH);
+
+    /* Stop new work and join the pipes first: after this returns, the only things that can
+     * still run on the dispatch queue are the two dispatch-source handlers below. */
+    quiesceDatapath();
+
+    __block _Atomic uint32_t pending = 0;
+    /* Counted into a plain local as well: once the Cancels below are issued, a handler may
+     * already have run and dropped the last copy of the block, which frees the __block
+     * storage -- so `pending` itself must not be read after that point. */
+    uint32_t cancelCount = 0;
+    if (ivars->rxBackoffTimer != nullptr) { ++cancelCount; }
+    if (ivars->txDataQueue    != nullptr) { ++cancelCount; }
+    pending = cancelCount;
+
+    if (cancelCount == 0) {
+        /* Nothing asynchronous to cancel, so the whole teardown can finish in this frame. */
+        Diag("Stop: no dispatch sources to cancel -- releasing and calling super inline");
+        ::ReleaseResources(this, provider);
+        return Stop(provider, SUPERDISPATCH);
+    }
+
+    this->retain();
+    provider->retain();
+
+    /* One block, handed to every Cancel. Cancel copies it to the heap, which is what makes
+     * passing the same local block to both calls correct -- and is why the earlier attempt
+     * that released the source immediately after a bare SetEnable(false) had no join at all.
+     * The captured `pending` is promoted to the heap and shared by every copy. */
+    void (^finalize)(void) = ^{
+        if (__c11_atomic_fetch_sub(&pending, 1U, __ATOMIC_RELAXED) <= 1) {
+            /* Last cancellation: every handler has finished, so the objects the datapath
+             * callbacks dereference can finally be released, and super can run. */
+            Diag("Stop: final cancellation handler -- releasing resources and calling super");
+            ::ReleaseResources(this, provider);
+            Stop(provider, SUPERDISPATCH);
+            Log("Stop: complete (super called from the final cancellation handler)");
+            provider->release();
+            this->release();
+        }
+    };
+
+    if (ivars->rxBackoffTimer != nullptr) {
+        ivars->rxBackoffTimer->Cancel(finalize);
+    }
+    if (ivars->txDataQueue != nullptr) {
+        ivars->txDataQueue->Cancel(finalize);
+    }
+
+    Diag("Stop: returning without super; %u cancellation(s) issued", cancelCount);
+    return kIOReturnSuccess;
 }
 
 /* The capital-S deprecated form (iig:114). The live one the stack calls on

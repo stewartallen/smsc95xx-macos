@@ -93,11 +93,12 @@ struct SMSC95xxDriver_IVars {
     bool                      txInFlight;
     IOUserNetworkPacket      *txPacket;    /* the packet the in-flight TX belongs to */
     /* True between the end of setupDatapath() and the first statement of
-     * teardownDatapath(); the drain loop's gate. teardownDatapath aborts the bulk OUT pipe
+     * quiesceDatapath(); the drain loop's gate. quiesceDatapath aborts the bulk OUT pipe
      * synchronously, and the aborted transfer's TxComplete can be delivered while that
      * abort is still on the stack -- with this flag false that completion returns its own
-     * packet (the TX completion queue outlives teardownDatapath) and then stops, rather
-     * than pulling fresh packets into a buffer about to be released. */
+     * packet (the TX completion queue is still alive, being released only after every
+     * cancellation has run) and then stops, rather than pulling fresh packets into a
+     * buffer about to be released. */
     bool                      txDatapathReady;
     /* Re-entrancy guards on the "every datapath callback serialises on one dispatch queue,
      * so no locking" assumption. Set on entry to each callback and cleared on exit; a set
