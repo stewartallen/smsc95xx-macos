@@ -13,7 +13,14 @@
  * Two values are synthetic rather than measured: the autoneg-capable BMSR
  * 0x782D, and the MII write address 0x03 in test_mii_addr_word.
  * Do not replace measured values with hand-derived numbers.
+ *
+ * The init-sequence tests at the end of this file are new with the move of the
+ * sequence into common/. Their expected register writes are transcribed from
+ * reference/mach-init-sequence.txt with the frame numbers alongside each entry, and
+ * the three places where this driver deliberately differs from that capture are
+ * pinned explicitly in test_init_seq_matches_capture() rather than left implicit.
  */
+#include "smsc95xx_init.h"
 #include "smsc95xx_proto.h"
 #include "smsc95xx_regs.h"
 #include "test_harness.h"
@@ -170,6 +177,43 @@ static void test_tx_prepend(void)
         CHECK_EQ_U32(le32_at(hdr + 4), vectors[i].cmd_b, "TX_CMD_B");
     }
 
+    /* THE ACCEPTED BOUNDARIES, and the two lengths the dext's transmit path was
+     * measured handling. The driver applies its own guard first (reject 0 or
+     * anything over 1518, a VLAN-tagged maximum frame) and then hands the length
+     * straight to this function, so exactly where accept turns into refuse is the
+     * seam between "the driver refused it" and "the protocol refused it". The
+     * cases below pin the accepting side of that seam; the refusing side is
+     * checked immediately after.
+     *
+     * cmd_a is frame_len | FIRST_SEG (0x2000) | LAST_SEG (0x1000), cmd_b is
+     * frame_len, so these are computed by hand rather than copied from a capture:
+     *   42   -> 0x0000302A / 0x0000002A   the shortest frame the stack was seen to send
+     *   1372 -> 0x0000355C / 0x0000055C   the longest frame the stack was seen to send
+     *   1514 -> 0x000035EA / 0x000005EA   SMSC95XX_FRAME_MAX, the last accepted length
+     */
+    static const struct {
+        size_t   frame_len;
+        uint32_t cmd_a;
+        uint32_t cmd_b;
+    } bounds[] = {
+        { SMSC95XX_FRAME_MIN, 0x0000302Au, 0x0000002Au },
+        { 1372,               0x0000355Cu, 0x0000055Cu },
+        { SMSC95XX_FRAME_MAX, 0x000035EAu, 0x000005EAu },
+    };
+
+    for (size_t i = 0; i < sizeof(bounds) / sizeof(bounds[0]); i++) {
+        /* The dext's real buffer size, header plus a VLAN-tagged maximum frame, so
+         * the buflen argument under test is the one the driver actually passes. */
+        uint8_t buf[SMSC95XX_TX_HEADER_LEN + 1518] = {0};
+        size_t n = smsc95xx_tx_prepend(buf, sizeof(buf), bounds[i].frame_len);
+        CHECK_EQ_U32(n, SMSC95XX_TX_HEADER_LEN, "tx_prepend accepts a boundary length");
+        CHECK_EQ_U32(le32_at(buf),     bounds[i].cmd_a, "TX_CMD_A at a boundary length");
+        CHECK_EQ_U32(le32_at(buf + 4), bounds[i].cmd_b, "TX_CMD_B at a boundary length");
+        /* Only the header is written: the caller copies the frame after it. */
+        CHECK_EQ_U32(buf[SMSC95XX_TX_HEADER_LEN], 0,
+                     "tx_prepend writes only the header");
+    }
+
     /* Refuse rather than truncate: a too-small buffer or an out-of-range
      * length must produce 0, not a partially-written header. */
     uint8_t small[4] = {0};
@@ -183,6 +227,11 @@ static void test_tx_prepend(void)
                  "reject oversized frame");
     CHECK_EQ_U32(smsc95xx_tx_prepend(hdr, sizeof(hdr), 0), 0,
                  "reject zero-length frame");
+    /* The dext's own guard admits up to 1518 (a VLAN-tagged maximum frame) before
+     * calling this, so 1515..1518 reaches here and must be refused. If this ever
+     * starts succeeding, the driver would frame a length the chip does not accept. */
+    CHECK_EQ_U32(smsc95xx_tx_prepend(hdr, sizeof(hdr), 1518), 0,
+                 "reject a VLAN-tagged maximum frame (the driver's guard band)");
 }
 
 /* Build one RX record into `dst`: status word for `frame_len`, then `frame_len`
@@ -308,6 +357,90 @@ static void test_rx_error_bits_and_malformed(void)
     CHECK_FALSE(smsc95xx_rx_next(short_frame, sizeof(short_frame), &offset,
                                  &frame, &frame_len, &status),
                 "reject frame shorter than CRC length");
+}
+
+/* The two cases below are what the driver actually meets on a real link, as opposed to
+ * the single-fault cases above. Both test already-correct code, so they are regression
+ * tests rather than TDD -- their job is to pin behaviour the receive loop depends on and
+ * that nothing else here states. */
+
+static void test_rx_walk_error_in_middle_does_not_stop_the_walk(void)
+{
+    /* Three records, the middle one carrying ERROR_SUM. All three must be returned:
+     * filtering is the driver's decision, not the decoder's. If an error record ended
+     * the walk instead, every frame after a single CRC error in a transfer would be
+     * silently lost -- a 4096-byte transfer can hold sixty of them -- and the symptom
+     * would be occasional missing packets under load, which is close to undiagnosable
+     * from outside. The distinct fillers are what prove the third record was reached. */
+    uint8_t buf[256] = {0};
+    size_t n = 0;
+    n += build_rx_record(buf + n, 64, 0x11, 0);
+    n += build_rx_record(buf + n, 64, 0x22, SMSC95XX_RX_STS_ERROR_SUM);
+    n += build_rx_record(buf + n, 64, 0x33, 0);
+
+    const uint8_t want_fill[3] = { 0x11, 0x22, 0x33 };
+    size_t offset = 0;
+    int seen = 0;
+    int flagged = 0;
+
+    for (int i = 0; i < 3; i++) {
+        const uint8_t *frame = NULL;
+        size_t frame_len = 0;
+        uint32_t status = 0;
+        CHECK_TRUE(smsc95xx_rx_next(buf, n, &offset, &frame, &frame_len, &status),
+                   "an error record does not end the walk");
+        CHECK_EQ_U32(frame_len, 64, "length of each record either side of the error");
+        CHECK_EQ_U32(frame[0], want_fill[i], "the right record, in order");
+        seen++;
+        if ((status & SMSC95XX_RX_STS_ERROR_SUM) != 0)
+            flagged++;
+    }
+    CHECK_EQ_U32(seen, 3, "all three records yielded");
+    CHECK_EQ_U32(flagged, 1, "exactly one carried the error bit");
+
+    const uint8_t *frame = NULL;
+    size_t frame_len = 0;
+    uint32_t status = 0;
+    CHECK_FALSE(smsc95xx_rx_next(buf, n, &offset, &frame, &frame_len, &status),
+                "and then the walk ends");
+}
+
+static void test_rx_walk_truncated_trailing_record(void)
+{
+    /* One complete record followed by two stray bytes -- too few even for a status
+     * word. The walk must yield exactly one frame and then stop rather than read past
+     * the end. This differs from "reject truncated status word" above, which starts at
+     * offset 0: here the offset has already been advanced by a successful decode, so it
+     * exercises the bounds check on the second iteration, which is the one the driver
+     * relies on for every transfer whose last record is cut short by the host's chosen
+     * transfer length. */
+    uint8_t buf[128] = {0};
+    size_t used = build_rx_record(buf, 64, 0x5A, 0);
+
+    size_t offset = 0;
+    const uint8_t *frame = NULL;
+    size_t frame_len = 0;
+    uint32_t status = 0;
+
+    CHECK_TRUE(smsc95xx_rx_next(buf, used + 2, &offset, &frame, &frame_len, &status),
+               "the complete record decodes");
+    CHECK_EQ_U32(frame_len, 64, "its length");
+    CHECK_EQ_U32(frame[0], 0x5A, "its data");
+    CHECK_FALSE(smsc95xx_rx_next(buf, used + 2, &offset, &frame, &frame_len, &status),
+                "two trailing bytes are not a second record");
+
+    /* Every truncation length short of a whole status word behaves the same way. Three
+     * spare bytes is the interesting boundary: it is one short of a status word, and an
+     * off-by-one in the check would accept it. */
+    for (size_t spare = 1; spare < SMSC95XX_RX_HEADER_LEN; spare++) {
+        offset = 0;
+        CHECK_TRUE(smsc95xx_rx_next(buf, used + spare, &offset, &frame, &frame_len,
+                                    &status),
+                   "the complete record still decodes with a short tail");
+        CHECK_FALSE(smsc95xx_rx_next(buf, used + spare, &offset, &frame, &frame_len,
+                                     &status),
+                    "a partial status word is never a record");
+    }
 }
 
 static void test_rx_measured_vector(void)
@@ -520,6 +653,501 @@ static void test_mac_plausible(void)
           "mis-clocked MAC passes plausibility -- only provenance rejects it");
 }
 
+/* ===========================================================================
+ * The initialisation sequence.
+ *
+ * Testable at all only because common/smsc95xx_init.c takes its register access
+ * as callbacks: the mock below records every (offset, value) write, so the exact
+ * ordered sequence -- the thing that actually switches RX and TX on in hardware --
+ * can be asserted with no device present.
+ *
+ * The expected values are cross-checked against reference/mach-init-sequence.txt,
+ * the decoded trace of the real Linux driver bringing this same hardware up. The
+ * frame numbers in test_init_seq_matches_capture() are that file's, so any
+ * expectation here can be re-checked against the capture line by line.
+ * ========================================================================= */
+
+#define MOCK_MAX_WRITES 32
+
+/* An arbitrary non-zero callback error. Any non-zero value must abort the sequence
+ * and come back to the caller unchanged; this one is recognisable in a failure
+ * message and small enough to be a valid int. */
+#define MOCK_ERR 0x0BADF00D
+
+typedef struct {
+    uint16_t offset;
+    uint32_t value;
+} reg_write;
+
+typedef struct {
+    reg_write writes[MOCK_MAX_WRITES];
+    size_t    nwrites;      /* attempted writes, which can exceed MOCK_MAX_WRITES */
+    size_t    nreads;
+    bool      overflow;     /* set if the sequence wrote more than we can record  */
+
+    uint32_t  hw_cfg_read;  /* what a HW_CFG read returns                         */
+    uint32_t  pm_ctrl_read; /* what a PM_CTRL read returns                        */
+    bool      hw_cfg_stuck; /* report LRST as never clearing, for the timeout path */
+
+    int       fail_write_at; /* -1 = never, else the 0-based write index to fail   */
+    int       fail_read_at;  /* -1 = never, else the 0-based read index to fail    */
+} mock_io;
+
+static void mock_reset(mock_io *m)
+{
+    for (size_t i = 0; i < MOCK_MAX_WRITES; i++) {
+        m->writes[i].offset = 0;
+        m->writes[i].value  = 0;
+    }
+    m->nwrites  = 0;
+    m->nreads   = 0;
+    m->overflow = false;
+    /* Both defaults are measured, not invented: HW_CFG reads back 0x00000004 (PSEL)
+     * once the chip has cleared LRST (capture frame 152), and PM_CTRL reads
+     * 0x000001C0 before the PHY reset bit is set (capture frame 216). Using the
+     * measured PM_CTRL value is what makes the read-modify-write assertion below
+     * comparable with the capture's 0x000001D0 (frame 218). */
+    m->hw_cfg_read  = SMSC95XX_HW_CFG_PSEL;
+    m->pm_ctrl_read = 0x000001C0u;
+    m->hw_cfg_stuck = false;
+    m->fail_write_at = -1;
+    m->fail_read_at  = -1;
+}
+
+static int mock_read(void *ctx, uint16_t offset, uint32_t *value)
+{
+    mock_io *m = (mock_io *)ctx;
+    int index = (int)m->nreads;
+    m->nreads++;
+
+    if (m->fail_read_at >= 0 && index == m->fail_read_at)
+        return MOCK_ERR;    /* deliberately leaves *value untouched */
+
+    switch (offset) {
+    case SMSC95XX_REG_HW_CFG:
+        *value = m->hw_cfg_stuck ? (m->hw_cfg_read | SMSC95XX_HW_CFG_LRST)
+                                 : m->hw_cfg_read;
+        break;
+    case SMSC95XX_REG_PM_CTRL:
+        *value = m->pm_ctrl_read;
+        break;
+    default:
+        *value = 0;
+        break;
+    }
+    return 0;
+}
+
+static int mock_write(void *ctx, uint16_t offset, uint32_t value)
+{
+    mock_io *m = (mock_io *)ctx;
+    int index = (int)m->nwrites;
+
+    if (m->nwrites < MOCK_MAX_WRITES) {
+        m->writes[m->nwrites].offset = offset;
+        m->writes[m->nwrites].value  = value;
+    } else {
+        m->overflow = true;
+    }
+    m->nwrites++;
+
+    if (m->fail_write_at >= 0 && index == m->fail_write_at)
+        return MOCK_ERR;
+    return 0;
+}
+
+static void mock_bind(mock_io *m, smsc95xx_io *io)
+{
+    io->ctx   = m;
+    io->read  = mock_read;
+    io->write = mock_write;
+}
+
+/* The MAC used for every ordering assertion below: the real address this unit
+ * carries, which test_eeprom_signature already pins to ADDRL 0x907961FC /
+ * ADDRH 0x00005604. Reusing it means the ADDRL/ADDRH entries in the expected table
+ * are cross-checked by an independent test rather than only by this one. */
+static const uint8_t init_test_mac[SMSC95XX_MAC_LEN] = {
+    0xFC, 0x61, 0x79, 0x90, 0x04, 0x56
+};
+
+/* The ordered sequence, promiscuous=false. Twenty writes, in this order, with these
+ * values. Transcribed from the sequence proven on hardware at M2; the `capture`
+ * column is the corresponding line of reference/mach-init-sequence.txt, and where
+ * the two differ it is called out in test_init_seq_matches_capture(). */
+static const reg_write init_expected[] = {
+    { SMSC95XX_REG_HW_CFG,       0x00000008u },  /* LRST                 frame 150 */
+    { SMSC95XX_REG_ADDRL,        0x907961FCu },  /* station address      frame 154 */
+    { SMSC95XX_REG_ADDRH,        0x00005604u },  /*                      frame 156 */
+    { SMSC95XX_REG_HW_CFG,       0x00001004u },  /* BIR|PSEL             frame 160 */
+    { SMSC95XX_REG_BURST_CAP,    0x00000005u },  /*                      frame 164 */
+    { SMSC95XX_REG_BULK_IN_DLY,  0x00002000u },  /*                      frame 168 */
+    { SMSC95XX_REG_HW_CFG,       0x00001026u },  /* BIR|MEF|PSEL|BCE     frame 174 */
+    { SMSC95XX_REG_INT_STS,      0xFFFFFFFFu },  /* clear all            frame 178 */
+    { SMSC95XX_REG_LED_GPIO_CFG, 0x81110007u },  /*                      frame 184 */
+    { SMSC95XX_REG_FLOW,         0x00000000u },  /*                      frame 186 */
+    { SMSC95XX_REG_AFC_CFG,      0x00F830A1u },  /*                      frame 188 */
+    { SMSC95XX_REG_VLAN1,        0x00008100u },  /* ETH_P_8021Q          frame 192 */
+    { SMSC95XX_REG_HASHH,        0x00000000u },  /*                      frame 198 */
+    { SMSC95XX_REG_HASHL,        0x00000000u },  /*                      frame 199 */
+    { SMSC95XX_REG_MAC_CR,       0x00000000u },  /*                      frame 200 */
+    { SMSC95XX_REG_MAC_CR,       0x00000008u },  /* TXEN                 frame 208 */
+    { SMSC95XX_REG_TX_CFG,       0x00000004u },  /* TX_ON                frame 210 */
+    { SMSC95XX_REG_MAC_CR,       0x0080000Cu },  /* RCVOWN|TXEN|RXEN  cf. frame 212 */
+    { SMSC95XX_REG_AFC_CFG,      0x00F830AFu },  /* half duplex       cf. frame 918 */
+    { SMSC95XX_REG_PM_CTRL,      0x000001D0u },  /* PHY_RST              frame 218 */
+};
+
+#define INIT_EXPECTED_N (sizeof(init_expected) / sizeof(init_expected[0]))
+
+/* Compare a recorded write log against an expected table, entry by entry. */
+static void check_write_log(const mock_io *m, const reg_write *want, size_t n,
+                            const char *what)
+{
+    CHECK_FALSE(m->overflow, "write log did not overflow");
+    CHECK_EQ_U32(m->nwrites, n, what);
+    for (size_t i = 0; i < n && i < m->nwrites && i < MOCK_MAX_WRITES; i++) {
+        CHECK_EQ_U32(m->writes[i].offset, want[i].offset, what);
+        CHECK_EQ_U32(m->writes[i].value,  want[i].value,  what);
+    }
+}
+
+static void test_init_seq_order(void)
+{
+    mock_io m;
+    smsc95xx_io io;
+
+    mock_reset(&m);
+    mock_bind(&m, &io);
+
+    CHECK_EQ_U32(smsc95xx_init_seq(&io, init_test_mac, false), 0,
+                 "init sequence succeeds when every access succeeds");
+    check_write_log(&m, init_expected, INIT_EXPECTED_N,
+                    "init sequence: exact ordered register writes");
+
+    /* The advertised write count is part of the contract -- callers log against it. */
+    CHECK_EQ_U32(SMSC95XX_INIT_WRITE_COUNT, INIT_EXPECTED_N,
+                 "SMSC95XX_INIT_WRITE_COUNT matches the sequence");
+
+    /* Two reads, and only two: the LRST poll and the PM_CTRL read-modify-write.
+     * Nothing else in the sequence reads, which is what lets it be free of any
+     * sleeping or MII access. */
+    CHECK_EQ_U32(m.nreads, 2u, "init sequence performs exactly two reads");
+}
+
+static void test_init_seq_enables_rx_and_tx(void)
+{
+    mock_io m;
+    smsc95xx_io io;
+
+    mock_reset(&m);
+    mock_bind(&m, &io);
+    CHECK_EQ_U32(smsc95xx_init_seq(&io, init_test_mac, false), 0, "init for MAC_CR check");
+
+    /* Find the LAST MAC_CR write: that is the one the chip is left with, and the
+     * whole point of running the sequence at all. A driver that omits it presents a
+     * network interface over a chip that will neither receive nor transmit -- which
+     * is exactly the defect this sequence was moved into common/ to fix. */
+    int last = -1;
+    for (size_t i = 0; i < m.nwrites && i < MOCK_MAX_WRITES; i++) {
+        if (m.writes[i].offset == SMSC95XX_REG_MAC_CR)
+            last = (int)i;
+    }
+    CHECK_TRUE(last >= 0, "MAC_CR is written at all");
+    if (last < 0)
+        return;
+
+    uint32_t final_mac_cr = m.writes[last].value;
+    CHECK_TRUE((final_mac_cr & SMSC95XX_MAC_CR_RXEN) != 0,
+               "final MAC_CR write sets RXEN");
+    CHECK_TRUE((final_mac_cr & SMSC95XX_MAC_CR_TXEN) != 0,
+               "final MAC_CR write sets TXEN");
+    /* Half duplex 10 Mb/s: RCVOWN set, FDPX clear. */
+    CHECK_TRUE((final_mac_cr & SMSC95XX_MAC_CR_RCVOWN) != 0,
+               "final MAC_CR write sets RCVOWN (half duplex)");
+    CHECK_FALSE(final_mac_cr & SMSC95XX_MAC_CR_FDPX,
+                "final MAC_CR write leaves FDPX clear");
+
+    /* MAC_CR three times, and TX_CFG between the second and third: the transmitter is
+     * enabled in MAC_CR BEFORE the TX datapath is turned on in TX_CFG, and the
+     * receiver only afterwards. Both captures agree, so the ordering is asserted
+     * rather than left as a comment. */
+    int mac_cr_count = 0, tx_cfg_index = -1;
+    int mac_cr_index[8];
+    for (size_t i = 0; i < m.nwrites && i < MOCK_MAX_WRITES; i++) {
+        if (m.writes[i].offset == SMSC95XX_REG_MAC_CR && mac_cr_count < 8)
+            mac_cr_index[mac_cr_count++] = (int)i;
+        if (m.writes[i].offset == SMSC95XX_REG_TX_CFG)
+            tx_cfg_index = (int)i;
+    }
+    CHECK_EQ_U32(mac_cr_count, 3, "MAC_CR is written exactly three times");
+    CHECK_TRUE(tx_cfg_index > 0, "TX_CFG is written");
+    if (mac_cr_count == 3 && tx_cfg_index > 0) {
+        CHECK_TRUE(mac_cr_index[1] < tx_cfg_index,
+                   "MAC_CR.TXEN is set before TX_CFG turns the datapath on");
+        CHECK_TRUE(tx_cfg_index < mac_cr_index[2],
+                   "TX_CFG comes before the MAC_CR write that enables RXEN");
+        CHECK_EQ_U32(m.writes[mac_cr_index[1]].value, SMSC95XX_MAC_CR_TXEN,
+                     "second MAC_CR write is TXEN alone");
+    }
+
+    /* HW_CFG.MEF must end up set: the RX decoder walks several frames per bulk IN
+     * transfer and that only happens in multiple-Ethernet-frames mode. */
+    int last_hw_cfg = -1;
+    for (size_t i = 0; i < m.nwrites && i < MOCK_MAX_WRITES; i++) {
+        if (m.writes[i].offset == SMSC95XX_REG_HW_CFG)
+            last_hw_cfg = (int)i;
+    }
+    CHECK_TRUE(last_hw_cfg >= 0, "HW_CFG is written");
+    if (last_hw_cfg >= 0) {
+        CHECK_TRUE((m.writes[last_hw_cfg].value & SMSC95XX_HW_CFG_MEF) != 0,
+                   "final HW_CFG write sets MEF");
+    }
+}
+
+static void test_init_seq_promiscuous(void)
+{
+    mock_io plain, promisc;
+    smsc95xx_io io;
+
+    mock_reset(&plain);
+    mock_bind(&plain, &io);
+    CHECK_EQ_U32(smsc95xx_init_seq(&io, init_test_mac, false), 0, "init promiscuous=false");
+
+    mock_reset(&promisc);
+    mock_bind(&promisc, &io);
+    CHECK_EQ_U32(smsc95xx_init_seq(&io, init_test_mac, true), 0, "init promiscuous=true");
+
+    CHECK_EQ_U32(promisc.nwrites, plain.nwrites,
+                 "promiscuous mode changes no write COUNT");
+
+    /* Exactly one write differs, and it is the final MAC_CR. Asserting the whole log
+     * rather than just that one entry is what catches a PRMS bit that leaked into
+     * some other register. */
+    size_t differing = 0;
+    size_t diff_index = 0;
+    for (size_t i = 0; i < plain.nwrites && i < MOCK_MAX_WRITES; i++) {
+        CHECK_EQ_U32(promisc.writes[i].offset, plain.writes[i].offset,
+                     "promiscuous mode changes no register ORDER");
+        if (promisc.writes[i].value != plain.writes[i].value) {
+            differing++;
+            diff_index = i;
+        }
+    }
+    CHECK_EQ_U32(differing, 1u, "promiscuous mode changes exactly one written value");
+    if (differing == 1) {
+        CHECK_EQ_U32(plain.writes[diff_index].offset, SMSC95XX_REG_MAC_CR,
+                     "the differing write is MAC_CR");
+        CHECK_TRUE((promisc.writes[diff_index].value & SMSC95XX_MAC_CR_PRMS) != 0,
+                   "promiscuous=true sets MAC_CR.PRMS");
+        CHECK_FALSE(plain.writes[diff_index].value & SMSC95XX_MAC_CR_PRMS,
+                    "promiscuous=false leaves MAC_CR.PRMS clear");
+        /* PRMS is the ONLY difference: RXEN, TXEN and RCVOWN are unaffected. */
+        CHECK_EQ_U32(promisc.writes[diff_index].value & ~SMSC95XX_MAC_CR_PRMS,
+                     plain.writes[diff_index].value,
+                     "PRMS is the only bit promiscuous mode adds");
+    }
+}
+
+static void test_init_seq_aborts_on_error(void)
+{
+    /* A callback failure must stop the sequence dead and be returned unchanged. If it
+     * carried on, a chip that rejected HW_CFG would still get MAC_CR.RXEN and the
+     * driver would believe it had initialised. Every write index is exercised, so
+     * there is no position at which a missing error check could hide. */
+    for (size_t at = 0; at < INIT_EXPECTED_N; at++) {
+        mock_io m;
+        smsc95xx_io io;
+
+        mock_reset(&m);
+        m.fail_write_at = (int)at;
+        mock_bind(&m, &io);
+
+        CHECK_EQ_U32(smsc95xx_init_seq(&io, init_test_mac, false), MOCK_ERR,
+                     "write failure is propagated unchanged");
+        /* The failing write was attempted, and nothing after it was. */
+        CHECK_EQ_U32(m.nwrites, at + 1, "sequence stops at the failing write");
+    }
+
+    /* Both reads too: the LRST poll (read 0) and the PM_CTRL read-modify-write
+     * (read 1). A failed PM_CTRL read must not turn into a PHY reset written on top
+     * of a garbage value. */
+    for (int at = 0; at < 2; at++) {
+        mock_io m;
+        smsc95xx_io io;
+
+        mock_reset(&m);
+        m.fail_read_at = at;
+        mock_bind(&m, &io);
+
+        CHECK_EQ_U32(smsc95xx_init_seq(&io, init_test_mac, false), MOCK_ERR,
+                     "read failure is propagated unchanged");
+        if (at == 0) {
+            CHECK_EQ_U32(m.nwrites, 1u, "a failed LRST poll stops after the LRST write");
+        } else {
+            /* Everything but the final PM_CTRL write. */
+            CHECK_EQ_U32(m.nwrites, INIT_EXPECTED_N - 1,
+                         "a failed PM_CTRL read stops before writing PM_CTRL");
+        }
+    }
+}
+
+static void test_init_seq_reset_timeout(void)
+{
+    mock_io m;
+    smsc95xx_io io;
+
+    mock_reset(&m);
+    m.hw_cfg_stuck = true;      /* the chip never clears LRST */
+    mock_bind(&m, &io);
+
+    CHECK_EQ_U32(smsc95xx_init_seq(&io, init_test_mac, false),
+                 (uint32_t)SMSC95XX_INIT_ERR_RESET_TIMEOUT,
+                 "a chip that never clears LRST reports a reset timeout");
+    CHECK_EQ_U32(m.nwrites, 1u, "nothing is written after a failed reset");
+    CHECK_TRUE(m.nreads > 1, "the LRST wait polls rather than reading once");
+    CHECK_TRUE(m.nreads <= (size_t)SMSC95XX_INIT_RESET_POLLS + 1,
+               "the LRST wait is bounded");
+}
+
+static void test_init_seq_bad_args(void)
+{
+    mock_io m;
+    smsc95xx_io io;
+
+    mock_reset(&m);
+    mock_bind(&m, &io);
+
+    CHECK_EQ_U32(smsc95xx_init_seq(NULL, init_test_mac, false),
+                 (uint32_t)SMSC95XX_INIT_ERR_BAD_ARG, "NULL io rejected");
+    CHECK_EQ_U32(smsc95xx_init_seq(&io, NULL, false),
+                 (uint32_t)SMSC95XX_INIT_ERR_BAD_ARG, "NULL mac rejected");
+
+    smsc95xx_io no_read = io;
+    no_read.read = NULL;
+    CHECK_EQ_U32(smsc95xx_init_seq(&no_read, init_test_mac, false),
+                 (uint32_t)SMSC95XX_INIT_ERR_BAD_ARG, "NULL read callback rejected");
+
+    smsc95xx_io no_write = io;
+    no_write.write = NULL;
+    CHECK_EQ_U32(smsc95xx_init_seq(&no_write, init_test_mac, false),
+                 (uint32_t)SMSC95XX_INIT_ERR_BAD_ARG, "NULL write callback rejected");
+
+    CHECK_EQ_U32(m.nwrites, 0u, "a rejected call touches no register");
+}
+
+static void test_init_seq_matches_capture(void)
+{
+    /* Cross-check against reference/mach-init-sequence.txt directly, using the MAC
+     * that capture was taken with (4a:f8:f8:c2:c2:f2, the mis-clocked EEPROM read
+     * Linux happened to program) so ADDRL/ADDRH are comparable too.
+     *
+     * The first seventeen writes match the capture EXACTLY, register for register and
+     * value for value, with two of the capture's writes omitted on purpose:
+     *   COE_CR    0x00010001  (frame 196) -- checksum offload, out of scope, and it
+     *                                        would add two bytes to every RX frame
+     *   INT_EP_CTL 0x00008000 (frame 206) -- the interrupt endpoint; link state is
+     *                                        polled instead
+     * Both omissions are documented in common/smsc95xx_init.h.
+     *
+     * The last three are checked separately below, because two of them are places
+     * where this sequence deliberately does in one pass what Linux does in two. */
+    static const reg_write capture_prefix[] = {
+        { SMSC95XX_REG_HW_CFG,       0x00000008u },  /* frame 150 */
+        { SMSC95XX_REG_ADDRL,        0xC2F8F84Au },  /* frame 154 */
+        { SMSC95XX_REG_ADDRH,        0x0000F2C2u },  /* frame 156 */
+        { SMSC95XX_REG_HW_CFG,       0x00001004u },  /* frame 160 */
+        { SMSC95XX_REG_BURST_CAP,    0x00000005u },  /* frame 164 */
+        { SMSC95XX_REG_BULK_IN_DLY,  0x00002000u },  /* frame 168 */
+        { SMSC95XX_REG_HW_CFG,       0x00001026u },  /* frame 174 */
+        { SMSC95XX_REG_INT_STS,      0xFFFFFFFFu },  /* frame 178 */
+        { SMSC95XX_REG_LED_GPIO_CFG, 0x81110007u },  /* frame 184 */
+        { SMSC95XX_REG_FLOW,         0x00000000u },  /* frame 186 */
+        { SMSC95XX_REG_AFC_CFG,      0x00F830A1u },  /* frame 188 */
+        { SMSC95XX_REG_VLAN1,        0x00008100u },  /* frame 192 */
+        { SMSC95XX_REG_HASHH,        0x00000000u },  /* frame 198 */
+        { SMSC95XX_REG_HASHL,        0x00000000u },  /* frame 199 */
+        { SMSC95XX_REG_MAC_CR,       0x00000000u },  /* frame 200 */
+        { SMSC95XX_REG_MAC_CR,       0x00000008u },  /* frame 208 */
+        { SMSC95XX_REG_TX_CFG,       0x00000004u },  /* frame 210 */
+    };
+    const size_t prefix_n = sizeof(capture_prefix) / sizeof(capture_prefix[0]);
+
+    const uint8_t capture_mac[SMSC95XX_MAC_LEN] = {
+        0x4A, 0xF8, 0xF8, 0xC2, 0xC2, 0xF2
+    };
+
+    mock_io m;
+    smsc95xx_io io;
+    mock_reset(&m);
+    mock_bind(&m, &io);
+
+    CHECK_EQ_U32(smsc95xx_init_seq(&io, capture_mac, false), 0,
+                 "init with the capture's MAC");
+    CHECK_EQ_U32(m.nwrites, prefix_n + 3,
+                 "capture prefix plus three writes this sequence folds in");
+
+    for (size_t i = 0; i < prefix_n; i++) {
+        CHECK_EQ_U32(m.writes[i].offset, capture_prefix[i].offset,
+                     "capture cross-check: register");
+        CHECK_EQ_U32(m.writes[i].value, capture_prefix[i].value,
+                     "capture cross-check: value");
+    }
+
+    /* KNOWN, DELIBERATE DIVERGENCES from the capture, pinned here so they cannot
+     * change silently and so a reader is not left to discover them:
+     *
+     * 1. The third MAC_CR write. The capture writes 0x0000000C (TXEN|RXEN) at frame
+     *    212 and only adds RCVOWN much later, at frame 907, from Linux's link-up
+     *    path. This sequence sets RCVOWN in the same write, because this hardware is
+     *    always 10 Mb/s half duplex -- it has no autonegotiation -- so there is no
+     *    later moment at which the duplex becomes known. Same end state, one write
+     *    instead of two. (The capture also carries HPFILT there on its second run,
+     *    which is multicast filtering this driver does not program.)
+     * 2. AFC_CFG's half-duplex low nibble. The capture writes 0x00F830AF at frame
+     *    918, again from the link-up path; this sequence writes it immediately after
+     *    MAC_CR for the same reason.
+     * Both were validated together on hardware at M2. */
+    CHECK_EQ_U32(m.writes[prefix_n + 0].offset, SMSC95XX_REG_MAC_CR,
+                 "divergence 1 is a MAC_CR write");
+    CHECK_EQ_U32(m.writes[prefix_n + 0].value, 0x0080000Cu,
+                 "divergence 1: capture frame 212 writes 0x0000000C, we fold in RCVOWN");
+    CHECK_EQ_U32(m.writes[prefix_n + 0].value & ~SMSC95XX_MAC_CR_RCVOWN, 0x0000000Cu,
+                 "divergence 1: RCVOWN is the only addition to the capture's value");
+
+    CHECK_EQ_U32(m.writes[prefix_n + 1].offset, SMSC95XX_REG_AFC_CFG,
+                 "divergence 2 is an AFC_CFG write");
+    CHECK_EQ_U32(m.writes[prefix_n + 1].value, 0x00F830AFu,
+                 "divergence 2: matches capture frame 918, written earlier here");
+
+    /* The PM_CTRL read-modify-write matches the capture exactly: it read 0x000001C0
+     * at frame 216 and wrote 0x000001D0 at frame 218. */
+    CHECK_EQ_U32(m.writes[prefix_n + 2].offset, SMSC95XX_REG_PM_CTRL,
+                 "PM_CTRL is the last write");
+    CHECK_EQ_U32(m.writes[prefix_n + 2].value, 0x000001D0u,
+                 "PM_CTRL read-modify-write matches capture frames 216/218");
+
+    /* Read-modify-write, not a blind store: a different starting value must be
+     * preserved under the PHY_RST bit. */
+    mock_reset(&m);
+    m.pm_ctrl_read = 0x0000A5A0u;
+    mock_bind(&m, &io);
+    CHECK_EQ_U32(smsc95xx_init_seq(&io, capture_mac, false), 0, "init for PM_CTRL rmw");
+    CHECK_EQ_U32(m.writes[m.nwrites - 1].value, 0x0000A5B0u,
+                 "PM_CTRL preserves the bits it read");
+}
+
+static void test_reg_name(void)
+{
+    /* Names are for log lines, so the only thing that matters is that they are the
+     * right ones and that an unknown offset cannot produce a NULL a logger would
+     * print as garbage. */
+    CHECK_TRUE(smsc95xx_reg_name(SMSC95XX_REG_MAC_CR)[0] == 'M', "MAC_CR names itself");
+    CHECK_TRUE(smsc95xx_reg_name(SMSC95XX_REG_HW_CFG)[0] == 'H', "HW_CFG names itself");
+    CHECK_TRUE(smsc95xx_reg_name(0x7FF) != NULL, "unknown offset is not NULL");
+    CHECK_TRUE(smsc95xx_reg_name(0x7FF)[0] == '?', "unknown offset reads as ?");
+}
+
 int main(void)
 {
     test_mii_addr_word();
@@ -532,10 +1160,20 @@ int main(void)
     test_rx_single_frame();
     test_rx_multiple_frames();
     test_rx_error_bits_and_malformed();
+    test_rx_walk_error_in_middle_does_not_stop_the_walk();
+    test_rx_walk_truncated_trailing_record();
     test_rx_measured_vector();
     test_rx_status_unicast_vs_broadcast();
     test_rx_status_multicast();
     test_parse_vid_pid();
     test_mac_plausible();
+    test_init_seq_order();
+    test_init_seq_enables_rx_and_tx();
+    test_init_seq_promiscuous();
+    test_init_seq_aborts_on_error();
+    test_init_seq_reset_timeout();
+    test_init_seq_bad_args();
+    test_init_seq_matches_capture();
+    test_reg_name();
     TEST_REPORT();
 }

@@ -5,6 +5,7 @@
 #include <libkern/OSByteOrder.h>
 #include <IOKit/IOReturn.h>
 
+#include "smsc95xx_init.h"
 #include "smsc95xx_proto.h"
 #include "smsc95xx_regs.h"
 
@@ -167,77 +168,41 @@ int smsc95xx_link_up(usb_device *d, bool *up)
     return kr;
 }
 
-/* Write a register and stop at the first failure, to keep init readable. */
-#define WR(off, val)                                     \
-    do {                                                 \
-        int wkr = smsc95xx_write_reg(d, (off), (val));   \
-        if (wkr != kIOReturnSuccess)                     \
-            return wkr;                                  \
-    } while (0)
+/* The init sequence itself now lives in common/smsc95xx_init.c, so the probe and the
+ * DriverKit extension cannot drift apart on the one thing that has to be identical in
+ * both. What is left here is the adapter: two thunks that turn the shared layer's
+ * (ctx, offset, value) callbacks into this file's usb_device register access.
+ *
+ * Both thunks pass their return value through unchanged. An IOReturn is 0 on success
+ * and non-zero on failure, which is exactly the contract smsc95xx_io states, so the
+ * shared layer propagates a real IOReturn back out without knowing what one is. */
+static int init_read(void *ctx, uint16_t offset, uint32_t *value)
+{
+    return smsc95xx_read_reg((usb_device *)ctx, offset, value);
+}
+
+static int init_write(void *ctx, uint16_t offset, uint32_t value)
+{
+    return smsc95xx_write_reg((usb_device *)ctx, offset, value);
+}
 
 int smsc95xx_init(usb_device *d, const uint8_t mac[6], bool promiscuous)
 {
-    uint32_t v = 0;
-    int kr;
+    smsc95xx_io io;
+    io.ctx   = d;
+    io.read  = init_read;
+    io.write = init_write;
 
-    /* Lite reset, then wait for the chip to clear the bit itself. */
-    WR(SMSC95XX_REG_HW_CFG, SMSC95XX_HW_CFG_LRST);
-    for (int i = 0; ; i++) {
-        kr = smsc95xx_read_reg(d, SMSC95XX_REG_HW_CFG, &v);
-        if (kr != kIOReturnSuccess)
-            return kr;
-        if (!(v & SMSC95XX_HW_CFG_LRST))
-            break;
-        if (i >= 100)
-            return kIOReturnTimeout;
+    int rc = smsc95xx_init_seq(&io, mac, promiscuous);
+
+    /* Map the shared layer's own two failure codes onto the IOReturn values this
+     * function has always returned, so the probe's external behaviour is unchanged.
+     * Anything else is already an IOReturn -- it came out of a callback. */
+    switch (rc) {
+    case 0:                                return kIOReturnSuccess;
+    case SMSC95XX_INIT_ERR_BAD_ARG:        return kIOReturnBadArgument;
+    case SMSC95XX_INIT_ERR_RESET_TIMEOUT:  return kIOReturnTimeout;
+    default:                               return rc;
     }
-
-    kr = smsc95xx_set_mac(d, mac);
-    if (kr != kIOReturnSuccess)
-        return kr;
-
-    WR(SMSC95XX_REG_HW_CFG,      SMSC95XX_HW_CFG_INIT_1);
-    WR(SMSC95XX_REG_BURST_CAP,   SMSC95XX_BURST_CAP_INIT);
-    WR(SMSC95XX_REG_BULK_IN_DLY, SMSC95XX_BULK_IN_DLY_INIT);
-    WR(SMSC95XX_REG_HW_CFG,      SMSC95XX_HW_CFG_INIT_2);
-    WR(SMSC95XX_REG_INT_STS,     SMSC95XX_INT_STS_CLEAR_ALL);
-    WR(SMSC95XX_REG_LED_GPIO_CFG, SMSC95XX_LED_GPIO_CFG_INIT);
-    WR(SMSC95XX_REG_FLOW,        0);
-    WR(SMSC95XX_REG_AFC_CFG,     SMSC95XX_AFC_CFG_INIT);
-    WR(SMSC95XX_REG_VLAN1,       SMSC95XX_VLAN1_INIT);
-    WR(SMSC95XX_REG_HASHH,       0);
-    WR(SMSC95XX_REG_HASHL,       0);
-
-    /* COE_CR and INT_EP_CTL are deliberately not written -- see the header. */
-
-    /* Half-duplex 10 Mb/s: RCVOWN set, FDPX clear. */
-    uint32_t mac_cr = SMSC95XX_MAC_CR_TXEN | SMSC95XX_MAC_CR_RXEN |
-                      SMSC95XX_MAC_CR_RCVOWN;
-    if (promiscuous)
-        mac_cr |= SMSC95XX_MAC_CR_PRMS;
-
-    WR(SMSC95XX_REG_MAC_CR, 0);
-    /* The captured sequence enables the transmitter in MAC_CR BEFORE turning on
-     * the TX datapath in TX_CFG, then enables the receiver afterwards. Both
-     * captures agree on this ordering; preserve it rather than collapsing the
-     * writes, since these orderings encode undocumented hardware requirements. */
-    WR(SMSC95XX_REG_MAC_CR, SMSC95XX_MAC_CR_TXEN);
-    WR(SMSC95XX_REG_TX_CFG, SMSC95XX_TX_CFG_ON);
-    WR(SMSC95XX_REG_MAC_CR, mac_cr);
-
-    /* AFC_CFG's low nibble is set on the half-duplex path. */
-    WR(SMSC95XX_REG_AFC_CFG,
-       SMSC95XX_AFC_CFG_INIT | SMSC95XX_AFC_CFG_HALF_DUPLEX_BITS);
-
-    /* PHY reset is read-modify-write: the surrounding bits differ between
-     * devices and must be preserved. */
-    kr = smsc95xx_read_reg(d, SMSC95XX_REG_PM_CTRL, &v);
-    if (kr != kIOReturnSuccess)
-        return kr;
-    WR(SMSC95XX_REG_PM_CTRL, v | SMSC95XX_PM_CTRL_PHY_RST);
-
-    return kIOReturnSuccess;
 }
-
-#undef WR
 

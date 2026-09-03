@@ -46,6 +46,10 @@ int smsc95xx_set_mac(usb_device *d, const uint8_t mac[6]);
 
 /* Run the full initialization sequence and enable TX and RX.
  *
+ * The sequence itself lives in common/smsc95xx_init.c as smsc95xx_init_seq(), shared
+ * verbatim with the DriverKit extension so the two cannot drift; this is a thin
+ * adapter over it. Behaviour, including the IOReturn values, is unchanged.
+ *
  * Follows the captured Linux bring-up, with two deliberate omissions recorded
  * in the design spec: checksum offload (COE_CR) is left off, because it is out
  * of scope and would add two bytes to every received frame; and the interrupt

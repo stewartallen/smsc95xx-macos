@@ -4,10 +4,15 @@ CFLAGS  ?= -O2 -g
 override CFLAGS += -std=c11 -Wall -Wextra -Werror -I../../common
 LDFLAGS := -framework IOKit -framework CoreFoundation
 
-PROBE_SRCS := main.c usb_backend.c smsc95xx_ops.c ../../common/smsc95xx_proto.c
-HDRS       := ../../common/smsc95xx_regs.h ../../common/smsc95xx_proto.h usb_backend.h smsc95xx_ops.h
+COMMON_SRCS := ../../common/smsc95xx_proto.c ../../common/smsc95xx_init.c
 
-TEST_SRCS  := tests/test_proto.c ../../common/smsc95xx_proto.c
+PROBE_SRCS := main.c usb_backend.c smsc95xx_ops.c $(COMMON_SRCS)
+HDRS       := ../../common/smsc95xx_regs.h ../../common/smsc95xx_proto.h \
+              ../../common/smsc95xx_init.h usb_backend.h smsc95xx_ops.h
+
+# The init sequence is in common/ too, and it is callback-driven with no I/O of its
+# own, so the tests can link it and drive it from a mock -- no frameworks, no hardware.
+TEST_SRCS  := tests/test_proto.c $(COMMON_SRCS)
 
 .PHONY: all test clean
 
