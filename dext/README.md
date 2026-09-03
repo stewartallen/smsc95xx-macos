@@ -1,10 +1,13 @@
 # Building and loading SMSC95xxDriver.dext
 
-> **Scope as of M4.** This driver registers a network interface and reads the chip's registers.
-> It does **not** move frames yet — there is no USB bulk transfer path until M5. `ifconfig` will show
-> the interface with the correct MAC and `status: active`, but nothing can be sent or received and
-> `ping` will not work. Do not read `status: active` as reachability; see the link-state section for
-> why it reports active whenever the dongle is attached.
+> **Scope as of M5.** This driver moves frames. `ping` works in both directions between the Mac and
+> a peer on the T1S segment — see `reference/m5-datapath.txt` for the measured evidence. One USB bulk
+> transfer is outstanding in each direction at a time and every frame is copied once, so M5 is
+> correctness rather than throughput; a ring and `AsyncIOBundled` are M6.
+>
+> Still do not read `status: active` as reachability. It is reported for as long as the dongle is
+> attached rather than polled, because a T1S segment without PLCA carries no continuous
+> link-integrity signal — see the link-state section for why.
 
 
 The DriverKit extension (`dext`) for the LAN9500A is built entirely with the `Makefile` — no Xcode
@@ -131,6 +134,37 @@ make clean
 ```
 
 Removes the entire `build/` directory.
+
+### `make TRACE=1` — compile in the per-frame datapath tracing
+
+```sh
+make app TRACE=1
+```
+
+Off by default. A normal build logs errors, refusals, the guards, and two lines of TX/RX
+totals whenever a run of traffic ends — enough to answer *did it work and did it lose
+anything*. `TRACE=1` adds three per-call traces that answer *what happened to this
+particular frame*:
+
+| Prefix | Covers |
+|---|---|
+| `DIAG5:` | every NetworkingDriverKit callback into the driver, with arguments and the value returned |
+| `DIAG6:` | transmit: every doorbell, dequeue, framed transfer, completion, and packet handed back |
+| `DIAG7:` | receive: every completion, record, drop with its reason, enqueue, and re-arm |
+
+```sh
+/usr/bin/log stream --predicate 'eventMessage CONTAINS "DIAG6:"' --style compact
+```
+
+**Why it is not on by default.** `os_log` throttles hard. During M5 a burst of ~364,000
+messages caused *later* attach-time logs to vanish from the store entirely — worse than
+having no tracing at all, because the absence looks like the driver never ran. The trace is
+also 34 KB of format strings in the binary.
+
+Disabled, the macros compile to `if (0) os_log(...)` rather than to nothing, so every format
+string and argument is still type-checked in a default build and a trace line cannot rot
+unnoticed. That relies on no trace call having a side effect in its arguments — currently
+true of all 68 of them, and worth keeping true.
 
 ---
 
@@ -405,15 +439,40 @@ Full measured evidence: `reference/signing-entitlement-match.txt`.
 
 ## Device matching and the provider
 
-### Why the provider is `IOUSBHostDevice`, not `IOUSBHostInterface`
+### Two drivers: why both provider classes are needed
 
-The device arrives at the macOS USB stack **unconfigured** — with configuration 0 selected. Before
-the driver can access endpoints, it must select a configuration and copy an interface node. See
-`reference/m3-attach-state.txt` for the measured state at clean attach.
+Since M5 there are two classes, and five personalities across them:
 
-Unconfigured devices have no interface nodes in the IOKit tree — only a device node. A personality
-matching `IOUSBHostInterface` can never match, because no interface exists. The dext builds, signs,
-installs, and activates cleanly, then silently never matches, with nothing logged to say why.
+| Class | Provider | `IOClass` | `CFBundleIdentifierKernel` | Job |
+|---|---|---|---|---|
+| `SMSC95xxUSBDevice` | `IOUSBHostDevice` | `IOUserService` | `com.apple.kpi.iokit` | select configuration 1, nothing else |
+| `SMSC95xxDriver` | `IOUSBHostInterface` | `IOUserNetworkEthernet` | `com.apple.iokit.IOSkywalkFamily` | pipes, registers, network interface |
+
+The device arrives at the macOS USB stack **unconfigured** — with configuration 0 selected. See
+`reference/m3-attach-state.txt` for the measured state at clean attach. Unconfigured devices have no
+interface nodes in the IOKit tree, only a device node, so an interface personality on its own can
+never match: the dext builds, signs, installs and activates cleanly, then silently never matches with
+nothing logged to say why. That is what the device-level class exists to prevent — it calls
+`SetConfiguration(1, true)`, and `matchInterfaces` must be `true` there, because the interface nodes
+that call creates are exactly what `SMSC95xxDriver` then matches against.
+
+The bulk endpoints live on the interface, not the device, which is why the datapath belongs on that
+half. The interface in the provider chain is also what lets SystemConfiguration name the port from
+`kUSBProductString` instead of calling it `Ethernet Adapter (enN)`.
+
+The interface-level driver needs no device handle of its own: control transfers for registers, MII and
+EEPROM go through `interface->DeviceRequest(..., kIOUSBDeviceRequestRecipientDevice, ...)`.
+
+**Interface match keys fail silently if wrong.** A personality specifying `idVendor` MUST also specify
+`idProduct` or `idProductArray`, plus `bConfigurationValue` and `bInterfaceNumber`. `idVendor` alone is
+rejected before matching and logs nothing at any level, including `--debug --info`. All 121 of Apple's
+own `IOUSBHostInterface` personalities were surveyed and none uses `idVendor` without a product key.
+Ours uses `idProductArray` for the MACH, whose USB product ID depends on whether its EEPROM auto-load
+succeeded. Full evidence: `reference/m5-interface-matching.txt`.
+
+Note also that **`ioreg -p IOUSB` does not show `IOUSBHostInterface` nodes** as children of a device.
+Use the IOService plane (plain `ioreg`) and parse `ioreg -a` as a plist; scraping the indented text
+form misattributes properties to the wrong node.
 
 To check whether the driver actually attached, search the USB device subtree — **not**
 `ioreg -c IOUserService`, whose class filter matches nothing for this driver even when it *is* attached
@@ -563,14 +622,30 @@ See `reference/m4-interface.txt` section 2 for the measured evidence.
 
 ---
 
-## Advertised offloads — open item
+## Advertised offloads — closed, and they are cosmetic
 
-The interface advertises `TSO4,TSO6,PARTIAL_CSUM` — TCP segmentation offload and partial checksum
-offload — that the driver does not implement. `Start()` never touches `COE_CR` at all — it skips
-checksum offload initialization entirely, and there is no packet segmentation logic anywhere in the
-driver.
+The interface advertises `TSO4,TSO6,PARTIAL_CSUM` — TCP segmentation and partial checksum offload —
+that the driver does not implement. `Start()` never touches `COE_CR`, and there is no segmentation
+logic anywhere in the driver. At M4 this was an open item and a real risk to the datapath: if the
+stack were handing down TSO segments, transmission would have failed in a way that looked exactly
+like a framing bug.
 
-Three driver-side APIs were tried, each returning nothing:
+**Measured at M5, before any framing code existed** — which was the point. The TX dequeue handler
+logged the length of every packet the stack handed us and completed it without transmitting:
+
+```
+lengths observed:  42 .. 1372
+maximum:           1372
+over 1514:         0
+```
+
+So Skywalk performs those offloads in software above the driver. The driver is never handed a
+segmented or partially-checksummed frame, and the advertisement is cosmetic. **This item is closed.**
+That confirms the hypothesis recorded at M4 — that `options=` reflects what the Skywalk layer offers
+the BSD stack rather than a claim about our hardware, which `CHANNEL_IO` and `ZEROINVERT_CSUM`
+appearing in the same list already suggested, both being Skywalk-native flags.
+
+Three driver-side APIs were tried first, each returning nothing:
 - `getHardwareAssists()` — called repeatedly, returns 0, flags unchanged
 - `setHardwareAssists(assists, mask)` — never called by the stack
 - `getTSOOptions(opts)` — never called by the stack
@@ -590,18 +665,8 @@ Those are exactly the capabilities `ifconfig` names. A fourth API, `getFeatureFl
 also checked — but the `kIOUserNetworkFeatureFlag*` enum carries only VLAN, timestamp, WOMP and
 NicProxy bits, no TSO or checksum, so it cannot be the source either.
 
-So the bounded conclusion is narrower than "no API exists": the driver reports 0 through the one API
-the family actually calls, the descriptor the family builds has a `hwAssists` field fed from it, and the
-advertisement persists regardless. The remaining hypothesis — untested — is that `options=` reflects
-what the **Skywalk layer** offers to the BSD stack, with the offload performed in software above the
-driver, rather than a claim about our hardware. `CHANNEL_IO` and `ZEROINVERT_CSUM` appearing in the same
-list are consistent with that reading, both being Skywalk-native flags.
-
-**M5 test:** once bulk transfer is wired, check whether the stack hands us packets that are
-pre-segmented or carry partial checksums. If it does, transmission will fail in a way that looks
-exactly like a framing bug, so check this **before** suspecting the framing code. If the stack
-honours the 0 from `getHardwareAssists()` in practice, the advertisement is cosmetic and this item
-can be closed.
+The 1518-byte length guard in the transmit path stays regardless. That is a memory-safety bound on a
+`memcpy`, not an offload question.
 
 ---
 

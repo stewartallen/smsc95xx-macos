@@ -44,6 +44,7 @@ exactly which values are device-specific and which are not.
 | File | What it is |
 |---|---|
 | `m4-interface.txt` | The M4 evidence: the interface appears in `ifconfig` with the correct MAC read from EEPROM. Records the interface properties, link state behaviour, four NetworkingDriverKit facts that cost time to discover, an open item on advertised-but-unimplemented offloads, and the finding that the two EEPROM provenance signals can disagree. **M4 registers an interface but does not move frames** — there is no USB bulk transfer path until M5. See `dext/README.md` for networking personality details. |
+| `m5-datapath.txt` | The M5 evidence: **frames cross the T1S link in both directions**. Records the rig, both classes attached at the right levels, the display-name fix, the closed offload question with its measured lengths, pings and the peer's `tcpdump` capture, and the two datapath bugs — `getDataVirtualAddress()` not including the packet data offset, and receive buffers having to come from the RX submission queue — both diagnosed by disassembling NetworkingDriverKit rather than by testing on hardware. Also the NetworkingDriverKit and USBDriverKit facts that each cost a hardware cycle, why a dext crash loop panics the machine, and the MAC provenance gate. |
 
 ### Code signing evidence
 

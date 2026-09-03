@@ -294,21 +294,22 @@ entirely and also give byte-exact control for validating TX/RX framing.
 | M2 | Probe does full init, transmits one frame, receives one frame — **done** |
 | M3 | Dext loads and matches the device in `ioreg` — **done** |
 | M4 | Interface appears in `ifconfig` with the EEPROM MAC — **done** |
-| M5 | Frames cross the T1S link to the Pi — also splits the driver in two (see below) |
+| M5 | Frames cross the T1S link to the Pi — also splits the driver in two — **done** |
 | M6 | `tcpdump` works via the BPF tap; throughput measured |
 
 Throughput expectations should stay modest: the segment is 10 Mb/s half-duplex, and the media
 converter rate-adapts from 100BASE-TX, so loss under load is expected.
 
-**Planned for M5: split into two drivers.** Today one class matches `IOUSBHostDevice`, configures the
-device and owns the networking. M5 splits that into a device-level personality that only selects the
-configuration, plus an interface-level personality matching the resulting `IOUSBHostInterface` that owns
-the pipes and the network interface — the structure Apple's own USB Ethernet dext uses. The bulk
-endpoints live on the interface rather than the device, so this is the natural shape for the datapath,
-and it also fixes the interface's display name: SystemConfiguration names a USB network interface from
-`kUSBProductString` found while walking the provider chain, and needs an `IOUSBHostInterface` in that
-chain to find it. Attached directly to the device, the interface shows as `Ethernet Adapter (enN)`
-instead of the dongle's product name. See `reference/m4-interface.txt` for what was ruled out.
+**M5 split the driver in two.** `SMSC95xxUSBDevice` matches `IOUSBHostDevice` and does nothing but
+select configuration 1; `SMSC95xxDriver` matches the resulting `IOUSBHostInterface` and owns the pipes
+and the network interface — the structure Apple's own USB Ethernet dext uses. The bulk endpoints live on
+the interface rather than the device, so this is the natural shape for the datapath, and it also fixed
+the interface's display name: SystemConfiguration names a USB network interface from `kUSBProductString`
+found while walking the provider chain, and needs an `IOUSBHostInterface` in that chain to find it.
+Attached directly to the device the interface showed as `Ethernet Adapter (enN)`; it now reads the
+dongle's own product name. See `reference/m4-interface.txt` for what was ruled out, and
+`reference/m5-datapath.txt` for the measured result — pings in both directions, the Pi's capture, and
+the two framing bugs that were diagnosed by disassembling NetworkingDriverKit rather than by testing.
 
 ### v1 scope
 
@@ -338,7 +339,10 @@ tools/        decode-usbmon.py        turn a usbmon pcap into a named register t
 
 ### Device matching
 
-Three personalities, matching `IOUSBHostDevice` (not `IOUSBHostInterface`):
+Five personalities across two provider classes, since M5 split the driver in two.
+
+Three match `IOUSBHostDevice` and name `SMSC95xxUSBDevice` (`IOClass` `IOUserService`,
+`CFBundleIdentifierKernel` `com.apple.kpi.iokit`):
 
 | | `idVendor` | `idProduct` | Notes |
 |---|---|---|---|
@@ -346,13 +350,26 @@ Three personalities, matching `IOUSBHostDevice` (not `IOUSBHostInterface`):
 | MACH (EEPROM failed) | `0x0424` | `0x9E00` | EEPROM auto-load failed; generic LAN9500A default |
 | EVB | `0x184F` | `0x0051` | Microchip reference board |
 
-**Why `IOUSBHostDevice` and not `IOUSBHostInterface`:** macOS leaves this device unconfigured
-at attach time. An unconfigured device has no interface nodes in the IOKit tree, only a device
-node. A personality matching `IOUSBHostInterface` would build, sign, install, and then silently
-never match, because no interface exists to match against. The driver selects configuration 1
-in its `Start()` method and copies interface 0. See `reference/m3-attach-state.txt` for the
-measured unconfigured state, and `reference/m3-dext-match.txt` for the evidence that device-level
-matching works on hardware.
+Two match `IOUSBHostInterface` and name `SMSC95xxDriver` (`IOClass` `IOUserNetworkEthernet`,
+`CFBundleIdentifierKernel` `com.apple.iokit.IOSkywalkFamily`) — one per vendor, because a single
+personality dictionary cannot express two values of `idVendor`:
+
+| | `idVendor` | `idProductArray` | `bInterfaceClass` | `bInterfaceNumber` | `bConfigurationValue` |
+|---|---|---|---|---|---|
+| MACH interface | `0x0424` | `0x9905`, `0x9E00` | 255 | 0 | 1 |
+| EVB interface | `0x184F` | `0x0051` | 255 | 0 | 1 |
+
+**Why the device level is still needed:** macOS leaves this device unconfigured at attach time,
+and an unconfigured device has no interface nodes in the IOKit tree. An interface personality
+alone would build, sign, install, and then silently never match. `SMSC95xxUSBDevice` selects
+configuration 1 with interface matching enabled, which is what creates the nodes the interface
+personality then matches. See `reference/m3-attach-state.txt` for the measured unconfigured state.
+
+**The interface match keys fail silently if wrong.** A personality specifying `idVendor` MUST
+also specify `idProduct` or `idProductArray`, plus `bConfigurationValue` and `bInterfaceNumber`.
+`idVendor` alone is rejected before matching and logs nothing at any level, including
+`--debug --info`. All 121 of Apple's own `IOUSBHostInterface` personalities were surveyed and
+none uses `idVendor` without a product key — see `reference/m5-interface-matching.txt`.
 
 **`0x0424:0x9905` vs `0x9E00`:** On this hardware unit the EEPROM auto-load sometimes fails
 (cause not established). When it succeeds (normal case), the device reports `0x9905` with

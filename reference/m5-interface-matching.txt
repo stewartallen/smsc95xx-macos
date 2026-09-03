@@ -1,0 +1,170 @@
+# Why an IOUSBHostInterface personality needs a product key
+#
+# date:    2026-08-31
+# system:  macOS 26.6.2 build 25G83, Apple Silicon
+# posture: SIP disabled, no AMFI boot-arg, signed with a development profile
+# device:  MACH SYSTEMS 10BASET1S-USB-IF
+# dext:    com.github.stewartallen.smsc95xx.driver 2.12/32
+#
+# WHY THIS FILE EXISTS
+# M5 splits the driver in two: a device-level personality that selects the USB
+# configuration, and an interface-level personality that owns the pipes and the network
+# interface. The interface personality did not match, and it failed in the worst possible
+# way -- completely silently. Nothing at Default level, nothing under --debug --info, no
+# error anywhere. The interface node existed with the right properties and simply had no
+# driver attached to it.
+
+## THE RULE (measured)
+
+An IOUSBHostInterface matching dictionary that specifies idVendor must ALSO specify a
+product key -- idProduct or idProductArray. A personality keyed on idVendor alone is
+rejected before matching is attempted, so no diagnostic is ever produced.
+
+Surveyed every IOUSBHostInterface personality shipped in /System/Library/DriverExtensions
+on this machine (121 of them, across AppleUserHIDDrivers, AppleUSBFTDI, AppleUSBCHCOM,
+AppleUserECM, UVC and others):
+
+  count  keys used
+  -----  ---------------------------------------------------------------------
+    105  idVendor, idProduct, bConfigurationValue, bInterfaceNumber
+      9  the same four, plus bInterfaceClass and bInterfaceSubClass
+      4  idVendor, idProductArray, bConfigurationValue, bInterfaceNumber
+      3  bInterfaceClass, bInterfaceSubClass
+      3  bInterfaceClass, bInterfaceSubClass, bInterfaceProtocol
+      2  bInterfaceClass, bInterfaceSubClass, idProduct, idVendor
+      2  bInterfaceClass, bInterfaceSubClass, bInterfaceProtocol, idProduct, idVendor
+      1  idVendor, idProduct, bInterfaceNumber
+      0  idVendor with no product key
+
+Two coherent schemes emerge: vendor-specific matching always carries a product key, and
+class-generic matching carries no vendor at all. Our personality was
+idVendor + bInterfaceClass + bInterfaceNumber -- a mix of the two with no product key, and
+the single shape not represented anywhere in Apple's own drivers.
+
+## WHAT WE USE NOW
+
+    idVendor           = 1060          (0x0424 Microchip/SMSC)
+    idProductArray     = [39173, 40448]  (0x9905 and 0x9E00)
+    bConfigurationValue = 1
+    bInterfaceNumber   = 0
+
+idProductArray rather than idProduct because this is ONE physical chip with two identities:
+the USB product ID is loaded from EEPROM, so a successful auto-load reports 0x9905 and a
+failed one reports the chip default 0x9E00. Needing to accept both is exactly why the
+product key had been omitted in the first place. AppleUSBFTDI-308A-multiple uses the same
+shape for the same reason.
+
+bInterfaceClass 255 was dropped. It had been included to keep this personality off the SMSC
+USB2422 hub inside the same dongle, which shares vendor 0x0424 AND presents
+bInterfaceNumber 0 -- so before, that key was the only thing preventing a cross-match. The
+product array now excludes the hub (0x2422) directly, which is a stronger guard than a class
+check. Do not "simplify" these keys by dropping the product array.
+
+## A FOURTH WAY A DEXT FAILS SILENTLY
+
+reference/m3-dext-match.txt records the requirements for a dext to load, each with the error
+it produces. This is a further failure mode and it produces NO error at all:
+
+  1. wrong architecture (plain arm64)      -> "Exec format error" from kernelmanagerd
+  2. unauthorised restricted entitlement   -> "Unsatisfied Entitlements", also surfacing as
+                                              "Exec format error" (see
+                                              reference/signing-entitlement-match.txt)
+  3. match keys that do not describe the   -> personality never matches; no log line
+     device (M3)
+  4. match keys in a SHAPE the family      -> personality never considered; no log line at
+     rejects (this file)                      any level, including --debug --info
+
+For 3 and 4 the only route is to compare the personality against the live node's properties
+and against working examples of the same provider class.
+
+## A METHOD ERROR THAT COST TWO HARDWARE CYCLES
+
+`ioreg -p IOUSB` does NOT show IOUSBHostInterface nodes as children of their device. Reading
+that plane produced the conclusion "SetConfiguration created no interfaces", which was
+false: in the IOService plane (plain `ioreg`) the interface node was present the whole time,
+with bInterfaceClass 255, bInterfaceNumber 0, idVendor 1060 and bConfigurationValue 1.
+
+That false conclusion led to a wrong fix -- closing the device session after configuring, on
+the theory that exclusive access suppressed interface publication. A diagnostic disproved it
+directly: CopyInterface reported one interface both before and after Close. The change was
+reverted, and holding the session turns out to be worth keeping, because Google Chrome and
+cef_server both attempt to open this device and the exclusive session is what refuses them.
+
+Use the IOService plane for parent/child questions, and parse `ioreg -a` output as a plist.
+Scraping the indented text form misattributes properties to the wrong node; doing that
+produced a spurious "5 interfaces for vendor 1060" reading in the same session.
+
+## END STATE
+
+    device pid=0x9905
+      child: SMSC95xxUSBDevice   | IOUserService
+      child: IOUSBHostInterface
+               SMSC95xxDriver    | IOUserNetworkEthernet
+                 IOSkywalkLegacyEthernet
+                 IOSkywalkNetworkBSDClient
+
+    en10: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+        ether fc:61:79:90:04:56
+        media: autoselect (10baseT/UTP <half-duplex>)
+        status: active
+
+    $ networksetup -listallhardwareports
+    Hardware Port: 10BASE-T
+    Device: en10
+
+The display name was the M4 defect this split was meant to fix, and it is fixed: it reads
+10BASE-T instead of "Ethernet Adapter (en10)". Note that the originally hoped-for
+"10BASET1S-USB-IF" is the STM32 control function's iProduct string -- a sibling USB device.
+The LAN9500A's own string is "10BASE-T", and in the 0x9E00 state it has none at all
+(iProduct 0). Naming the Ethernet interface after the Ethernet function is correct.
+
+Register, PHY and EEPROM access all work unchanged through
+IOUSBHostInterface::DeviceRequest, which is what makes the device handle unnecessary in the
+interface-level driver. See the spec for that correction.
+
+## CONFIRMED ON THE SECOND DEVICE (EVB-LAN8670-USB, 2026-08-31)
+
+The Microchip EVB is a useful independent check on the split: a single USB function with no
+internal hub and no STM32 control channel, so SetConfiguration and interface matching run
+against a much simpler tree than the MACH's. Its personality uses idProduct rather than
+idProductArray, the EVB having only one identity.
+
+    EVB device node: 10BASE-T1S
+      child: SMSC95xxUSBDevice   | IOUserService
+      child: IOUSBHostInterface     ifNum=0 ifClass=255 cfgVal=1 pid=81
+               SMSC95xxDriver    | IOUserNetworkEthernet
+                 IOSkywalkLegacyEthernet
+                 IOSkywalkNetworkBSDClient
+
+    en11: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+        ether 9c:95:6e:b5:9b:62
+        inet 169.254.85.31 netmask 0xffff0000
+        media: autoselect (10baseT/UTP <half-duplex>)
+        status: active
+
+    Hardware Port: 10BASE-T1S
+    Device: en11
+
+macOS created the network service and brought the interface up by itself here, including
+link-local addressing -- the MACH did not, only because its service had been deleted
+manually beforehand to stop a stale cached name falsifying the display-name check.
+
+### This attach also proved the DEBUG_MAC scaffolding is correctly gated
+
+The build under test had DEBUG_MAC=fc:61:79:90:04:56 compiled in, which is the MACH's
+address. The EVB came up with its own 9c:95:6e:b5:9b:62 and the log recorded zero override
+activations, so the override fires only after the EEPROM provenance gate has failed and
+never unconditionally.
+
+That property cannot be tested on the MACH at all: there the override value and the real
+programmed MAC are the same address, so a wrongly-firing override would be invisible. Worth
+remembering if the scaffolding is ever reintroduced -- test it on the EVB.
+
+### Per-unit PHY variance, again
+
+EVB PHY ID reads 0x0007:0xc165; the MACH reads 0x0007:0x4165. Same difference recorded in
+reference/evb-init-sequence.txt at M1. This is why the driver does not validate PHY IDs, and
+seeing both values in one session is a reminder not to add such a check.
+
+Note ID_REV reports chip 0x9e00 on the EVB as well. That is the chip identity register
+reading LAN9500A, and is unrelated to the EEPROM-derived USB product ID.

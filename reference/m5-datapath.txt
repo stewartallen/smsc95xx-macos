@@ -1,0 +1,657 @@
+# M5 evidence: Ethernet frames cross the 10BASE-T1S link, carried by the DriverKit driver
+#
+# date:    2026-09-02 09:37 PDT
+# system:  macOS 26.6.2 build 25G83, Apple Silicon (Mac16,11)
+# posture: SIP disabled, systemextensionsctl developer on. No boot-args set on this
+#          machine; AMFI is satisfied by the Developer-ID-signed build plus a
+#          provisioning profile, not by amfi_get_out_of_my_way.
+# devices: BOTH units were driven by this driver, in two arrangements, and the datapath
+#          was proven on each:
+#            sections 1-6  EVB-LAN8670-USB (184f:0051) on the Mac, MACH on the Pi
+#            section 10    MACH 10BASET1S-USB-IF (0424:9905/0x9E00) on the Mac, EVB on
+#                          the Pi -- the swap is required because only the MACH can
+#                          produce a failed EEPROM auto-load
+# dext:    com.github.stewartallen.smsc95xx.driver, Apple Development signed,
+#          arm64e-apple-driverkit24.0. 2.25/45 for sections 1-6, 2.26/46 -- which has no
+#          MAC override compiled in at all -- for section 10.
+#
+# SCOPE: M5 is correctness, not throughput. One USB bulk transfer is outstanding in each
+# direction at a time and every frame is copied once, so nothing here should be read as a
+# performance figure. The numbers below are "does it work and does it lose anything".
+
+
+=======================================================================
+0. THE TEST RIG
+=======================================================================
+
+    Mac ── USB ── EVB-LAN8670-USB ── 6" terminated T1S cable ──
+                             MACH 10BASET1S-USB-IF ── USB ── Raspberry Pi
+
+No PLCA. The segment runs CSMA/CD with exactly two nodes.
+
+    Mac  en11  9c:95:6e:b5:9b:62  192.168.90.1/24  network service "10BASE-T1S"
+    Pi   eth1  fc:61:79:90:04:56  192.168.90.2/24  Linux smsc95xx v2.0.0
+
+The Pi reports the link independently, which is the only outside confirmation of the
+physical layer available here:
+
+    $ ssh 10base-t1s 'sudo ethtool eth1'
+        Speed: 10Mb/s
+        Duplex: Half
+        Link detected: yes
+
+A real macOS network service matters. A manual `ifconfig ... up` does not survive a driver
+restart, and an interface that quietly went down produced one bogus RX result during
+development.
+
+
+=======================================================================
+1. BOTH CLASSES ATTACH, AT THE RIGHT LEVELS
+=======================================================================
+
+The M4 driver matched IOUSBHostDevice and owned everything. M5 splits it: a device-level
+driver whose only job is to select configuration 1, and the ethernet driver re-parented
+onto the resulting IOUSBHostInterface -- which is where the bulk endpoints live, and which
+SystemConfiguration needs in the provider chain to name the interface.
+
+    $ ioreg -l -w0 | grep '"IOUserClass" = "SMSC95xx'
+        "IOUserClass" = "SMSC95xxUSBDevice"
+          "IOUserClass" = "SMSC95xxDriver"      <- one level deeper: the interface node
+
+    $ make -C dext status
+        running: v45 [3B9F8F52-25E6-4363-AE2E-A3F971466116]
+        staged:  v45 [3B9F8F52-25E6-4363-AE2E-A3F971466116]
+        declared in tree: v45
+
+Five personalities across two provider classes: three device-level ones naming
+SMSC95xxUSBDevice (IOClass IOUserService, CFBundleIdentifierKernel com.apple.kpi.iokit),
+and two interface-level ones naming SMSC95xxDriver (IOClass IOUserNetworkEthernet,
+CFBundleIdentifierKernel com.apple.iokit.IOSkywalkFamily) -- one per vendor ID, because a
+single personality dictionary cannot express two values of idVendor.
+
+The interface-level match keys are load-bearing and fail SILENTLY if wrong. See
+reference/m5-interface-matching.txt: a personality specifying idVendor MUST also specify
+idProduct or idProductArray, plus bConfigurationValue and bInterfaceNumber. idVendor alone
+is rejected before matching and logs nothing at any level, including --debug --info. All
+121 of Apple's own IOUSBHostInterface personalities were surveyed; none uses idVendor
+without a product key.
+
+
+=======================================================================
+2. THE DISPLAY NAME -- the defect that motivated the split
+=======================================================================
+
+M4's interface appeared as "Ethernet Adapter (enN)". With the interface in the provider
+chain it reads the hardware's own name:
+
+    $ networksetup -listallhardwareports
+        Hardware Port: 10BASE-T1S
+        Device: en11
+        Ethernet Address: 9c:95:6e:b5:9b:62
+
+
+=======================================================================
+3. THE INTERFACE
+=======================================================================
+
+    $ ifconfig en11
+    en11: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+        options=6460<TSO4,TSO6,CHANNEL_IO,PARTIAL_CSUM,ZEROINVERT_CSUM>
+        ether 9c:95:6e:b5:9b:62
+        inet 192.168.90.1 netmask 0xffffff00 broadcast 192.168.90.255
+        media: autoselect (10baseT/UTP <half-duplex>)
+        status: active
+
+The MAC is the one read from the chip's EEPROM, never invented; see section 8.
+
+10baseT/UTP is the closest available media word -- there is no 10BASE-T1S constant in
+NetworkingDriverKit -- and the link is genuinely half duplex. "status: active" is reported
+for as long as the dongle is attached rather than polled, because a T1S multidrop segment
+without PLCA carries no continuous link-integrity signal: BMSR bit 2 reads set with the
+cable unplugged (measured at M2), so it must never be presented as link truth.
+
+
+=======================================================================
+4. THE OFFLOAD QUESTION -- ANSWERED, and it is cosmetic
+=======================================================================
+
+`options=6460<TSO4,TSO6,PARTIAL_CSUM>` advertises offloads this driver does not implement,
+and M4 could not make getHardwareAssists() change it. That was an open item from M4 and a
+real risk to the framing work: if the stack were handing down TSO segments, the symptom
+after writing framing would have been indistinguishable from a framing bug.
+
+So it was measured BEFORE any framing code existed, by logging the length of every packet
+the stack handed us and completing it without transmitting (M5 Gate 2, dext 2.9/29):
+
+    lengths observed:  42 .. 1372
+    maximum:           1372
+    over 1514:         0
+
+Conclusion: Skywalk performs those offloads in software above the driver. The driver is
+never handed a segmented or partially-checksummed frame, and the ifconfig flags are
+cosmetic. The item is CLOSED. Framing does not need to handle either case.
+
+The length guard in the transmit path stays anyway, at 1518 (a VLAN-tagged maximum frame),
+because the memcpy behind it is only as safe as the length driving it. That is a
+memory-safety bound, not an offload question.
+
+
+=======================================================================
+5. FRAMES CROSS THE LINK -- Gate 3, the headline result
+=======================================================================
+
+    $ ping -c 5 192.168.90.2
+    64 bytes from 192.168.90.2: icmp_seq=1 ttl=64 time=1.343 ms
+    64 bytes from 192.168.90.2: icmp_seq=2 ttl=64 time=1.536 ms
+    64 bytes from 192.168.90.2: icmp_seq=3 ttl=64 time=1.509 ms
+    64 bytes from 192.168.90.2: icmp_seq=4 ttl=64 time=1.165 ms
+    --- 192.168.90.2 ping statistics ---
+    5 packets transmitted, 5 packets received, 0.0% packet loss
+    round-trip min/avg/max/stddev = 1.165/1.553/2.210/0.355 ms
+
+    $ ssh 10base-t1s 'ping -c 5 192.168.90.1'
+    --- 192.168.90.1 ping statistics ---
+    5 packets transmitted, 5 received, 0% packet loss, time 4005ms
+    rtt min/avg/max/mdev = 1.037/1.120/1.165/0.044 ms
+
+The Pi's own view of the wire. Note the ethertype: this is the field the 8-byte framing bug
+in section 6 used to destroy, and it now parses:
+
+    $ ssh 10base-t1s 'sudo tcpdump -i eth1 -n -e'
+    09:38:10.551010 9c:95:6e:b5:9b:62 > ff:ff:ff:ff:ff:ff, ethertype ARP (0x0806),
+        length 60: Request who-has 192.168.90.2 tell 192.168.90.1, length 46
+    09:38:10.551070 fc:61:79:90:04:56 > 9c:95:6e:b5:9b:62, ethertype ARP (0x0806),
+        length 42: Reply 192.168.90.2 is-at fc:61:79:90:04:56, length 28
+    09:38:10.551895 9c:95:6e:b5:9b:62 > fc:61:79:90:04:56, ethertype IPv4 (0x0800),
+        length 98: 192.168.90.1 > 192.168.90.2: ICMP echo request, id 29291, seq 0,
+        length 64
+    09:38:10.551955 fc:61:79:90:04:56 > 9c:95:6e:b5:9b:62, ethertype IPv4 (0x0800),
+        length 98: 192.168.90.2 > 192.168.90.1: ICMP echo reply, id 29291, seq 0,
+        length 64
+
+ARP resolves in both directions, and the Mac's own mDNS traffic goes out correctly at
+172-224 bytes, so the framing holds above minimum length too:
+
+    09:38:10.056619 9c:95:6e:b5:9b:62 > 01:00:5e:00:00:fb, ethertype IPv4 (0x0800),
+        length 204: 192.168.90.1.5353 > 224.0.0.251.5353: PTR redacted-host._airplay._tcp.local.
+
+Counters over the run:
+
+    $ netstat -I en11
+    Name  Mtu   Network      Address             Ipkts Ierrs  Opkts Oerrs  Coll
+    en11  1500  <Link#32>  9c:95:6e:b5:9b:62       104     0    141     0     0
+
+Zero input errors, zero output errors, zero collisions. Across 1294 lines of driver log for
+this attach there were no occurrences of FAILED, REFUSING, RE-ENTERED, "NOT on the driver's
+dispatch queue", LOST, DROP, STALLED, or "gave nothing".
+
+### A sustained run
+
+The pings above are the gate. A flood ping afterwards is the more convincing number, and it
+is where the permanent counters earn their place -- these two lines are logged when the
+interface is disabled and again at datapath teardown, so a whole attach/detach cycle reports
+its own totals with no tracing enabled:
+
+    counters at datapath teardown -- TX: doorbells 15342 drains 30684 deferred 1458 |
+      dequeued 15342 submitted 15342 completions 15342 returned 15342 lost 0 |
+      frames 15342 bytes 10906461 | rejected 0 submitFail 0 errors 0 stalls 0 aborted 0
+    counters at datapath teardown -- RX: completions 15713 errors 1 zeroLen 0 arms 15713
+      armFail 1 | bytes 10713268 records 15715 frames 15715 dropped 0 |
+      enqueued 15715 enqFail 0 lost 0 | fromSubmitQ 15715 submitQEmpty 0 poolFail 0
+
+31,057 frames and roughly 10.9 MB out / 10.7 MB in, and every identity holds exactly:
+
+    TX  dequeued == submitted == completions == returned == frames == 15342, lost 0
+    RX  records == frames == enqueued == 15715, dropped 0, enqFail 0, lost 0
+
+Nothing was rejected, no transfer failed to submit, no pipe stalled, and no packet was
+leaked in either direction.
+
+fromSubmitQ 15715 with submitQEmpty 0 is the one to read twice: every single receive buffer
+came from the RX submission queue across the whole run, and the pool fallback never fired
+once. That is the fix in section 6b holding under load, not just on the first frame.
+
+The single RX "error" and the single arm failure are both the unplug that ended the run --
+status 0xe00002ed (kIOReturnNotResponding) on a device that had just been removed, then
+0xe0005000 on the re-arm. Benign, and correctly reported: one event in 31,057 frames.
+
+That run also justified compiling the per-frame tracing out by default. This build still had
+it unconditionally enabled, and it produced a 36 MB log for those 31,057 frames -- about
+1.2 KB of log per frame. See the TRACE=1 section in dext/README.md.
+
+The transmit accounting identity held throughout. Every packet taken off the submission
+queue must be handed back to the stack exactly once:
+
+    TX: packet returned to the stack (transmitted):
+        dequeued=119 returned=119 lost=0 inFlight=false
+
+119 matches Opkts exactly at that moment. A shortfall here would drain the 64-packet pool
+and wedge transmit silently, so this is the identity to read out of the log, not a
+nice-to-have.
+
+
+=======================================================================
+6. TWO BUGS, AND HOW THEY WERE FOUND WITHOUT HARDWARE
+=======================================================================
+
+Both of M5's remaining datapath bugs were diagnosed by disassembling NetworkingDriverKit
+out of the DriverKit dyld shared cache, and both fixes then worked on the wire on the first
+attach. The tooling is in tools/dsc-disasm/. This matters beyond the two bugs: the DriverKit
+frameworks ship as headers and .tbd stubs only, so questions of the form "what does the
+family actually do here" had been answered by guessing, and each guess cost a build, an
+install, an unplug/replug and a hardware test.
+
+--- 6a. getDataVirtualAddress() does not include the packet's data offset ---
+
+    IOUserNetworkPacket::getDataVirtualAddress():
+        ldr x8, [x0, #0x30]      ; ivars
+        ldr x0, [x8, #0x10]      ; return ivars->field_0x10
+        ret
+
+    IOUserNetworkPacket::getDataOff():
+        ldr x8, [x0, #0x30]
+        ldr w0, [x8, #0x4c]      ; a DIFFERENT ivar
+        ret
+
+A bare ivar load. The frame begins at getDataVirtualAddress() + getDataOff(); the two are
+independent fields. A comment in this driver asserted the opposite.
+
+getTxDataOffset() returns 8 (SMSC95XX_TX_HEADER_LEN), so the family reserves 8 bytes of
+headroom on every transmit packet. Copying frameLen bytes from the base therefore sent 8
+bytes of reserved headroom followed by only the first frameLen-8 bytes of the frame. What
+the Pi saw before the fix, and how it was misread at the time:
+
+    00:00:ff:ff:ff:ff > 00:00:00:00:00:00, ethertype Unknown (0xffff), length 60:
+      0x0000:  9c95 6eb5 9b62 0806 0001 0800 0604 0001
+      0x0010:  9c95 6eb5 9b62 c0a8 5a01 0000 0000 0000
+
+Two tcpdump conventions have to be applied to read that: it prints `src > dst`, NOT
+`dst > src`, and its hex dump starts at the link-layer PAYLOAD -- wire offset 14 -- not at
+wire offset 0. Decoded correctly, the wire frame is
+
+    00 x8 | ff ff ff ff ff ff | 9c 95 6e b5 9b 62 | 08 06 | <ARP> | pad
+
+that is, eight zero bytes followed by our intact broadcast ARP frame, truncated by eight at
+the tail. Read without those two conventions it looked instead as though the chip was not
+stripping our TX command header and as though the destination MAC were corrupt. Neither was
+true. The chip strips the header correctly.
+
+Confirmed three independent ways before a single hardware cycle was spent: the family's code
+above; the arithmetic (a logged frame address of 0x104d64000 is 2048-aligned, and the pool's
+buffers are 2048 bytes, so it is a buffer base -- base+8 would have ended in 008); and the
+capture above once read correctly.
+
+After the fix, from the live 2.25/45 attach:
+
+    TX framing probe (packet 1 of the first 8): buffer base 0x105040000 + getDataOff 8
+      (getTxDataOffset asked for 8) = frame at 0x105040008, dataLength=42,
+      linkHeaderLength=14
+
+Every logged base is 2048-aligned -- 0x105040000, 0x10505f800, 0x10505f000, 0x10505e800 --
+which is the alignment argument that identified the bug, now visible directly.
+
+MEASURED OFFSETS, and be precise about which half of the fix mattered:
+
+    transmit packets:  getDataOff() == 8   on every packet
+    receive  packets:  getDataOff() == 0   on every packet
+
+So the receive path's identical arithmetic error was NOT observably wrong on this hardware:
+the family hands receive packets with a zero offset, and base+0 == base. It was still fixed,
+because it is correct for any offset the family chooses and the code should not depend on a
+value that happens to be zero today. But no misdelivery was ever observed from it, and this
+file should not be read as saying otherwise.
+
+getTxDataOffset() deliberately still returns 8 rather than reverting to the family's default
+of 0. A non-zero offset keeps the arithmetic exercised on every transmitted frame instead of
+adding zero, and it is what an in-place zero-copy transmit would need. Returning 0 would make
+both datapaths silently stop testing the thing that was wrong.
+
+--- 6b. kIOReturnOverrun from enqueuePackets means "zero packets accepted" ---
+
+The receive path decoded frames correctly -- right status words, right lengths, no error
+bits -- and then failed to deliver them:
+
+    RxComplete: enqueuePackets(1) FAILED: 0xe00002e8
+
+0xe00002e8 is kIOReturnOverrun, on the first packet of a 64-slot queue, which cannot be an
+overrun. It is not an overrun report at all:
+
+    IOUserNetworkPacketQueue::enqueuePackets(packets, count, options):
+        ldr x16,[x0] ... ldr x8,[x16,#0x58]! ; blraa   -> virtual EnqueuePackets(packets, count)
+        cmp  w0, #0x0
+        mov  w8, #0x2e8 ; movk w8, #0xe000, lsl #16    ; kIOReturnOverrun
+        csel w0, w8, wzr, eq
+
+Sixteen instructions. Its IOReturn carries exactly one bit: whether the count that the
+underlying virtual EnqueuePackets accepted was zero.
+
+EnqueuePackets, per packet and in order: packet->_GetPacketState(&state), then unless a flag
+bit is set, packet->_CompleteWithQueue(queue, ivars->direction), then build a 0x68-byte
+record and enqueue it on the queue's IODataQueueDispatchSource. It breaks out of its loop on
+the first packet it cannot take. _GetPacketState and _CompleteWithQueue are both kernel
+RPCs, so the kernel decides.
+
+_CompleteWithQueue is the name that gives it away: a packet is *completed with* a queue it
+was *submitted on*. These packets came from pool->allocatePacket(), so there was nothing to
+complete against. Transmit worked for exactly the reason receive did not -- its packets come
+off txSubmit and go back on txComplete. rxSubmit was the only one of the four queues this
+driver never touched.
+
+The family's own instrumentation says the same thing. `make -C dext status` prints the
+IOReportLegend published for our four queues, and it sorts them into two shapes:
+
+    RX Submission, TX Submission:  Dequeued Packets, Returned Packets, Dequeue Count,
+                                   Dequeue Errors, Dequeue Depletions, and on RX Submission
+                                   also Pool Allocation Errors / Retries / Max Retries
+    RX Completion, TX Completion:  Enabled, Capacity, Buffer Size, Queue State, Packet Count
+
+A queue with a Dequeue Depletions counter is not one the driver is meant to ignore.
+
+Fix: receive buffers come from rxSubmit->DequeuePackets(). Confirmed on the first attach:
+
+    RxComplete: took packet 1 from the RX submission queue
+
+The submission queue supplied a buffer for every single frame -- the submitQEmpty counter
+never incremented across the run -- so the pool fallback never fired and the
+IOUserNetworkPacketPoller alternative is not needed.
+
+--- 6c. two hypotheses refuted, recorded so they are not retried ---
+
+Both were plausible, both were checked in the family's code, and neither was the cause:
+
+  * "the RX completion queue's packet direction is never set, so _CompleteWithQueue is
+    called with direction None". It is set: IOUserNetworkRxCompletionQueue::Create calls
+    vtable slot 0x40 with w1=2, i.e. SetPacketDirection(kIOUserNetworkPacketDirectionRx),
+    and slot 0x38 with the pool.
+  * "the driver must call packet->prepareWithQueue() before enqueuing". It is not on the
+    enqueue path at all -- the three-argument call in EnqueuePackets is _CompleteWithQueue at
+    vtable slot 0x50, not prepareWithQueue at 0xe0 -- and prepareWithQueue's body is a single
+    strb of the direction plus logging, returning success unconditionally.
+
+--- 6d. enqueuePackets is not all-or-nothing, so batching was unsafe ---
+
+Falling out of 6b: since the return value only distinguishes "zero accepted" from "some
+accepted", a batch of sixteen of which one is accepted returns kIOReturnSuccess and gives no
+way to learn that the other fifteen were refused. And because EnqueuePackets stops at the
+first packet it cannot take, a partial accept is the normal shape of failure rather than a
+corner case. Those refused packets would be neither enqueued nor deallocated: leaked, and a
+pool that quietly shrinks looks like a stall minutes later rather than like the enqueue
+failure it is.
+
+Received frames are therefore handed over one at a time, where the return value is
+unambiguous. On a 10 Mb/s half-duplex segment the extra calls cost nothing.
+
+--- 6e. how to reproduce any of this ---
+
+    $ tools/dsc-disasm/find-symbol.py NetworkingDriverKit enqueuePackets
+    0x137c40    __ZN24IOUserNetworkPacketQueue14enqueuePacketsEPP19IOUserNetworkPacketjj
+    $ tools/dsc-disasm/disasm.sh 137c40 64
+
+Vtable slot offsets are derived from the generated header's <Class>_VirtualMethods macro:
+skip init and free, which override OSObject's own slots, then the remaining declarations
+take consecutive 8-byte slots starting at 0x38. That was calibrated against two
+independently known anchors on IOUserNetworkPacketQueue -- EnqueuePackets at 0x58 and
+DequeuePackets at 0x68, both established from call sites -- before being trusted on
+IOUserNetworkPacket. Watch for the multiple inheritance: these classes are
+`class X : public OSObject, public XInterface`, so the __ZThn40_ symbols are the secondary
+vtable's this-adjusting thunks and the primary vtable at [obj] holds the real functions.
+
+
+=======================================================================
+7. THE DATAPATH AS BUILT, and the facts that cost hardware cycles
+=======================================================================
+
+Endpoints, from reference/mach-lan9500a-descriptors.txt, identical on the EVB:
+
+    bulk IN   0x81  wMaxPacketSize 512
+    bulk OUT  0x02  wMaxPacketSize 512
+    int IN    0x83  16 bytes -- link-status notifications, NOT used in v1
+
+    TX header  8 bytes (cmd_a, cmd_b)     RX status word  4 bytes
+
+Each of the following was learned the expensive way.
+
+* The TX doorbell is the submission queue's own data queue. Create(...) (which populates
+  dsQueue), then CopyDataQueue, then SetDataAvailableHandler, then DequeuePackets. NOT
+  withPool(...). Verified with `nm -u` against AppleUserECM, E1000 and IXGBE: all three use
+  Create + SetDataAvailableHandler, none uses withPool or IOUserNetworkPacketPoller.
+
+* The doorbell is EDGE-triggered. A packet the stack enqueues while a transfer is in flight
+  has already spent its notification, so the drain must also run from TxComplete. Without
+  that, such a packet sits in the queue until the next unrelated enqueue happens to ring the
+  bell, which looks exactly like a stall.
+
+* setEnable(true) on the four packet queues MUST happen in setInterfaceEnable(true), after
+  chaining to super -- not in Start(). From Start(), txSubmit and rxComplete refuse with
+  kIOReturnNotReady and the stack never enqueues anything. This is easy to miss because a
+  pre-existing network service enables the interface almost as soon as it is registered.
+
+* Everything runs on the driver's Default dispatch queue. The three callbacks carry no
+  QUEUENAME, so they land on Default; the four packet queues are therefore created with
+  CopyDispatchQueue(kIOServiceDefaultQueueName, ...) so the whole datapath serialises on one
+  queue and needs no locking. Do not reintroduce a dedicated queue -- that splits the
+  datapath across two queues sharing one pool. Two runtime assertions check the assumption
+  rather than asserting it in a comment: a re-entrancy flag per handler, and OnQueue(). Both
+  stayed silent across every run.
+
+* The pool needs poolFlags = PoolFlagMapToDext | PoolFlagIODirectionIn |
+  PoolFlagIODirectionOut. Direction flags are relative to the DEVICE, so a pool serving both
+  directions needs both. Without MapToDext the pool is never mapped into the driver's address
+  space and getDataVirtualAddress() returns pool-relative OFFSETS -- see section 9.
+
+* setInterfaceEnable must chain to super::setInterfaceEnable(enable). Omitting it leaves the
+  interface looking healthy while the base class never runs its half.
+
+* An idle bulk IN read completes instantly with zero bytes, and a zero-length completion
+  counts as success -- so re-arming unconditionally is a spin with no I/O wait in it.
+  Measured at ~364,000 arms and 19% of a CPU core. Eight consecutive empty completions are
+  re-armed immediately, after which a timer takes over at 100 ms.
+
+* Control transfers go through the INTERFACE:
+  interface->DeviceRequest(..., kIOUSBDeviceRequestRecipientDevice, ...). The
+  interface-level driver needs no device handle of its own for register, MII or EEPROM
+  access.
+
+* Async completions: declare your own method TYPE(IOUSBHostPipe::CompleteAsyncIO) and iig
+  generates CreateAction<Name>. There is no CreateActionCompleteAsyncIO. CompleteAsyncIO
+  itself is pure virtual and TARGET on the pipe, and must not be overridden.
+
+* Never pass a stack block to Cancel(). Cancel(^{ }) stores the block and invokes it
+  asynchronously, after the frame is gone. Use SetEnable(false) and release.
+
+* Spellings that are not what the kernel frameworks use: kIOUSBAbortSynchronous is in
+  USBDriverKit/USBDriverKitDefs.h; the stall status is kUSBHostReturnPipeStalled in
+  USBDriverKit/IOUSBHostFamilyDefinitions.h, and there is no kIOUSBPipeStalled anywhere in
+  the DriverKit SDK. IOUSBHostInterface::Open takes uint8_t *; IOUSBHostDevice::Open takes
+  uintptr_t.
+
+* ioreg -p IOUSB does NOT show IOUSBHostInterface nodes as children of a device. Use the
+  IOService plane (plain ioreg) and parse `ioreg -a` as a plist; scraping the indented text
+  form misattributes properties to the wrong node.
+
+* os_log throttles hard under load. ~364,000 messages in one burst caused later attach-time
+  logs to vanish from the store entirely. Arm `/usr/bin/log stream ... > file &` BEFORE the
+  attach; do not rely on `log show` afterwards. Note also that the `log` process logs its own
+  invocation including the predicate text, so greps match your own search string, and that a
+  dext's output is attributed to process "kernel". `log` is a zsh builtin -- always
+  /usr/bin/log.
+
+
+=======================================================================
+8. THE CHIP WAS NEVER INITIALISED -- for calibration
+=======================================================================
+
+Recorded because it is the largest single mistake in this milestone and the cheapest kind to
+repeat. The driver wrote only E2P_CMD and MII_ADDR, both merely the EEPROM- and PHY-access
+helpers. MAC_CR was never written, so RXEN and TXEN were off in hardware the entire time,
+and every bulk IN transfer completed instantly with zero bytes because the chip had nothing
+to give. M2 had proved the 63-line init sequence in the userspace probe; nobody ported it
+into the driver, and the M5 spec claimed a task carried over "existing chip initialization"
+when what it inherited was register ACCESS. Several hardware cycles were spent building a
+datapath on a chip that was switched off.
+
+The sequence now lives in common/smsc95xx_init.c behind read/write callbacks, shared with
+the userspace probe and unit-tested.
+
+Two writes deliberately diverge from reference/mach-init-sequence.txt, and both divergences
+are pinned by test_init_seq_matches_capture():
+
+  * MAC_CR gains RCVOWN.
+  * The final AFC_CFG write, which Linux defers to a link-up event driven by
+    autonegotiation. 10BASE-T1S has no autonegotiation, so that moment never arrives.
+
+
+=======================================================================
+9. A DEXT CRASH LOOP PANICS THE MACHINE
+=======================================================================
+
+The most important operational fact in this milestone, and it generalises well beyond this
+driver. A userspace fault in a dext is normally just a restart -- but IOKit relaunches it
+through xpcproxy, and if the fault repeats quickly the respawn loop exhausts SPTM shared
+regions and takes the kernel with it:
+
+    panic ... [SPTM] VIOLATION_SHARED_REGIONS_EXHAUSTED: shared_region_alloc
+    Panicked task ... xpcproxy
+
+That happened here, twice. The pool was created without PoolFlagMapToDext, so
+getDataVirtualAddress() returned pool-relative offsets and the receive memcpy faulted on
+EVERY received frame:
+
+    KERN_INVALID_ADDRESS at 0xa800 / 0xc000 / 0xd800
+      _platform_memmove
+      SMSC95xxDriver::RxComplete_Impl
+
+Those addresses are the giveaway: the pool is 64 x 2048 = 131072 bytes, and 0xa800, 0xc000
+and 0xd800 are 43008, 49152 and 55296 -- exactly packets 21, 24 and 27 at 2048 bytes each.
+
+So the cost of a bad address in a per-frame path is not one crash, it is the user's machine.
+Both directions now refuse rather than copy, permanently:
+
+  * any base address below 1 MB cannot be a mapped buffer in this address space, while
+    comfortably covering every offset that pool could produce;
+  * offset + length must fit the 2048-byte packet buffer. On transmit this bounds a READ past
+    the end of a packet, which is exactly as fatal as a bad write.
+
+Keep both. A one-comparison check that turns a panic into a dropped frame and a log line is
+worth it at any frame rate. And when diagnosing, compare ALL crash reports rather than the
+newest: two distinct bugs here were only distinguishable by noticing that the newest three
+faulted in _platform_memmove/RxComplete_Impl while the older three faulted in
+IOTimerDispatchSource::Cancel_Impl.
+
+
+=======================================================================
+10. THE MAC IS NEVER INVENTED
+=======================================================================
+
+The provenance gate is load-bearing: both E2P_CMD bit 9 (LOADED) and signature 0xA5 at
+EEPROM offset 0, plus smsc95xx_mac_plausible(). The two signals can disagree, and a stable
+plausible-looking wrong value is exactly what a re-read-and-compare cannot catch.
+
+If any check fails the driver refuses to bring the interface up, and says so:
+
+    refusing to bring up the interface: <which gate failed>
+
+%{public}s and not %s, because os_log redacts a plain %s to <private> and would hide the one
+line a user needs.
+
+An M5-only compile-time MAC override existed to make test attaches deterministic while the
+datapath was being built -- the MACH unit's EEPROM auto-load succeeds on roughly one power
+cycle in three. It is removed; `grep -rn` over every source, header, Makefile and example in
+the tree finds nothing, and a clean build passes no such -D flag.
+
+Removing an override only means something if the behaviour it was bypassing still works, so
+both EEPROM paths were re-proven on the MACH unit with dext 2.26/46 and 2.28/48, neither of
+which has any override compiled in. Verified against the shipped binary rather than the
+source:
+
+    $ strings <installed dext binary> | grep -c OVERRIDE
+    0
+
+--- the good path, product ID 0x9905 ---
+
+    E2P_CMD auto-load LOADED
+    MAC fc:61:79:90:04:56
+    ethernet interface registered
+
+    $ ping -c 5 192.168.90.2          5/5, 0.0% loss, 0.891/1.183/1.606 ms
+    $ ssh 10base-t1s 'ping -c 5 ...'  5/5, 0%   loss, 0.751/0.879/0.979 ms
+
+The Pi's capture shows correct framing from the MACH's own MAC with parsed ethertypes, so the
+datapath is proven on BOTH units and not only on the one Gate 3 used.
+
+This half is deliberately NOT argued from the MAC value. The MACH's real address and the old
+override's value are the same address -- which is exactly why the override had to be tested
+for removal on the EVB rather than here -- so the proof rests on two independent facts
+instead: E2P_CMD reporting LOADED with product ID 0x9905, and the override string being
+absent from the installed binary.
+
+--- the refusal path, product ID 0x9E00, on the release build ---
+
+    Start: matched provider
+    ID_REV 0x9e000002 chip 0x9e00 rev 0x0002
+    PHY ID 0x0007:0x4165
+    E2P_CMD auto-load NOT loaded
+    EEPROM auto-load did not complete; refusing to trust its contents
+    refusing to bring up the interface: EEPROM auto-load did not complete
+    counters at datapath teardown -- TX: ... all zero
+    counters at datapath teardown -- RX: ... all zero
+
+    DK: SMSC95xxDriver-0x100011e83::start(IOUSBHostInterface-0x100011e7e) fail
+
+    $ ifconfig en10; ifconfig en11; ifconfig en12
+    ... none of them exist
+
+Note ID_REV: 0x9e00 is the chip's OWN register reporting the fallback ID, not merely the USB
+descriptor, so the failed auto-load is real and not a descriptor artefact.
+
+Four further details worth having:
+
+  * The refusal reason renders as text and not <private>, so the %{public}s is doing its job.
+    That line is the entire point of the change and would be worthless redacted.
+  * The counters at teardown are all zero, so the refusal happens before any pool, queue,
+    pipe or buffer is allocated. Nothing has to be unwound.
+  * Only SMSC95xxUSBDevice stays attached -- "Start: done, holding the device open". The
+    device half keeps the device and its selected configuration while the networking half
+    declines. That separation is a property of the M5 split which had never been explicitly
+    tested before, and it means a refusal is not a half-built driver.
+  * IOKit itself records the refusal as `start(IOUSBHostInterface) fail`, so the failure is
+    visible without reading our own log at all.
+
+--- on reproducing the failed auto-load ---
+
+The plan recorded the MACH's auto-load as failing on roughly two power cycles in three. On
+the day of this capture it failed on 1 attach in 8, including a deliberate 30-second power
+cycle, so do not rely on the rate. Two useful observations: the failures correlate with
+LONGER unplugged intervals, and the state is visible from ioreg alone
+(tools/watch-attach/watch-attach.py classifies each attach), so a cycle-until-good loop needs
+no human reading registers.
+
+Because it would not reproduce on demand, the three-line refusal path was ALSO exercised
+deterministically with a throwaway build carrying a one-line forced gate failure. That build
+was never committed -- the source was reverted with git checkout and the revert verified by
+grep and an empty git diff. It agreed exactly with the natural 0x9E00 attach above, which
+arrived shortly afterwards and is what this section actually records.
+
+--- a fossil of the bug, found by accident ---
+
+Setting up a persistent network service for the MACH revealed a stale service named
+"USB2.0 Hub" bound to the same hardware port, on DHCP, sitting at higher priority than the
+one just created -- which is why the interface first came up with a 169.254 link-local
+address.
+
+The name is the interesting part. SystemConfiguration names a USB network interface from
+kUSBProductString found while walking the provider chain. In the 0x9E00 state the LAN9500A
+publishes NO strings, so the walk fell through to the product string of the USB2422 hub
+INSIDE the dongle. That service could therefore only have been created while an interface was
+being brought up in the failed-EEPROM state -- which is exactly what the override used to do,
+and what this driver now refuses to do. Removed.
+
+Configure the interface through a real service, not `ifconfig`. A manual `ifconfig ... up`
+does not survive a driver restart, and this was observed again during Gate 4: en10 silently
+lost its address on a replug. The service persists:
+
+    $ networksetup -createnetworkservice "10BASE-T1S MACH" "10BASE-T1S-USB-IF"
+    $ networksetup -setmanual "10BASE-T1S MACH" 192.168.90.1 255.255.255.0
+
+Note also that the MACH's hardware port reads "10BASE-T1S-USB-IF", its own USB product
+string, so the M5 display-name fix holds on this unit as well as on the EVB.
