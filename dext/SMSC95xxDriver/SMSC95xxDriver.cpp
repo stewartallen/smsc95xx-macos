@@ -872,6 +872,11 @@ SMSC95xxDriver::finishStop(IOService *provider)
         IOService      *prov = provider;
         Diag("Stop: final cancellation handler -- releasing resources and calling super");
         ::ReleaseResources(self, prov);
+        /* Whether a late pipe completion could outlive the release below rests on
+         * whatever the runtime still retains at this point; this is the measurement.
+         * A count of 1 here means our release is the last one. */
+        Diag("Stop: retain count before super::Stop and the final release: %d",
+             self->getRetainCount());
         /* Logged BEFORE super, not after: super::Stop can tear this service down and the
          * process with it, so a line placed after it may never be emitted. */
         Log("Stop: joined all cancellations, calling super::Stop now");
