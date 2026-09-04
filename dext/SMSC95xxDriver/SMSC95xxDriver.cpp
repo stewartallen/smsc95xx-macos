@@ -748,8 +748,14 @@ mac_publish:
 
         ret = registerEthernetInterface(hwAddr, queues, 4, ivars->pool, ivars->pool);
         if (ret != kIOReturnSuccess) {
+            /* NOT the synchronous fail path below: registration was attempted, so the
+             * family may have touched the queues even though it reported failure. Tear
+             * down through the same joined path as Stop(); super::Stop runs from the
+             * last cancellation handler. */
             Log("registerEthernetInterface failed: 0x%x", ret);
-            goto fail;
+            quiesceDatapath();
+            finishStop(provider);
+            return ret;
         }
         Log("ethernet interface registered");
         Diag("registerEthernetInterface returned 0x%x -- everything after this point is "
@@ -793,21 +799,22 @@ mac_publish:
 
 fail:
     /* Synchronous teardown, unlike Stop(), and it is safe here because no handler can be in
-     * flight on this path. Every goto fail site runs before the interface was successfully
-     * registered -- the last is registerEthernetInterface's own failure return -- so the
+     * flight on this path. Every goto fail site is before registerEthernetInterface -- a
+     * failure of registration itself takes the joined finishStop path above -- so the
      * family has never been able to call setInterfaceEnable(true): no bulk IN read is posted
      * and no packet queue is enabled. The backoff timer, although enabled, has never been
      * given a WakeAtTime deadline, so it cannot fire either. There is nothing to cancel and
-     * wait for. Do not add a goto fail after a successful registration without revisiting
-     * this. */
+     * wait for. Do not add a goto fail at or after registration without revisiting this. */
     quiesceDatapath();
     ::ReleaseResources(this, provider);
     Stop(provider, SUPERDISPATCH);
     return ret;
 }
 
-/* Stop is ASYNCHRONOUS: it returns without calling super, and super::Stop runs later from
- * the last dispatch-source cancellation handler.
+/* Teardown is ASYNCHRONOUS: Stop() returns without calling super, and super::Stop runs
+ * later from the last dispatch-source cancellation handler. finishStop is the shared
+ * machinery; Start()'s registration-failure path uses it too, so a partially registered
+ * interface is torn down with the same joins as a normal Stop.
  *
  * IOService::Stop requires this: "stop all activity and put your driver in a quiescent
  * state. If your driver has any in-progress asynchronous tasks, cancel those tasks and
@@ -834,19 +841,12 @@ fail:
  * executing, so it cannot replace any of these Cancels; see
  * reference/teardown-quiescence.txt for each primitive's documented guarantee.
  *
- * `this` and `provider` are retained across the asynchronous gap and released once
+ * The driver and provider are retained across the asynchronous gap and released once
  * super::Stop has returned. The atomic counter is what makes super::Stop run exactly once,
  * on whichever cancellation completes last. */
 kern_return_t
-IMPL(SMSC95xxDriver, Stop)
+SMSC95xxDriver::finishStop(IOService *provider)
 {
-    Log("Stop");
-    Diag("Stop(provider=0x%llx) entered", DiagPtr(provider));
-
-    /* Stop new work and stop the hardware issuing more I/O. This does NOT join anything on
-     * the dispatch queue -- the Cancels below are what do that. */
-    quiesceDatapath();
-
     uint32_t cancelCount = 0;
     if (ivars->rxBackoffTimer != nullptr) { ++cancelCount; }   /* idle-RX backoff timer   */
     if (ivars->txDataQueue    != nullptr) { ++cancelCount; }   /* TX doorbell source      */
@@ -942,6 +942,18 @@ IMPL(SMSC95xxDriver, Stop)
     return kIOReturnSuccess;
 }
 
+kern_return_t
+IMPL(SMSC95xxDriver, Stop)
+{
+    Log("Stop");
+    Diag("Stop(provider=0x%llx) entered", DiagPtr(provider));
+
+    /* Stop new work and stop the hardware issuing more I/O. This does NOT join anything on
+     * the dispatch queue -- finishStop's Cancels are what do that. */
+    quiesceDatapath();
+    return finishStop(provider);
+}
+
 /* The capital-S deprecated form. The live one the stack calls on
  * `ifconfig up`/`down` is the lowercase setInterfaceEnable below; this exists only to
  * satisfy the SDK's declaration. */
@@ -998,6 +1010,21 @@ SMSC95xxDriver::setInterfaceEnable(bool enable)
 {
     Log("setInterfaceEnable(%{public}s)", enable ? "true" : "false");
 
+    /* Teardown has begun: Stop() may already have returned with its cancellation handlers
+     * still pending, and those handlers release the buffers an enable would arm I/O into.
+     * Refuse before chaining, so the family never records the interface as up. */
+    if (enable && ivars->stopping) {
+        Log("setInterfaceEnable(true) refused: teardown in progress");
+        return kIOReturnOffline;
+    }
+
+    static const char *const queueNames[4] = {
+        "tx submission", "rx submission", "tx completion", "rx completion"
+    };
+    IOUserNetworkPacketQueue *queues[4] = {
+        ivars->txSubmit, ivars->rxSubmit, ivars->txComplete, ivars->rxComplete
+    };
+
     /* Chain to the base class FIRST, and do not swallow its result:
      * IOUserNetworkEthernet::setInterfaceEnable is what puts the packet queues into a
      * state where the stack will enqueue to them. Without it the interface looks healthy
@@ -1020,12 +1047,6 @@ SMSC95xxDriver::setInterfaceEnable(bool enable)
          * refuse setEnable(true) with kIOReturnNotReady and the stack never enqueues
          * a transmit packet. setEnable, not SetEnable: the capital form is the
          * deprecated one. */
-        static const char *const queueNames[4] = {
-            "tx submission", "rx submission", "tx completion", "rx completion"
-        };
-        IOUserNetworkPacketQueue *queues[4] = {
-            ivars->txSubmit, ivars->rxSubmit, ivars->txComplete, ivars->rxComplete
-        };
         uint32_t enabledCount = 0;
 
         for (uint32_t i = 0; i < 4; i++) {
@@ -1100,6 +1121,23 @@ enable_failed:
          * RxComplete sees rxRunning false, discards it and does not re-arm. */
         ivars->rxRunning = false;
         Log("setInterfaceEnable(false): RX will stop after the outstanding read completes");
+
+        /* Disable the four queues, the mirror of the enable above, in reverse order. A
+         * queue left enabled refuses the next setEnable(true) with kIOReturnBadArgument,
+         * so without this every disable/enable cycle -- an ifconfig down/up, or the
+         * family's own cycle around system sleep -- failed its re-enable and left the
+         * interface dead until a replug. Failures are logged and otherwise ignored: the
+         * interface is going down regardless. */
+        for (int i = 3; i >= 0; i--) {
+            if (queues[i] != nullptr) {
+                IOReturn er = queues[i]->setEnable(false);
+                if (er != kIOReturnSuccess) {
+                    Log("setInterfaceEnable(false): setEnable(false) failed on the "
+                        "%{public}s queue: 0x%x", queueNames[i], er);
+                }
+            }
+        }
+
         /* Log totals now as well as at teardown, so a disable/re-enable cycle without a
          * dext restart is summarised per run rather than only once, added together. */
         logDatapathCounters("interface disable");

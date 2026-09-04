@@ -51,6 +51,7 @@ exactly which values are device-specific and which are not.
 | File | What it is |
 |---|---|
 | `teardown-quiescence.txt` | Why `Stop()` is asynchronous. Quotes the `IOService::Stop` contract and each DriverKit join primitive's documented guarantee, records which ones actually wait for an in-flight handler (`Cancel`, both classes' `SetEnableWithCompletion` per the SDK HeaderDoc, synchronous `Abort`) and which does not (`SetEnable(false)`), explains why blocking inside `Stop` would deadlock on the serial queue, and documents the cancel-count / deferred-`super::Stop` pattern the driver now uses. |
+| `teardown-validation.txt` | The teardown fixes proven on hardware: unplug mid-iperf, dext deactivation mid-iperf (the in-flight-packet reclaim path, plus the measured fact that the aborted bulk OUT completion is sometimes never delivered at all), and the sleep test that found queues left enabled refuse the next `setEnable(true)` — with the `ifconfig down/up` control, the fix, and its three validation passes. Ends with what was NOT exercised. |
 
 ### Code signing evidence
 

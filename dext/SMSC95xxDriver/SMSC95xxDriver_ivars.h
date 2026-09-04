@@ -117,6 +117,11 @@ struct SMSC95xxDriver_IVars {
      * only re-armed while this holds, so disabling the interface lets the read loop wind
      * down after at most one more completion instead of reading into a released buffer. */
     bool                      rxRunning;
+    /* Latched true by quiesceDatapath and never cleared: teardown has begun. Stop() can
+     * return with its cancellation handlers still pending, and those handlers release the
+     * buffers -- so a setInterfaceEnable(true) or armRxRead delivered in that gap must
+     * refuse rather than arm I/O into memory about to be freed. */
+    bool                      stopping;
     /* Cancellations Stop() has issued whose handlers have not yet run. The shared
      * cancellation handler counts it down; whichever handler reaches zero releases the
      * driver's resources and calls super::Stop. Lives here rather than on Stop's stack

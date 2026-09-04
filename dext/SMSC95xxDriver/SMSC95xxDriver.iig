@@ -67,6 +67,10 @@ public:
     virtual kern_return_t setupDatapath() LOCALONLY;
     virtual void          quiesceDatapath() LOCALONLY;
     virtual void          releaseDatapath() LOCALONLY;
+    /* The joined half of teardown, shared by Stop() and Start()'s registration-failure
+     * path: Cancel every dispatch source and run the resource release and super::Stop
+     * from the last cancellation handler. quiesceDatapath() must have run first. */
+    virtual kern_return_t finishStop(IOService *provider) LOCALONLY;
     virtual kern_return_t armRxRead() LOCALONLY;
     /* The single re-arm decision point for RxComplete. `carriedData` says whether the
      * completion that is asking to re-arm actually delivered bytes; that is the only input

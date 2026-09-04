@@ -354,9 +354,12 @@ abortResultIsBenign(kern_return_t ar)
 void
 SMSC95xxDriver::quiesceDatapath(void)
 {
-    /* Stop the receive loop BEFORE anything is aborted. The synchronous Abort below can
-     * deliver the aborted transfer's completion while this function is still on the stack;
-     * RxComplete is what would re-arm, and with rxRunning already false it will not.
+    /* Latch teardown and stop the receive loop BEFORE anything is aborted. The synchronous
+     * Abort below can deliver the aborted transfer's completion while this function is
+     * still on the stack; RxComplete is what would re-arm, and with rxRunning already false
+     * it will not. `stopping` additionally keeps a setInterfaceEnable(true) delivered after
+     * Stop() returns from setting rxRunning back to true while the cancellation handlers
+     * are still pending.
      *
      * rxArmed is NOT cleared here: the aborted transfer's completion clears it, and
      * clearing it early would let a late armRxRead() double-arm. */
@@ -369,6 +372,7 @@ SMSC95xxDriver::quiesceDatapath(void)
           "episodes=%llu wakes=%llu", ivars->rxIdleRun,
           ivars->rxBackoffActive ? "true" : "false", ivars->rxBackoffEpisodes,
           ivars->rxBackoffWakes);
+    ivars->stopping  = true;
     ivars->rxRunning = false;
 
     /* Close the transmit path to new work, for the same reason. The synchronous bulk OUT
@@ -447,6 +451,9 @@ SMSC95xxDriver::quiesceDatapath(void)
     Diag7("quiesceDatapath: complete; pipes aborted, no new work accepted");
 }
 
+static void txReturnPacket(SMSC95xxDriver_IVars *ivars, IOUserNetworkPacket *packet,
+                           const char *why);
+
 /* PHASE 2 of teardown: release the datapath objects.
  *
  * MUST NOT be called until every dispatch-source cancellation handler has fired -- see
@@ -483,22 +490,25 @@ SMSC95xxDriver::releaseDatapath(void)
     OSSafeReleaseNULL(ivars->rxBuffer);
     OSSafeReleaseNULL(ivars->txBuffer);
 
-    /* After a synchronous abort every completion has run, so this should already be false
-     * with no packet held. If not, the one-in-flight bookkeeping is broken: the packet
-     * cannot safely be completed now (a not-yet-delivered completion might still arrive,
-     * and completing twice hands the stack a packet we still point at), so it is dropped
-     * and counted. The pool is reclaimed when it is released. */
-    if (ivars->txPacket != nullptr || ivars->txInFlight) {
+    /* A transfer can still be logically in flight here: the pipe was aborted synchronously,
+     * but its completion may be queued behind Stop on the serial queue and delivered only
+     * after this runs. Take the packet and null the state FIRST, then hand it back -- the
+     * TX completion queue is still alive (ReleaseResources releases the queues after this
+     * function), and the late TxComplete then finds txPacket null and returns nothing, so
+     * the packet cannot be completed twice. */
+    if (ivars->txPacket != nullptr) {
+        IOUserNetworkPacket *packet = ivars->txPacket;
+        ivars->txPacket   = nullptr;
+        ivars->txInFlight = false;
+        txReturnPacket(ivars, packet, "in flight at teardown");
+    } else if (ivars->txInFlight) {
+        /* In flight with no packet recorded: a real bookkeeping fault, not teardown noise. */
+        ivars->txInFlight = false;
         ivars->txLost++;
-        Log("releaseDatapath: a TX was STILL in flight after a synchronous abort "
-            "(inFlight=%{public}s packet=%{public}s) -- the packet is dropped rather than "
-            "risk completing it twice (total lost %llu). The one-in-flight bookkeeping is "
-            "wrong if this line ever appears.",
-            ivars->txInFlight ? "true" : "false",
-            ivars->txPacket != nullptr ? "set" : "null", ivars->txLost);
+        Log("releaseDatapath: txInFlight with no packet recorded -- the one-in-flight "
+            "bookkeeping is wrong if this line ever appears (total lost %llu)",
+            ivars->txLost);
     }
-    ivars->txPacket   = nullptr;
-    ivars->txInFlight = false;
     /* Only now, with the pipes released and the buffers gone, is it certain no transfer can
      * be outstanding, so rxArmed becomes just a cleared flag. */
     ivars->rxArmed = false;
@@ -514,6 +524,10 @@ SMSC95xxDriver::releaseDatapath(void)
 kern_return_t
 SMSC95xxDriver::armRxRead(void)
 {
+    if (ivars->stopping) {
+        Log("armRxRead: teardown in progress -- not arming");
+        return kIOReturnOffline;
+    }
     if (ivars->pipeIn == nullptr || ivars->rxAction == nullptr
             || ivars->rxBuffer == nullptr) {
         /* Reached if something arms after the datapath has been released. Not an error worth
@@ -1105,10 +1119,14 @@ IMPL(SMSC95xxDriver, RxComplete)
           actualByteCount, completionTimestamp, ivars->rxRunning ? "true" : "false",
           ivars->rxFrames, ivars->rxDropped, ivars->rxEnqueued);
 
-    /* EXIT 1: aborted. Normal at teardown -- quiesceDatapath aborts the pipe on purpose --
-     * and never fatal. Nothing has been allocated yet. Deliberately does NOT re-arm: the
-     * buffer this would read into is about to be released. */
-    if (status == kIOReturnAborted) {
+    /* EXIT 1: aborted at teardown. Both teardown paths clear rxRunning before the pipe is
+     * aborted, so aborted-with-rxRunning-false is the teardown case: nothing has been
+     * allocated, and deliberately do NOT re-arm -- the buffer this would read into is about
+     * to be released. An abort with rxRunning still TRUE is spontaneous (sleep/wake, a bus
+     * reset) and falls through to EXIT 4, which re-arms behind the backoff gate; returning
+     * here would leave receive permanently dead behind an interface still reporting an
+     * active link. */
+    if (status == kIOReturnAborted && !ivars->rxRunning) {
         Log("RxComplete: aborted, not re-arming");
         ivars->inRxComplete = false;
         return;
@@ -1138,9 +1156,10 @@ IMPL(SMSC95xxDriver, RxComplete)
         return;
     }
 
-    /* EXIT 4: a failed transfer. Nothing allocated. Re-arm, because a single failure is not a
-     * reason to stop receiving -- but clear a stall first, since every subsequent transfer on
-     * a stalled pipe would fail the same way.
+    /* EXIT 4: a failed transfer, including a spontaneous abort (EXIT 1 passed it through
+     * because rxRunning is still true). Nothing allocated. Re-arm, because a single failure
+     * is not a reason to stop receiving -- but clear a stall first, since every subsequent
+     * transfer on a stalled pipe would fail the same way.
      *
      * Through rearmRxRead with carriedData=false: a failed transfer delivered nothing, and a
      * pipe that fails instantly has exactly the same busy-loop shape as a device with nothing
@@ -1424,10 +1443,12 @@ IMPL(SMSC95xxDriver, TxComplete)
           ivars->txDatapathReady ? "live" : "tearing down", ivars->txSubmitted,
           ivars->txFrames, ivars->txErrors);
 
-    if (packet == nullptr) {
-        /* A completion with no packet recorded. Either a transfer completed twice or one was
-         * submitted without recording its packet -- both are bookkeeping bugs, and both would
-         * otherwise be invisible, so this is the line that catches them. */
+    if (packet == nullptr && ivars->txDatapathReady) {
+        /* A completion with no packet recorded while the datapath is LIVE: a transfer
+         * completed twice or a submit did not record its packet, both bookkeeping bugs that
+         * would otherwise be invisible. During teardown a null packet is expected --
+         * releaseDatapath returns the in-flight packet itself when the aborted completion
+         * is still queued behind Stop. */
         Log("TxComplete: NO packet was recorded for this transfer (status 0x%x, %u bytes) -- "
             "either a completion was delivered twice or a submit did not record its packet; "
             "the one-in-flight bookkeeping is wrong", status, actualByteCount);
@@ -1446,9 +1467,8 @@ IMPL(SMSC95xxDriver, TxComplete)
          * fatal. Counted separately from real errors so an error total stays meaningful. */
         ivars->txAborted++;
         why = "transfer aborted";
-        Log("TxComplete: aborted after %u bytes (teardown, abort #%llu) -- the packet is still "
-            "returned to the stack, and nothing further is consumed", actualByteCount,
-            ivars->txAborted);
+        Log("TxComplete: aborted after %u bytes (teardown, abort #%llu) -- nothing further "
+            "is consumed", actualByteCount, ivars->txAborted);
     } else {
         ivars->txErrors++;
         why = "transfer failed";

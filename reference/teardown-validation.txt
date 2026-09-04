@@ -1,0 +1,171 @@
+Teardown and interface-enable fixes: hardware validation
+=========================================================
+
+Date:    2026-09-03
+Driver:  v2.34/54 (the five review fixes), then v2.35/55 (adds the queue-disable fix
+         found below). Baseline for comparison: v2.33/53.
+Host:    Apple Silicon Mac, macOS (Darwin 25.6.0), SIP off, AMFI enforcing.
+Rig:     MACH 10BASET1S-USB-IF on the Mac (en12, MAC fc:61:79:90:04:56,
+         192.168.90.1/24) -> T1S -> media converter -> Raspberry Pi 4 eth1
+         (192.168.90.2/24). Load: iperf3 3.21 (Mac) -> 3.18 (Pi), Mac as sender,
+         ~6.5 Mbit/s sustained on the 10 Mb/s half-duplex segment.
+Log:     `/usr/bin/log stream --predicate 'eventMessage CONTAINS "SMSC95xx"'`,
+         default (non-TRACE) build throughout.
+
+Under test: the fixes in the "Fix the teardown and interface-enable defects" commit --
+spontaneous-abort RX re-arm, the `stopping` latch, the teardown TX-packet reclaim, the
+joined teardown for a failed registration, and (added mid-session) disabling the packet
+queues on interface disable.
+
+
+1. Unplug mid-traffic
+---------------------
+
+Yank the dongle during an iperf run (~33 MB transferred). The dying transfers surface as
+kIOReturnNotResponding (0xe00002ed), NOT kIOReturnAborted:
+
+    RxComplete: status 0xe00002ed after 0 bytes (error #1)
+    AsyncIO(bulk IN) failed: 0xe0005000 (arm failures 1)
+    TxComplete: status 0xe00002ed after 0 bytes (error #1)
+
+The failed TX returned its packet through the normal error path, so by the time the
+family delivered Stop (240 ms later) nothing was in flight and the accounting identity
+held exactly:
+
+    counters at datapath teardown -- TX accounting: dequeued 21773 = returned 21773
+        + lost 0 + inFlight 0  (identity must hold)
+    Stop: joined all cancellations, calling super::Stop now
+
+No canary lines ("bookkeeping is wrong", "LOST", the OnQueue or re-entry alarms)
+anywhere in the run. Note what this test does NOT exercise: because the transfer dies
+before Stop arrives, the in-flight-at-teardown reclaim path never runs on a yank.
+
+
+2. Deactivate the dext mid-traffic (the reclaim path)
+-----------------------------------------------------
+
+`systemextensionsctl` deactivation during an iperf run delivers Stop while a transfer
+is still healthy, so quiesceDatapath's own Abort is what kills it:
+
+    counters at datapath teardown -- TX accounting: dequeued 17318 = returned 17317
+        + lost 0 + inFlight 1  (identity must hold)
+    Stop: joined all cancellations, calling super::Stop now
+    RxComplete: aborted, not re-arming
+
+Three measured facts:
+
+  - inFlight 1 at the teardown dump: the reclaim path was genuinely exercised.
+    releaseDatapath returned the packet (no "LOST" line follows; a failed enqueue
+    would have logged loudly), and lost stayed 0. Under v53 this exact sequence
+    fired both bookkeeping canaries and counted the packet lost.
+
+  - The aborted RxComplete was delivered AFTER super::Stop's join line -- the
+    documented un-joinable late completion, handled by the null guards.
+
+  - The aborted bulk OUT completion was NEVER delivered at all (completions stayed
+    one behind submitted; no late TxComplete line). This is why the reclaim has to
+    live in releaseDatapath: a design that waited for the late completion to return
+    the packet would have leaked it. Do not "simplify" the reclaim away on the theory
+    that the completion always arrives.
+
+
+3. The sleep test, and the bug it found (v54)
+---------------------------------------------
+
+`pmset sleepnow` with the interface up and idle. The family disables the interface
+around sleep and re-enables it -- and the re-enable failed:
+
+    20:41:48.994  setInterfaceEnable(false)
+    20:41:50.857  setInterfaceEnable(true)
+    20:41:50.857  setEnable(true) failed on the tx submission queue: 0xe00002c2
+
+kIOReturnBadArgument, from IOUserNetworkPacketQueue::setEnable(true). The unwind
+reported the link inactive and chained super::setInterfaceEnable(false); the family
+never retried. After wake the interface sat UP-flagged but `status: inactive`, no
+IPv4, 100% ping loss -- dead until a replug.
+
+Diagnosis: setInterfaceEnable(false) stopped the RX loop but never called
+setEnable(false) on the four packet queues, and a queue that is already enabled
+refuses setEnable(true) with kIOReturnBadArgument. So the failure is not
+sleep-specific: ANY disable/enable cycle hits it.
+
+Control experiment, confirming that: a plain `ifconfig en12 down && ifconfig en12 up`
+failed identically --
+
+    20:46:01.701  setInterfaceEnable(true)
+    20:46:01.701  setEnable(true) failed on the tx submission queue: 0xe00002c2
+
+(No setInterfaceEnable(false) line for the `down`: the family already considered the
+interface disabled from the failed enable's unwind.)
+
+
+4. The fix and its validation (v55)
+-----------------------------------
+
+setInterfaceEnable(false) now disables the four queues in reverse of the enable order.
+Three passes:
+
+  a. ifconfig down/up, idle. The down disabled all four queues without complaint;
+     the up re-enabled them and re-armed RX; ping 192.168.90.2 at ~1 ms.
+
+    21:14:43.850  setInterfaceEnable(false)
+    21:14:45.890  setInterfaceEnable(true)
+    21:14:45.890  all four packet queues enabled
+    21:14:45.890  setInterfaceEnable: RX armed
+
+  b. ifconfig down/up under iperf load, with a transfer in flight at the disable:
+
+    21:15:58.819  counters at interface disable -- TX accounting: dequeued 17610 =
+                  returned 17609 + lost 0 + inFlight 1  (identity must hold)
+    21:15:58.834  RxComplete: RX is not running (interface disabled or tearing
+                  down): discarding 150 bytes and not re-arming
+    21:16:00.853  all four packet queues enabled
+
+     The in-flight TX completed and returned after the re-enable (lost stayed 0
+     for the rest of the session), answering the open question about a completion
+     landing on a just-disabled queue: it does not lose the packet. The iperf TCP
+     session survived the ~2 s outage (138 retransmits, then recovery; 6.54 Mbit/s
+     over the enclosing 60 s window) rather than resetting.
+
+  c. The sleep test again:
+
+    21:20:12.172  setInterfaceEnable(false)
+    21:20:32.314  setInterfaceEnable(true)
+    21:20:32.314  all four packet queues enabled
+    21:20:32.314  setInterfaceEnable: RX armed
+
+     After wake: interface active, 0% ping loss. The v54 failure is gone.
+
+
+Not exercised
+-------------
+
+The spontaneous-abort RX re-arm (an aborted completion arriving with rxRunning still
+true) never fired in any of these runs: a yank surfaces as kIOReturnNotResponding and
+takes the failed-transfer exit, and sleep goes through the family's clean
+disable/enable cycle. The fix is validated only as not regressing anything; its
+trigger has not been observed on this hardware. If a bus reset ever delivers one,
+RX re-arms instead of going permanently deaf -- but that claim rests on the code, not
+on a measurement.
+
+
+Reproducing
+-----------
+
+    # far end
+    ssh 10base-t1s 'iperf3 -s -D'
+    # load, Mac as sender
+    iperf3 -c 192.168.90.2 -t 120
+    # the three provocations
+    <yank the dongle>
+    make -C dext uninstall          # Stop with a transfer in flight
+    sudo ifconfig en12 down && sleep 2 && sudo ifconfig en12 up
+    sudo pmset sleepnow             # then wake by key press
+
+Watch with:
+
+    /usr/bin/log stream --predicate 'eventMessage CONTAINS "SMSC95xx"'
+
+The pass criteria are the accounting identity lines (dequeued = returned + lost +
+inFlight, records = frames + dropped), lost 0, the absence of the canary lines, and
+"Stop: joined all cancellations" on every teardown.
