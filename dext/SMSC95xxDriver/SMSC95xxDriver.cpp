@@ -53,7 +53,7 @@
 #endif
 #define DiagPtr(p)     ((uint64_t)(uintptr_t)(p))
 
-/* Poll attempts for MII and EEPROM operations */
+/* Poll attempts for MII operations. */
 #define POLL_ATTEMPTS 100
 
 /* Depth of each of the four packet queues. Matches the pool's packet count, which is the
@@ -167,7 +167,7 @@ SMSC95xxDriver::writeRegister(uint32_t offset, uint32_t value)
     return kIOReturnSuccess;
 }
 
-/* Poll a register until the given mask clears. Helper for miiRead/eepromRead. */
+/* Poll a register until the given mask clears. Helper for miiRead. */
 static kern_return_t
 wait_clear(SMSC95xxDriver *driver, uint16_t offset, uint32_t mask)
 {
@@ -205,58 +205,14 @@ SMSC95xxDriver::miiRead(uint8_t phy, uint8_t reg, uint16_t *value)
     return kr;
 }
 
-kern_return_t
-SMSC95xxDriver::eepromRead(uint16_t offset, uint8_t *buf, size_t len)
-{
-    /* EEPROM addresses are 9 bits wide; written so a huge `len` cannot wrap. */
-    if (buf == nullptr || len > 0x200 || offset > 0x200 - len)
-        return kIOReturnBadArgument;
-
-    kern_return_t kr = wait_clear(this, SMSC95XX_REG_E2P_CMD, SMSC95XX_E2P_BUSY);
-    if (kr != kIOReturnSuccess)
-        return kr;
-
-    for (size_t i = 0; i < len; i++) {
-        kr = writeRegister(SMSC95XX_REG_E2P_CMD,
-                           smsc95xx_e2p_read_cmd((uint16_t)(offset + i)));
-        if (kr != kIOReturnSuccess)
-            return kr;
-
-        /* Read back E2P_CMD to confirm the operation retired and did not time
-         * out. The captured trace does exactly this between each byte. */
-        uint32_t cmd = 0;
-        bool retired = false;
-        for (int attempt = 0; attempt < POLL_ATTEMPTS; attempt++) {
-            kr = readRegister(SMSC95XX_REG_E2P_CMD, &cmd);
-            if (kr != kIOReturnSuccess)
-                return kr;
-            if (!(cmd & SMSC95XX_E2P_BUSY)) {
-                retired = true;
-                break;
-            }
-        }
-        if (!retired)
-            return kIOReturnTimeout;
-        if (cmd & SMSC95XX_E2P_TIMEOUT)
-            return kIOReturnNotFound;   /* no EEPROM responding */
-
-        uint32_t data = 0;
-        kr = readRegister(SMSC95XX_REG_E2P_DATA, &data);
-        if (kr != kIOReturnSuccess)
-            return kr;
-        buf[i] = (uint8_t)(data & 0xFFu);
-    }
-    return kIOReturnSuccess;
-}
-
 /* ---------------------------------------------------------------------------------------
- * Chip initialisation.
+ * Chip initialisation and EEPROM access.
  *
- * The sequence itself lives in common/smsc95xx_init.c, shared verbatim with the
- * userspace probe. What lives here is the adapter: two thunks that turn the shared
- * layer's (ctx, offset, value) callbacks into this class's readRegister/writeRegister,
- * plus per-access logging so a failed init is diagnosable from a single attach rather
- * than needing a USB capture.
+ * The sequences themselves live in common/smsc95xx_init.c, shared verbatim with the
+ * userspace probe so the two cannot drift. What lives here is the adapter: thunks that
+ * turn the shared layer's (ctx, offset, value) callbacks into this class's
+ * readRegister/writeRegister, plus per-access logging for the init sequence so a failed
+ * init is diagnosable from a single attach rather than needing a USB capture.
  * ------------------------------------------------------------------------------------- */
 
 /* Carried through the shared layer as its opaque `ctx`. The counters are only for the
@@ -303,17 +259,43 @@ initRegWrite(void *ctx, uint16_t offset, uint32_t value)
     return (int)ret;
 }
 
-/* Map the shared layer's own two failure codes onto IOReturn. Anything else already IS an
- * IOReturn, because it came back out of one of the thunks above. */
+/* Map the shared layer's own failure codes onto IOReturn. Anything else already IS an
+ * IOReturn, because it came back out of one of the register thunks. */
 static kern_return_t
-initSeqResultToIOReturn(int rc)
+sharedResultToIOReturn(int rc)
 {
     switch (rc) {
-    case 0:                               return kIOReturnSuccess;
-    case SMSC95XX_INIT_ERR_BAD_ARG:       return kIOReturnBadArgument;
-    case SMSC95XX_INIT_ERR_RESET_TIMEOUT: return kIOReturnTimeout;
-    default:                              return (kern_return_t)rc;
+    case 0:                                return kIOReturnSuccess;
+    case SMSC95XX_INIT_ERR_BAD_ARG:        return kIOReturnBadArgument;
+    case SMSC95XX_INIT_ERR_RESET_TIMEOUT:  return kIOReturnTimeout;
+    case SMSC95XX_INIT_ERR_E2P_TIMEOUT:    return kIOReturnTimeout;
+    case SMSC95XX_INIT_ERR_E2P_NO_EEPROM:  return kIOReturnNotFound;
+    default:                               return (kern_return_t)rc;
     }
+}
+
+/* Silent thunks for the shared EEPROM reader. Unlike the init thunks above, these do
+ * not log per access: a MAC read is seven bytes and dozens of polls, and every EEPROM
+ * failure is already logged by eepromRead's callers with the mapped IOReturn. */
+static int
+quietRegRead(void *ctx, uint16_t offset, uint32_t *value)
+{
+    return (int)static_cast<SMSC95xxDriver *>(ctx)->readRegister(offset, value);
+}
+
+static int
+quietRegWrite(void *ctx, uint16_t offset, uint32_t value)
+{
+    return (int)static_cast<SMSC95xxDriver *>(ctx)->writeRegister(offset, value);
+}
+
+kern_return_t
+SMSC95xxDriver::eepromRead(uint16_t offset, uint8_t *buf, size_t len)
+{
+    /* The poll loop lives in common/smsc95xx_init.c, shared with the probe; this is
+     * only the adapter. */
+    smsc95xx_io io = { this, quietRegRead, quietRegWrite };
+    return sharedResultToIOReturn(smsc95xx_eeprom_read(&io, offset, buf, len));
 }
 
 /* Publish one registry property to ioreg. A null value is silently ignored and a
@@ -631,7 +613,7 @@ mac_publish:
          * broadcast; setPromiscuousModeEnable toggles MAC_CR.PRMS at runtime when the
          * stack asks (tcpdump, a bridge). */
         int irc = smsc95xx_init_seq(&io, ivars->macAddress, false);
-        ret = initSeqResultToIOReturn(irc);
+        ret = sharedResultToIOReturn(irc);
         if (ret != kIOReturnSuccess) {
             Log("init: FAILED after %u writes and %u reads: rc %d -> 0x%x -- refusing to "
                 "start rather than present an interface over an uninitialised chip",

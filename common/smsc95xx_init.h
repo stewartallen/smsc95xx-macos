@@ -50,11 +50,16 @@ typedef struct {
  * error space. */
 #define SMSC95XX_INIT_ERR_BAD_ARG       (-1)
 #define SMSC95XX_INIT_ERR_RESET_TIMEOUT (-2)
+#define SMSC95XX_INIT_ERR_E2P_TIMEOUT   (-3)   /* E2P engine never went un-busy       */
+#define SMSC95XX_INIT_ERR_E2P_NO_EEPROM (-4)   /* E2P_CMD.TIMEOUT: no EEPROM responded */
 
 /* Maximum read-polls of HW_CFG while waiting for the chip to clear LRST itself. The
  * chip clears it almost immediately; the bound only keeps broken hardware from hanging
  * the caller. */
 #define SMSC95XX_INIT_RESET_POLLS       100
+
+/* Maximum read-polls of E2P_CMD per EEPROM byte; same rationale as the reset bound. */
+#define SMSC95XX_INIT_E2P_POLLS         100
 
 /* Number of register WRITES the sequence performs when every callback succeeds.
  * Exported so a caller can log progress and the unit tests can assert the count. */
@@ -77,6 +82,20 @@ typedef struct {
  * SMSC95XX_INIT_ERR_* codes above. On failure the chip is left partially initialised:
  * the caller must not present a working interface. */
 int smsc95xx_init_seq(const smsc95xx_io *io, const uint8_t mac[6], bool promiscuous);
+
+/* Read `len` bytes of EEPROM starting at `offset`, one E2P_CMD/E2P_DATA cycle per byte,
+ * polling E2P_CMD between bytes the way the captured Linux bring-up does.
+ *
+ * Bounds are checked so a huge `len` cannot wrap: the address space is
+ * SMSC95XX_E2P_SIZE (512) bytes. Returns 0 on success, a callback's own non-zero error
+ * unchanged, or one of the SMSC95XX_INIT_ERR_* codes: E2P_TIMEOUT when the engine never
+ * goes un-busy, E2P_NO_EEPROM when the chip's own TIMEOUT bit reports that no EEPROM
+ * answered.
+ *
+ * Reading is all this driver needs; there is deliberately no write: a bad EEPROM write
+ * can brick the dongle's identity, and nothing in bring-up requires one. */
+int smsc95xx_eeprom_read(const smsc95xx_io *io, uint16_t offset, uint8_t *buf,
+                         size_t len);
 
 /* Name of a register offset, for logging. Returns a static string, never NULL; unknown
  * offsets come back as "?". Pure lookup -- no I/O, no allocation. */

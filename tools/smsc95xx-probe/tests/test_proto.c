@@ -1137,6 +1137,159 @@ static void test_init_seq_matches_capture(void)
                  "PM_CTRL preserves the bits it read");
 }
 
+/* ---- smsc95xx_eeprom_read --------------------------------------------------------
+ *
+ * A dedicated mock: E2P_CMD writes record the address and can simulate a stuck-busy
+ * engine or the chip's own TIMEOUT verdict; E2P_DATA reads serve from a 512-byte
+ * image, addressed by the most recent command -- which is how the hardware behaves.
+ */
+typedef struct {
+    uint8_t  image[SMSC95XX_E2P_SIZE];
+    uint32_t last_addr;       /* address from the most recent E2P_CMD write     */
+    uint32_t cmd_writes;
+    uint32_t nreads;
+    int      fail_read_at;    /* nth read returns MOCK_ERR; -1 disables         */
+    bool     busy_forever;    /* E2P_CMD always reads back BUSY                 */
+    bool     report_timeout;  /* E2P_CMD reads back with the TIMEOUT bit set    */
+    bool     bad_cmd;         /* a command was not exactly BUSY | address       */
+} e2p_mock;
+
+static void e2p_reset(e2p_mock *m)
+{
+    *m = (e2p_mock){0};
+    m->fail_read_at = -1;
+}
+
+static int e2p_read(void *ctx, uint16_t offset, uint32_t *value)
+{
+    e2p_mock *m = (e2p_mock *)ctx;
+    int index = (int)m->nreads;
+    m->nreads++;
+
+    if (m->fail_read_at >= 0 && index == m->fail_read_at)
+        return MOCK_ERR;    /* deliberately leaves *value untouched */
+
+    switch (offset) {
+    case SMSC95XX_REG_E2P_CMD:
+        *value = m->busy_forever   ? SMSC95XX_E2P_BUSY
+               : m->report_timeout ? SMSC95XX_E2P_TIMEOUT
+                                   : 0;
+        break;
+    case SMSC95XX_REG_E2P_DATA:
+        *value = m->image[m->last_addr & SMSC95XX_E2P_ADDR_MASK];
+        break;
+    default:
+        *value = 0;
+        break;
+    }
+    return 0;
+}
+
+static int e2p_write(void *ctx, uint16_t offset, uint32_t value)
+{
+    e2p_mock *m = (e2p_mock *)ctx;
+
+    if (offset == SMSC95XX_REG_E2P_CMD) {
+        m->cmd_writes++;
+        m->last_addr = value & SMSC95XX_E2P_ADDR_MASK;
+        /* Opcode READ is zero, so every command must be exactly BUSY | address. */
+        if (value != (SMSC95XX_E2P_BUSY | m->last_addr))
+            m->bad_cmd = true;
+    }
+    return 0;
+}
+
+static void e2p_bind(e2p_mock *m, smsc95xx_io *io)
+{
+    io->ctx   = m;
+    io->read  = e2p_read;
+    io->write = e2p_write;
+}
+
+static void test_eeprom_read_serves_the_image(void)
+{
+    e2p_mock m;
+    smsc95xx_io io;
+
+    e2p_reset(&m);
+    m.image[SMSC95XX_EEPROM_SIG_OFFSET] = SMSC95XX_EEPROM_SIGNATURE;
+    for (int i = 0; i < SMSC95XX_MAC_LEN; i++)
+        m.image[SMSC95XX_EEPROM_MAC_OFFSET + i] = init_test_mac[i];
+    e2p_bind(&m, &io);
+
+    uint8_t sig = 0;
+    CHECK_EQ_U32(smsc95xx_eeprom_read(&io, SMSC95XX_EEPROM_SIG_OFFSET, &sig, 1), 0,
+                 "one-byte signature read succeeds");
+    CHECK_EQ_U32(sig, SMSC95XX_EEPROM_SIGNATURE, "signature byte served");
+
+    uint8_t got[SMSC95XX_MAC_LEN] = {0};
+    CHECK_EQ_U32(smsc95xx_eeprom_read(&io, SMSC95XX_EEPROM_MAC_OFFSET, got,
+                                      SMSC95XX_MAC_LEN),
+                 0, "six-byte MAC read succeeds");
+    for (int i = 0; i < SMSC95XX_MAC_LEN; i++)
+        CHECK_EQ_U32(got[i], init_test_mac[i], "MAC byte matches the image");
+    CHECK_EQ_U32(m.cmd_writes, 1 + SMSC95XX_MAC_LEN, "one E2P_CMD write per byte");
+    CHECK_FALSE(m.bad_cmd, "every command was exactly BUSY | address");
+
+    /* The last addressable byte is readable. */
+    m.image[SMSC95XX_E2P_SIZE - 1] = 0x5A;
+    uint8_t last = 0;
+    CHECK_EQ_U32(smsc95xx_eeprom_read(&io, SMSC95XX_E2P_SIZE - 1, &last, 1), 0,
+                 "last byte of the 512-byte space is readable");
+    CHECK_EQ_U32(last, 0x5A, "last byte served");
+}
+
+static void test_eeprom_read_bounds_and_args(void)
+{
+    e2p_mock m;
+    smsc95xx_io io;
+    uint8_t buf[4] = {0};
+
+    e2p_reset(&m);
+    e2p_bind(&m, &io);
+
+    CHECK_EQ_U32(smsc95xx_eeprom_read(&io, 0, buf, SMSC95XX_E2P_SIZE + 1),
+                 SMSC95XX_INIT_ERR_BAD_ARG, "len over the EEPROM size refused");
+    CHECK_EQ_U32(smsc95xx_eeprom_read(&io, SMSC95XX_E2P_SIZE - 1, buf, 2),
+                 SMSC95XX_INIT_ERR_BAD_ARG, "offset + len past the end refused");
+    /* The wrap case an open-coded `offset + len > size` check gets wrong. */
+    CHECK_EQ_U32(smsc95xx_eeprom_read(&io, 0xFFFF, buf, (size_t)-1),
+                 SMSC95XX_INIT_ERR_BAD_ARG, "wrapping offset + len refused");
+    CHECK_EQ_U32(smsc95xx_eeprom_read(NULL, 0, buf, 1),
+                 SMSC95XX_INIT_ERR_BAD_ARG, "NULL io refused");
+    CHECK_EQ_U32(smsc95xx_eeprom_read(&io, 0, NULL, 1),
+                 SMSC95XX_INIT_ERR_BAD_ARG, "NULL buffer refused");
+    CHECK_EQ_U32(m.cmd_writes, 0, "no command was issued for a refused request");
+}
+
+static void test_eeprom_read_engine_faults(void)
+{
+    e2p_mock m;
+    smsc95xx_io io;
+    uint8_t buf[1] = {0};
+
+    /* The engine never goes un-busy: the poll bound turns it into E2P_TIMEOUT. */
+    e2p_reset(&m);
+    m.busy_forever = true;
+    e2p_bind(&m, &io);
+    CHECK_EQ_U32(smsc95xx_eeprom_read(&io, 0, buf, 1),
+                 SMSC95XX_INIT_ERR_E2P_TIMEOUT, "stuck-busy engine times out");
+
+    /* The chip's own verdict: the command retired but no EEPROM answered. */
+    e2p_reset(&m);
+    m.report_timeout = true;
+    e2p_bind(&m, &io);
+    CHECK_EQ_U32(smsc95xx_eeprom_read(&io, 0, buf, 1),
+                 SMSC95XX_INIT_ERR_E2P_NO_EEPROM, "TIMEOUT bit means no EEPROM");
+
+    /* A transport error propagates unchanged, not remapped. */
+    e2p_reset(&m);
+    m.fail_read_at = 0;
+    e2p_bind(&m, &io);
+    CHECK_EQ_U32(smsc95xx_eeprom_read(&io, 0, buf, 1), MOCK_ERR,
+                 "a callback's own error propagates unchanged");
+}
+
 static void test_reg_name(void)
 {
     /* Names are for log lines, so the only thing that matters is that they are the
@@ -1174,6 +1327,9 @@ int main(void)
     test_init_seq_reset_timeout();
     test_init_seq_bad_args();
     test_init_seq_matches_capture();
+    test_eeprom_read_serves_the_image();
+    test_eeprom_read_bounds_and_args();
+    test_eeprom_read_engine_faults();
     test_reg_name();
     TEST_REPORT();
 }

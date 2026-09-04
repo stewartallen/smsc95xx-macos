@@ -19,10 +19,6 @@ int smsc95xx_write_reg(usb_device *d, uint16_t offset, uint32_t value);
 /* Read one PHY register through the MII_ADDR/MII_DATA pair. */
 int smsc95xx_mii_read(usb_device *d, uint8_t phy, uint8_t reg, uint16_t *value);
 
-/* Read `len` bytes from the EEPROM starting at `offset`.
- * Returns kIOReturnBadArgument if offset + len > 0x200 (EEPROM size). */
-int smsc95xx_eeprom_read(usb_device *d, uint16_t offset, uint8_t *buf, size_t len);
-
 /* Read the six-byte MAC address from its fixed EEPROM location.
  *
  * This performs the raw read only. It does NOT verify the EEPROM signature, so
@@ -50,9 +46,9 @@ int smsc95xx_set_mac(usb_device *d, const uint8_t mac[6]);
  * verbatim with the DriverKit extension so the two cannot drift; this is a thin
  * adapter over it. Behaviour, including the IOReturn values, is unchanged.
  *
- * Follows the captured Linux bring-up, with two deliberate omissions recorded
- * in the design spec: checksum offload (COE_CR) is left off, because it is out
- * of scope and would add two bytes to every received frame; and the interrupt
+ * Follows the captured Linux bring-up, with two deliberate omissions (documented
+ * in common/smsc95xx_init.h): checksum offload (COE_CR) is left off, because it is
+ * out of scope and would add two bytes to every received frame; and the interrupt
  * endpoint (INT_EP_CTL) is left disabled, because link state is polled instead.
  *
  * Configures the MAC for 10 Mb/s half duplex -- RCVOWN set, FDPX clear, and the

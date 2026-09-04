@@ -92,6 +92,60 @@ int smsc95xx_init_seq(const smsc95xx_io *io, const uint8_t mac[6], bool promiscu
 
 #undef WR
 
+int smsc95xx_eeprom_read(const smsc95xx_io *io, uint16_t offset, uint8_t *buf,
+                         size_t len)
+{
+    uint32_t v = 0;
+    int kr;
+
+    if (io == NULL || io->read == NULL || io->write == NULL || buf == NULL)
+        return SMSC95XX_INIT_ERR_BAD_ARG;
+    /* 9-bit address space; written so a huge `len` cannot wrap. */
+    if (len > SMSC95XX_E2P_SIZE || offset > SMSC95XX_E2P_SIZE - len)
+        return SMSC95XX_INIT_ERR_BAD_ARG;
+
+    /* Wait for the engine to be idle before issuing the first command. */
+    for (int i = 0; ; i++) {
+        kr = io->read(io->ctx, SMSC95XX_REG_E2P_CMD, &v);
+        if (kr != 0)
+            return kr;
+        if (!(v & SMSC95XX_E2P_BUSY))
+            break;
+        if (i + 1 >= SMSC95XX_INIT_E2P_POLLS)
+            return SMSC95XX_INIT_ERR_E2P_TIMEOUT;
+    }
+
+    for (size_t i = 0; i < len; i++) {
+        kr = io->write(io->ctx, SMSC95XX_REG_E2P_CMD,
+                       smsc95xx_e2p_read_cmd((uint16_t)(offset + i)));
+        if (kr != 0)
+            return kr;
+
+        /* Read back E2P_CMD until the command retires. The captured trace polls
+         * exactly this way between bytes. */
+        uint32_t cmd = 0;
+        for (int attempt = 0; ; attempt++) {
+            kr = io->read(io->ctx, SMSC95XX_REG_E2P_CMD, &cmd);
+            if (kr != 0)
+                return kr;
+            if (!(cmd & SMSC95XX_E2P_BUSY))
+                break;
+            if (attempt + 1 >= SMSC95XX_INIT_E2P_POLLS)
+                return SMSC95XX_INIT_ERR_E2P_TIMEOUT;
+        }
+        /* The chip's own verdict, distinct from our poll bound: TIMEOUT set means the
+         * command retired because no EEPROM answered. */
+        if (cmd & SMSC95XX_E2P_TIMEOUT)
+            return SMSC95XX_INIT_ERR_E2P_NO_EEPROM;
+
+        kr = io->read(io->ctx, SMSC95XX_REG_E2P_DATA, &v);
+        if (kr != 0)
+            return kr;
+        buf[i] = (uint8_t)(v & 0xFFu);
+    }
+    return 0;
+}
+
 const char *smsc95xx_reg_name(uint16_t offset)
 {
     switch (offset) {

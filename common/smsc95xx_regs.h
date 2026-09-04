@@ -59,6 +59,8 @@ extern "C" {
  * data that still looks plausible -- see the README's Known findings. */
 #define SMSC95XX_E2P_LOADED       0x00000200u
 #define SMSC95XX_E2P_ADDR_MASK    0x000001FFu
+/* The E2P address field is 9 bits, so the addressable EEPROM space is 512 bytes. */
+#define SMSC95XX_E2P_SIZE         (SMSC95XX_E2P_ADDR_MASK + 1u)
 
 /* HW_CFG bits. */
 #define SMSC95XX_HW_CFG_SRST      0x00000001u
