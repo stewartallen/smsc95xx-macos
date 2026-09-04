@@ -118,7 +118,8 @@
  * Per-frame fault paths log their first few occurrences in full and then fall silent;
  * the totals stay visible through logDatapathCounters. os_log throttles hard under a
  * sustained burst, and one line per damaged frame at wire rate can wipe the rest of the
- * attach's log from the store. */
+ * attach's log from the store. Each fault class gates on its OWN counter, so a run of
+ * one kind cannot silence the first occurrence of another. */
 #define SMSC95XX_RX_FAULT_LOG_LIMIT 8
 
 /* ---- the idle-RX backoff -------------------------------------------------------------
@@ -320,6 +321,16 @@ SMSC95xxDriver::logDatapathCounters(const char *why)
         ivars->rxZeroRecords, ivars->rxArmCount, ivars->rxArmFailures, ivars->rxByteCount,
         ivars->rxEnqueueFailures, ivars->rxLost, ivars->rxSubmitDequeued,
         ivars->rxSubmitEmpty, ivars->rxPoolFailures);
+
+    /* Only when something was dropped: a clean run stays at four lines. The reasons must
+     * sum to the dropped total in the accounting line above. */
+    if (ivars->rxDropped != 0) {
+        Log("counters at %{public}s -- RX drop reasons: errSum %llu short %llu oversize "
+            "%llu noBuffer %llu badAddr %llu badFit %llu setLen %llu enqueue %llu",
+            why, ivars->rxDropErrSum, ivars->rxDropShort, ivars->rxDropOversize,
+            ivars->rxDropNoBuffer, ivars->rxDropBadAddr, ivars->rxDropBadFit,
+            ivars->rxDropSetLen, ivars->rxDropEnqueue);
+    }
 }
 
 /* True for an Abort result that just means "the device or its pipe has already gone, so
@@ -1239,8 +1250,9 @@ IMPL(SMSC95xxDriver, RxComplete)
 
             if ((rxStatus & (SMSC95XX_RX_STS_ERROR_SUM | SMSC95XX_RX_STS_FILTER_FAIL)) != 0) {
                 ivars->rxDropped++;
+                ivars->rxDropErrSum++;
                 dropped++;
-                if (ivars->rxDropped <= SMSC95XX_RX_FAULT_LOG_LIMIT) {
+                if (ivars->rxDropErrSum <= SMSC95XX_RX_FAULT_LOG_LIMIT) {
                     Log("RxComplete: DROP record %u: status 0x%08x has%{public}s%{public}s "
                         "(total dropped %llu)", records, rxStatus,
                         (rxStatus & SMSC95XX_RX_STS_ERROR_SUM)   ? " ERROR_SUM"   : "",
@@ -1254,8 +1266,9 @@ IMPL(SMSC95xxDriver, RxComplete)
              * frame at all. */
             if (frameLen <= SMSC95XX_RX_CRC_LEN) {
                 ivars->rxDropped++;
+                ivars->rxDropShort++;
                 dropped++;
-                if (ivars->rxDropped <= SMSC95XX_RX_FAULT_LOG_LIMIT) {
+                if (ivars->rxDropShort <= SMSC95XX_RX_FAULT_LOG_LIMIT) {
                     Log("RxComplete: DROP record %u: frame_len %zu is not longer than the "
                         "%u-byte CRC, status 0x%08x (total dropped %llu)", records, frameLen,
                         (unsigned int)SMSC95XX_RX_CRC_LEN, rxStatus, ivars->rxDropped);
@@ -1267,8 +1280,9 @@ IMPL(SMSC95xxDriver, RxComplete)
              * buffer, which is larger than a packet buffer. */
             if (payloadLen > SMSC95XX_RX_MAX_PAYLOAD) {
                 ivars->rxDropped++;
+                ivars->rxDropOversize++;
                 dropped++;
-                if (ivars->rxDropped <= SMSC95XX_RX_FAULT_LOG_LIMIT) {
+                if (ivars->rxDropOversize <= SMSC95XX_RX_FAULT_LOG_LIMIT) {
                     Log("RxComplete: DROP record %u: payload %zu exceeds the %u-byte maximum "
                         "this driver will copy, status 0x%08x (total dropped %llu)", records,
                         payloadLen, (unsigned int)SMSC95XX_RX_MAX_PAYLOAD, rxStatus,
@@ -1285,9 +1299,10 @@ IMPL(SMSC95xxDriver, RxComplete)
                 /* No buffer from either source: drop the rest of the transfer and rely on
                  * stack backpressure rather than blocking the completion handler. */
                 ivars->rxDropped++;
+                ivars->rxDropNoBuffer++;
                 dropped++;
                 noBuffer = true;
-                if (ivars->rxDropped <= SMSC95XX_RX_FAULT_LOG_LIMIT) {
+                if (ivars->rxDropNoBuffer <= SMSC95XX_RX_FAULT_LOG_LIMIT) {
                     Log("RxComplete: no packet available from the submission queue or the "
                         "pool at record %u -- abandoning the rest of this transfer (total "
                         "dropped %llu)", records, ivars->rxDropped);
@@ -1309,8 +1324,9 @@ IMPL(SMSC95xxDriver, RxComplete)
             uint64_t dst     = base + dataOff;
             if (base < 0x100000ull) {
                 ivars->rxDropped++;
+                ivars->rxDropBadAddr++;
                 dropped++;
-                if (ivars->rxDropped <= SMSC95XX_RX_FAULT_LOG_LIMIT) {
+                if (ivars->rxDropBadAddr <= SMSC95XX_RX_FAULT_LOG_LIMIT) {
                     Log("RxComplete: REFUSING to copy: getDataVirtualAddress() returned "
                         "0x%llx, which is not a mapped address (is the pool missing "
                         "PoolFlagMapToDext?) -- copying would fault. Dropping record %u "
@@ -1323,8 +1339,9 @@ IMPL(SMSC95xxDriver, RxComplete)
              * rather than assume SMSC95XX_RX_MAX_PAYLOAD alone is safe. */
             if (dataOff + payloadLen > SMSC95XX_POOL_BUFFER_SIZE) {
                 ivars->rxDropped++;
+                ivars->rxDropBadFit++;
                 dropped++;
-                if (ivars->rxDropped <= SMSC95XX_RX_FAULT_LOG_LIMIT) {
+                if (ivars->rxDropBadFit <= SMSC95XX_RX_FAULT_LOG_LIMIT) {
                     Log("RxComplete: DROP record %u: data offset %zu plus payload %zu "
                         "exceeds the %u-byte packet buffer (total dropped %llu)", records,
                         dataOff, payloadLen, (unsigned int)SMSC95XX_POOL_BUFFER_SIZE,
@@ -1340,8 +1357,9 @@ IMPL(SMSC95xxDriver, RxComplete)
                 /* Length is what tells the stack how much of the buffer is a frame, so a
                  * packet whose length did not take cannot be delivered. Return it. */
                 ivars->rxDropped++;
+                ivars->rxDropSetLen++;
                 dropped++;
-                if (ivars->rxDropped <= SMSC95XX_RX_FAULT_LOG_LIMIT) {
+                if (ivars->rxDropSetLen <= SMSC95XX_RX_FAULT_LOG_LIMIT) {
                     Log("RxComplete: setDataLength(%zu) failed: 0x%x at record %u -- "
                         "returning the packet to the pool (total dropped %llu)", payloadLen,
                         sret, records, ivars->rxDropped);
@@ -1369,7 +1387,9 @@ IMPL(SMSC95xxDriver, RxComplete)
                 delivered++;
                 ivars->rxFrames++;
             } else {
+                /* deliverPacket already logged, gated on its own rxEnqueueFailures. */
                 ivars->rxDropped++;
+                ivars->rxDropEnqueue++;
                 dropped++;
             }
         }

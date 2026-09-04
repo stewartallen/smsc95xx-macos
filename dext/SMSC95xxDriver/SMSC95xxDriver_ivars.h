@@ -170,6 +170,18 @@ struct SMSC95xxDriver_IVars {
     uint64_t                  rxByteCount;          /* bytes delivered by the bulk IN pipe */
     uint64_t                  rxRecords;            /* status-word records decoded         */
     uint64_t                  rxZeroRecords;        /* transfers with bytes but no records */
+    /* Per-reason drop counters. Each drop-log site gates on ITS OWN counter against
+     * SMSC95XX_RX_FAULT_LOG_LIMIT, so eight drops of one kind cannot silence the first
+     * occurrence of another for the life of the attach. rxDropped stays the total the
+     * accounting identity uses; these must sum to it. */
+    uint64_t                  rxDropErrSum;         /* status has ERROR_SUM/FILTER_FAIL     */
+    uint64_t                  rxDropShort;          /* frame_len not longer than the CRC    */
+    uint64_t                  rxDropOversize;       /* payload over SMSC95XX_RX_MAX_PAYLOAD */
+    uint64_t                  rxDropNoBuffer;       /* no packet from the queue or the pool */
+    uint64_t                  rxDropBadAddr;        /* unmapped buffer address refused      */
+    uint64_t                  rxDropBadFit;         /* offset + payload over the buffer     */
+    uint64_t                  rxDropSetLen;         /* setDataLength failed                 */
+    uint64_t                  rxDropEnqueue;        /* the stack refused the packet         */
     uint64_t                  rxEnqueueFailures;    /* enqueuePackets calls that failed    */
     /* rxSubmitDequeued vs rxSubmitEmpty is the load-bearing pair: it says whether the stack
      * supplies receive buffers on the RX submission queue at all, which is the difference
