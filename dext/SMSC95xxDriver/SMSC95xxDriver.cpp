@@ -369,7 +369,7 @@ ReleaseResources(SMSC95xxDriver *driver, IOService *provider __unused)
         }
         /* The interface is the matched provider, retained by IOKit for as long as we
          * are attached: close it (above, only if we opened it), never release it, and
-         * null it so a second TearDown cannot issue a second Close. */
+         * null it so a second ReleaseResources cannot issue a second Close. */
         driver->ivars->interface = nullptr;
     }
     driver->ivars->ctrlBytes = nullptr;
@@ -648,7 +648,7 @@ mac_publish:
      * same queue to the four packet queues below is what makes "everything serialises,
      * so no locking" true by construction -- a dedicated queue would split the datapath
      * across two queues sharing one packet pool, which is a race, not a design.
-     * CopyDispatchQueue returns a retained queue, so TearDown's release is correct. */
+     * CopyDispatchQueue returns a retained queue, so ReleaseResources' release is correct. */
     ret = CopyDispatchQueue(kIOServiceDefaultQueueName, &ivars->dispatchQueue);
     if (ret != kIOReturnSuccess || ivars->dispatchQueue == nullptr) {
         Log("CopyDispatchQueue(Default) failed: 0x%x", ret);
@@ -720,7 +720,7 @@ mac_publish:
         SMSC95XX_QID_RX_SUBMIT, SMSC95XX_QID_RX_COMPLETE);
 
     /* Bulk pipes, transfer buffers and the two completion actions. Acquired after the
-     * pool and the queues so that TearDown's order -- datapath, queues, pool -- is the
+     * pool and the queues so that ReleaseResources' order -- datapath, queues, pool -- is the
      * exact reverse of setup. No RX read is armed here; that happens in
      * setInterfaceEnable, once the stack is ready to receive. */
     ret = setupDatapath();
@@ -766,26 +766,39 @@ mac_publish:
      * to poll: BMSR bit 2 reads set even with the cable unplugged and must never be
      * presented as link truth. 10BASE-T is the closest available media word --
      * there is no 10BASE-T1S constant -- and the link is genuinely half duplex. */
-    ret = reportLinkStatus(kIOUserNetworkLinkStatusActive,
-                           SMSC95XX_MEDIA_WORD);
+    /* NEITHER of the two calls below fails the attach, and that is deliberate: both happen
+     * AFTER registerEthernetInterface, so the family may already have called
+     * setInterfaceEnable(true) -- arming a receive read and enabling the packet queues -- by
+     * the time either returns. Tearing down synchronously from here could then release
+     * buffers under a live handler, which is the whole hazard the Stop path was rewritten to
+     * avoid. Keeping every `goto fail` site strictly BEFORE registration is what makes the
+     * synchronous failure teardown below provably safe.
+     *
+     * Both are safe to merely log. reportLinkStatus is re-issued from
+     * setInterfaceEnable(true), which is the call that actually matters (a status reported
+     * before the interface is enabled is discarded anyway). RegisterService only publishes
+     * the service for further matching; the interface is already registered and functional
+     * without it. */
+    ret = reportLinkStatus(kIOUserNetworkLinkStatusActive, SMSC95XX_MEDIA_WORD);
     if (ret != kIOReturnSuccess) {
-        Log("reportLinkStatus failed: 0x%x", ret);
-        goto fail;
+        Log("reportLinkStatus failed: 0x%x -- continuing, setInterfaceEnable re-reports it",
+            ret);
     }
 
     ret = RegisterService();
     if (ret != kIOReturnSuccess) {
-        Log("RegisterService failed: 0x%x", ret);
-        goto fail;
+        Log("RegisterService failed: 0x%x -- continuing, the interface is already registered",
+            ret);
     }
     return kIOReturnSuccess;
 
 fail:
-    /* Synchronous teardown, unlike Stop() below, and that is safe here specifically because
-     * nothing asynchronous has been started yet on this path: no bulk IN read is posted and
-     * no packet queue is enabled until setInterfaceEnable(true), and the backoff timer,
-     * although enabled, has never been given a WakeAtTime deadline so it cannot fire. With
-     * no handler able to be in flight there is nothing to cancel and wait for. */
+    /* Synchronous teardown, unlike Stop(), and it is safe here because no handler can be in
+     * flight on this path. Every goto fail site is before registerEthernetInterface, so the
+     * family has never been able to call setInterfaceEnable(true): no bulk IN read is posted
+     * and no packet queue is enabled. The backoff timer, although enabled, has never been
+     * given a WakeAtTime deadline, so it cannot fire either. There is nothing to cancel and
+     * wait for. Do not add a goto fail after registration without revisiting this. */
     quiesceDatapath();
     ::ReleaseResources(this, provider);
     Stop(provider, SUPERDISPATCH);
@@ -795,24 +808,32 @@ fail:
 /* Stop is ASYNCHRONOUS: it returns without calling super, and super::Stop runs later from
  * the last dispatch-source cancellation handler.
  *
- * This is what IOService::Stop's contract requires -- "stop all activity and put your
- * driver in a quiescent state. If your driver has any in-progress asynchronous tasks,
- * cancel those tasks and wait for DriverKit to call the associated cancellation handler
- * before calling the super version of this method" -- and it is the shape Apple's own
- * DriverKit sample code uses for exactly this situation.
+ * IOService::Stop requires this: "stop all activity and put your driver in a quiescent
+ * state. If your driver has any in-progress asynchronous tasks, cancel those tasks and
+ * wait for DriverKit to call the associated cancellation handler before calling the super
+ * version of this method."
  *
- * WHY IT CANNOT SIMPLY BLOCK AND WAIT: the two dispatch sources deliver their handlers on
- * the driver's Default queue, which is serial, and Stop is itself delivered on that queue.
- * A cancellation handler therefore cannot run until Stop returns, so waiting for one inside
- * Stop would deadlock. Deferring super::Stop into the handler is the join.
+ * Stop cannot block and wait instead. Stop is delivered ON the driver's Default queue
+ * (measured: quiesceDatapath's OnQueue probe reports true here), that queue is serial, and
+ * every handler below is delivered on it too -- so a cancellation handler cannot run until
+ * Stop returns, and waiting for one inside Stop would deadlock. Deferring super::Stop into
+ * the handler is the join.
  *
- * WHY SetEnable(false) IS NOT ENOUGH, which is what this used to do: only Cancel()'s
- * handler is documented to fire "after any callbacks have completed". SetEnable(false)
- * documents nothing about a handler that is already executing, so releasing the sources and
- * the shared buffers straight afterwards relied on an undocumented assumption that the
- * queue happened to be idle. On a different scheduler, platform or load that is a
- * use-after-free, and a repeating dext fault becomes a kernel panic through IOKit's respawn
- * loop -- so this does not rely on it.
+ * WHAT THE CANCELS DO AND DO NOT ACHIEVE, measured rather than assumed:
+ *  - The backoff timer and the TX doorbell ARE genuinely joined. IODispatchSource::Cancel's
+ *    handler fires after that source's in-flight callbacks complete, which is what makes it
+ *    safe to release the sources and everything the datapath callbacks dereference. This is
+ *    the defect the rewrite existed to fix, and it is fixed.
+ *  - The two pipe completions are NOT joined, by anything available here. Neither the
+ *    synchronous Abort nor OSAction::Cancel prevents an aborted RxComplete from arriving
+ *    after the buffers have been released -- verified on builds both with and without those
+ *    action Cancels. The completion handlers' own null guards are what make that safe; see
+ *    the long comment in quiesceDatapath. rxAction and txAction are still counted and
+ *    cancelled below, because that is the documented way to stop a FUTURE invocation.
+ *
+ * SetEnable(false) only stops future deliveries and says nothing about a handler already
+ * executing, so it cannot replace any of these Cancels; see
+ * reference/teardown-quiescence.txt for each primitive's documented guarantee.
  *
  * `this` and `provider` are retained across the asynchronous gap and released once
  * super::Stop has returned. The atomic counter is what makes super::Stop run exactly once,
@@ -823,22 +844,22 @@ IMPL(SMSC95xxDriver, Stop)
     Log("Stop");
     Diag("Stop(provider=0x%llx) entered", DiagPtr(provider));
 
-    /* Stop new work and join the pipes first: after this returns, the only things that can
-     * still run on the dispatch queue are the two dispatch-source handlers below. */
+    /* Stop new work and stop the hardware issuing more I/O. This does NOT join anything on
+     * the dispatch queue -- the Cancels below are what do that. */
     quiesceDatapath();
 
-    __block _Atomic uint32_t pending = 0;
-    /* Counted into a plain local as well: once the Cancels below are issued, a handler may
-     * already have run and dropped the last copy of the block, which frees the __block
-     * storage -- so `pending` itself must not be read after that point. */
     uint32_t cancelCount = 0;
-    if (ivars->rxBackoffTimer != nullptr) { ++cancelCount; }
-    if (ivars->txDataQueue    != nullptr) { ++cancelCount; }
-    pending = cancelCount;
+    if (ivars->rxBackoffTimer != nullptr) { ++cancelCount; }   /* idle-RX backoff timer   */
+    if (ivars->txDataQueue    != nullptr) { ++cancelCount; }   /* TX doorbell source      */
+    if (ivars->rxAction       != nullptr) { ++cancelCount; }   /* bulk IN  completion     */
+    if (ivars->txAction       != nullptr) { ++cancelCount; }   /* bulk OUT completion     */
+    /* The countdown lives in ivars, not on this stack frame: the handlers run after Stop
+     * has returned, and the retain on `this` below keeps ivars alive until the last one. */
+    ivars->stopCancelsPending = cancelCount;
 
     if (cancelCount == 0) {
         /* Nothing asynchronous to cancel, so the whole teardown can finish in this frame. */
-        Diag("Stop: no dispatch sources to cancel -- releasing and calling super inline");
+        Diag("Stop: nothing to cancel -- releasing and calling super inline");
         ::ReleaseResources(this, provider);
         return Stop(provider, SUPERDISPATCH);
     }
@@ -847,34 +868,84 @@ IMPL(SMSC95xxDriver, Stop)
     provider->retain();
 
     /* One block, handed to every Cancel. Cancel copies it to the heap, which is what makes
-     * passing the same local block to both calls correct -- and is why the earlier attempt
-     * that released the source immediately after a bare SetEnable(false) had no join at all.
-     * The captured `pending` is promoted to the heap and shared by every copy. */
+     * passing the same local block to all four calls correct. */
     void (^finalize)(void) = ^{
-        if (__c11_atomic_fetch_sub(&pending, 1U, __ATOMIC_RELAXED) <= 1) {
-            /* Last cancellation: every handler has finished, so the objects the datapath
-             * callbacks dereference can finally be released, and super can run. */
-            Diag("Stop: final cancellation handler -- releasing resources and calling super");
-            ::ReleaseResources(this, provider);
-            Stop(provider, SUPERDISPATCH);
-            Log("Stop: complete (super called from the final cancellation handler)");
-            provider->release();
-            this->release();
+        /* Release-acquire so the countdown joins the handlers' effects even if the two
+         * cancellation handlers are ever delivered on different queues. */
+        uint32_t prior = __c11_atomic_fetch_sub(&ivars->stopCancelsPending, 1U,
+                                                __ATOMIC_ACQ_REL);
+        if (prior == 0) {
+            Log("Stop: a cancellation handler ran with none outstanding -- the cancel "
+                "count is wrong if this line ever appears");
         }
+        if (prior != 1) {
+            return;
+        }
+        /* Last cancellation: every handler has finished, so the objects the datapath
+         * callbacks dereference can finally be released, and super can run.
+         *
+         * Copied to stack locals first: ReleaseResources drops the two dispatch sources,
+         * and this block is running out of storage owned by one of them, so nothing after
+         * that point may reach through `this` or read a captured variable again. */
+        SMSC95xxDriver *self = this;
+        IOService      *prov = provider;
+        Diag("Stop: final cancellation handler -- releasing resources and calling super");
+        ::ReleaseResources(self, prov);
+        /* Logged BEFORE super, not after: super::Stop can tear this service down and the
+         * process with it, so a line placed after it may never be emitted -- which is
+         * precisely why the first hardware run could not confirm this point was reached. */
+        Log("Stop: joined all cancellations, calling super::Stop now");
+        self->Stop(prov, SUPERDISPATCH);
+        prov->release();
+        self->release();
     };
 
+    /* A failed Cancel means its handler will NEVER run, so the countdown would never reach
+     * zero, super::Stop would never be called, and both retains would leak -- silently.
+     * Invoking finalize() directly for a failed Cancel keeps the countdown honest, so
+     * super::Stop still runs exactly once whatever happens here. */
     if (ivars->rxBackoffTimer != nullptr) {
-        ivars->rxBackoffTimer->Cancel(finalize);
+        kern_return_t cr = ivars->rxBackoffTimer->Cancel(finalize);
+        if (cr != kIOReturnSuccess) {
+            Log("Stop: Cancel(RX backoff timer) FAILED: 0x%x -- its handler will not run, "
+                "so that cancellation is completed here instead", cr);
+            finalize();
+        }
     }
     if (ivars->txDataQueue != nullptr) {
-        ivars->txDataQueue->Cancel(finalize);
+        kern_return_t cr = ivars->txDataQueue->Cancel(finalize);
+        if (cr != kIOReturnSuccess) {
+            Log("Stop: Cancel(TX doorbell) FAILED: 0x%x -- its handler will not run, so "
+                "that cancellation is completed here instead", cr);
+            finalize();
+        }
+    }
+    /* The two pipe completions. These are what make releasing rxBuffer/txBuffer safe: the
+     * synchronous Abort above does not wait for a completion that is queued behind this
+     * Stop on the serial queue, so without these the buffers could be released while an
+     * aborted completion was still pending delivery. */
+    if (ivars->rxAction != nullptr) {
+        kern_return_t cr = ivars->rxAction->Cancel(finalize);
+        if (cr != kIOReturnSuccess) {
+            Log("Stop: Cancel(bulk IN completion) FAILED: 0x%x -- its handler will not run, "
+                "so that cancellation is completed here instead", cr);
+            finalize();
+        }
+    }
+    if (ivars->txAction != nullptr) {
+        kern_return_t cr = ivars->txAction->Cancel(finalize);
+        if (cr != kIOReturnSuccess) {
+            Log("Stop: Cancel(bulk OUT completion) FAILED: 0x%x -- its handler will not run, "
+                "so that cancellation is completed here instead", cr);
+            finalize();
+        }
     }
 
     Diag("Stop: returning without super; %u cancellation(s) issued", cancelCount);
     return kIOReturnSuccess;
 }
 
-/* The capital-S deprecated form (iig:114). The live one the stack calls on
+/* The capital-S deprecated form. The live one the stack calls on
  * `ifconfig up`/`down` is the lowercase setInterfaceEnable below; this exists only to
  * satisfy the SDK's declaration. */
 kern_return_t

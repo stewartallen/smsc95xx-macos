@@ -294,23 +294,49 @@ SMSC95xxDriver::setupDatapath(void)
 void
 SMSC95xxDriver::logDatapathCounters(const char *why)
 {
-    Log("counters at %{public}s -- TX: doorbells %llu drains %llu deferred %llu | dequeued "
-        "%llu submitted %llu completions %llu returned %llu lost %llu | frames %llu bytes "
-        "%llu | rejected %llu submitFail %llu errors %llu stalls %llu aborted %llu",
-        why, ivars->txDoorbells, ivars->txDrains, ivars->txDeferred, ivars->txDequeued,
-        ivars->txSubmitted, ivars->txCompletions, ivars->txReturned, ivars->txLost,
-        ivars->txFrames, ivars->txBytesSent, ivars->txRejected, ivars->txSubmitFailures,
-        ivars->txErrors, ivars->txStalls, ivars->txAborted);
+    /* Four short lines, not two long ones. A dext's os_log messages are clipped at a couple
+     * of hundred characters, and the two combined lines exceeded that once the counters grew
+     * to real values -- losing the tail fields, which is where the accounting identities
+     * live. The identity each line proves is stated on the line itself so a reader does not
+     * have to remember it. */
+    Log("counters at %{public}s -- TX accounting: dequeued %llu = returned %llu + lost %llu "
+        "+ inFlight %u  (identity must hold)",
+        why, ivars->txDequeued, ivars->txReturned, ivars->txLost,
+        ivars->txInFlight ? 1u : 0u);
+    Log("counters at %{public}s -- TX detail: doorbells %llu drains %llu deferred %llu "
+        "submitted %llu completions %llu frames %llu bytes %llu rejected %llu submitFail "
+        "%llu errors %llu stalls %llu aborted %llu",
+        why, ivars->txDoorbells, ivars->txDrains, ivars->txDeferred, ivars->txSubmitted,
+        ivars->txCompletions, ivars->txFrames, ivars->txBytesSent, ivars->txRejected,
+        ivars->txSubmitFailures, ivars->txErrors, ivars->txStalls, ivars->txAborted);
 
-    Log("counters at %{public}s -- RX: completions %llu errors %llu zeroLen %llu arms %llu "
-        "armFail %llu | bytes %llu records %llu zeroRec %llu frames %llu dropped %llu | "
-        "enqueued %llu enqFail %llu lost %llu | fromSubmitQ %llu submitQEmpty %llu "
-        "poolFail %llu",
+    Log("counters at %{public}s -- RX accounting: records %llu = frames %llu + dropped %llu, "
+        "and frames = enqueued %llu  (identities must hold)",
+        why, ivars->rxRecords, ivars->rxFrames, ivars->rxDropped, ivars->rxEnqueued);
+    Log("counters at %{public}s -- RX detail: completions %llu errors %llu zeroLen %llu "
+        "zeroRec %llu arms %llu armFail %llu bytes %llu enqFail %llu lost %llu "
+        "fromSubmitQ %llu submitQEmpty %llu poolFail %llu",
         why, ivars->rxCompletions, ivars->rxCompletionErrors, ivars->rxZeroLength,
-        ivars->rxArmCount, ivars->rxArmFailures, ivars->rxByteCount, ivars->rxRecords,
-        ivars->rxZeroRecords, ivars->rxFrames, ivars->rxDropped, ivars->rxEnqueued,
+        ivars->rxZeroRecords, ivars->rxArmCount, ivars->rxArmFailures, ivars->rxByteCount,
         ivars->rxEnqueueFailures, ivars->rxLost, ivars->rxSubmitDequeued,
         ivars->rxSubmitEmpty, ivars->rxPoolFailures);
+}
+
+/* True for an Abort result that just means "the device or its pipe has already gone, so
+ * there was nothing left to abort" -- routine when the dongle is unplugged, and observed as
+ * kIOReturnNotReady on a yank. Anything else is a real refusal and must be logged: this is
+ * what distinguishes a device-gone teardown from the kIOReturnBadArgument that a wrong
+ * forClient argument produced on every teardown until it was fixed. */
+static bool
+abortResultIsBenign(kern_return_t ar)
+{
+    return ar == kIOReturnSuccess
+        || ar == kIOReturnNoDevice        /* 0x2c0 no such device        */
+        || ar == kIOReturnOffline         /* 0x2d7 device offline        */
+        || ar == kIOReturnNotReady        /* 0x2d8 pipe gone with device */
+        || ar == kIOReturnNotAttached     /* 0x2d9 device not attached   */
+        || ar == kIOReturnNotResponding   /* 0x2ed device not responding */
+        || ar == kIOReturnAborted;        /* 0x2eb already aborted       */
 }
 
 /* PHASE 1 of teardown: stop new work and join the USB pipes. Releases nothing.
@@ -367,19 +393,59 @@ SMSC95xxDriver::quiesceDatapath(void)
           ivars->txBytesSent, ivars->txRejected, ivars->txSubmitFailures, ivars->txStalls,
           ivars->txAborted, ivars->txDeferred, ivars->txErrors);
 
-    /* Abort SYNCHRONOUSLY: a transfer still in flight against a released buffer is a
-     * use-after-free inside the USB stack. kIOUSBAbortSynchronous is documented not to
-     * return until the aborted I/O has completed, so once these return the pipe
-     * completions have run and the pipe has dropped its reference to our actions. */
+    /* Abort both pipes so the hardware issues no further I/O. This stops new completions;
+     * it does NOT join the ones already pending -- read on, because that distinction was
+     * got wrong once already.
+     *
+     * forClient MUST be nullptr. The header is explicit: "If NULL, all requests will be
+     * aborted. Only control endpoints can specify a non-NULL value" -- and these are bulk
+     * endpoints. Passing `this` made both calls fail with kIOReturnBadArgument (0xe00002c2)
+     * on every teardown, so nothing was ever aborted at all.
+     *
+     * kIOUSBAbortSynchronous is documented not to return until the aborted I/O has
+     * completed, but that does NOT make it a join here: Stop runs on the same serial queue
+     * that delivers the completions, so an aborted transfer's completion cannot run until
+     * Stop returns.
+     *
+     * THE PIPE COMPLETIONS CANNOT BE JOINED AT ALL IN THIS ARCHITECTURE, and that was
+     * measured rather than assumed. The aborted RxComplete arrives after releaseDatapath has
+     * released the buffers -- on builds with and without OSAction::Cancel on rxAction and
+     * txAction, so cancelling those actions does not change it. OSAction::Cancel's "after
+     * any in-flight callbacks finish" evidently means callbacks currently EXECUTING, not one
+     * still queued for delivery behind Stop.
+     *
+     * So what makes that late completion safe is NOT a join, it is the guards, and they are
+     * therefore load-bearing rather than belt-and-braces: releaseDatapath nulls rxBytes and
+     * txBytes BEFORE releasing the descriptors; RxComplete's aborted branch returns before
+     * touching any buffer and its EXIT 3 re-checks rxBytes/pool/rxComplete for null;
+     * TxComplete finds txPacket null and txComplete gone and accounts for it. Do not remove
+     * any of those checks on the theory that teardown has already joined everything.
+     * (The actions are still cancelled: that is the documented way to stop any FUTURE
+     * invocation, and it costs nothing.)
+     *
+     * The result is CHECKED, because a silently failing Abort is what hid the forClient bug.
+     * abortResultIsBenign() below separates "the device is already gone, so there is nothing
+     * to abort" -- routine on an unplug -- from a real refusal like kIOReturnBadArgument,
+     * which must stay loud. */
     if (ivars->pipeIn != nullptr) {
         kern_return_t ar = ivars->pipeIn->Abort(kIOUSBAbortSynchronous, kIOReturnAborted,
-                                                this);
+                                                nullptr);
+        if (!abortResultIsBenign(ar)) {
+            Log("quiesceDatapath: Abort(bulk IN, synchronous) REFUSED: 0x%x -- not a "
+                "device-gone status, so this is a real error; receive I/O was not aborted",
+                ar);
+        }
         Diag7("quiesceDatapath: Abort(bulk IN, synchronous) -> 0x%x; rxArmed is now "
               "%{public}s", ar, ivars->rxArmed ? "true (completion not seen yet)" : "false");
     }
     if (ivars->pipeOut != nullptr) {
         kern_return_t ar = ivars->pipeOut->Abort(kIOUSBAbortSynchronous, kIOReturnAborted,
-                                                 this);
+                                                 nullptr);
+        if (!abortResultIsBenign(ar)) {
+            Log("quiesceDatapath: Abort(bulk OUT, synchronous) REFUSED: 0x%x -- not a "
+                "device-gone status, so this is a real error; transmit I/O was not aborted",
+                ar);
+        }
         Diag7("quiesceDatapath: Abort(bulk OUT, synchronous) -> 0x%x", ar);
     }
     Diag7("quiesceDatapath: complete; pipes aborted, no new work accepted");

@@ -117,6 +117,11 @@ struct SMSC95xxDriver_IVars {
      * only re-armed while this holds, so disabling the interface lets the read loop wind
      * down after at most one more completion instead of reading into a released buffer. */
     bool                      rxRunning;
+    /* Cancellations Stop() has issued whose handlers have not yet run. The shared
+     * cancellation handler counts it down; whichever handler reaches zero releases the
+     * driver's resources and calls super::Stop. Lives here rather than on Stop's stack
+     * because the handlers run after Stop has returned. */
+    _Atomic uint32_t          stopCancelsPending;
 
     /* The idle-RX backoff state (RxComplete branches on it). rxIdleRun counts consecutive
      * completions that delivered no bytes -- a zero-length success or a failed transfer

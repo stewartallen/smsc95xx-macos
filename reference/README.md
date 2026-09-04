@@ -50,7 +50,7 @@ exactly which values are device-specific and which are not.
 
 | File | What it is |
 |---|---|
-| `teardown-quiescence.txt` | Why `Stop()` is asynchronous. Quotes the `IOService::Stop` contract and each DriverKit join primitive's documented guarantee, records which ones actually wait for an in-flight handler (`Cancel`, the timer's `SetEnableWithCompletion`, synchronous `Abort`) and which do not (`SetEnable(false)`, the data queue's `SetEnableWithCompletion`), explains why blocking inside `Stop` would deadlock on the serial queue, and documents the cancel-count / deferred-`super::Stop` pattern the driver now uses. |
+| `teardown-quiescence.txt` | Why `Stop()` is asynchronous. Quotes the `IOService::Stop` contract and each DriverKit join primitive's documented guarantee, records which ones actually wait for an in-flight handler (`Cancel`, both classes' `SetEnableWithCompletion` per the SDK HeaderDoc, synchronous `Abort`) and which does not (`SetEnable(false)`), explains why blocking inside `Stop` would deadlock on the serial queue, and documents the cancel-count / deferred-`super::Stop` pattern the driver now uses. |
 
 ### Code signing evidence
 

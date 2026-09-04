@@ -41,10 +41,14 @@ The join primitives, and which ones actually join:
                                              ---> a real join, for the timer only.
 
   IODataQueueDispatchSource::SetEnableWithCompletion(false, h)
-                                             h runs only "after this method successfully
-                                             disables the dispatch source" -- it says
-                                             nothing about in-flight handlers.
-                                             ---> NOT a join. Cancel is required here.
+                                             h runs "after the interrupt has been disabled
+                                             and any pending interrupt handlers completed"
+                                             (SDK HeaderDoc; the developer.apple.com prose
+                                             is weaker and omits the second clause).
+                                             ---> a real join, though not a terminal one.
+                                             The driver Cancels this source anyway, because
+                                             teardown also frees it and cancel-then-free is
+                                             the documented sequence.
 
   IODispatchSource::SetEnable(false)         documented only as "Enables or disables the
                                              delivery of events to your code". No statement
@@ -110,16 +114,17 @@ Stop():
      counters, and Abort(kIOUSBAbortSynchronous) both bulk pipes. That is a documented join
      for the pipe completions, so after it returns only the two dispatch-source handlers can
      still run.
-  2. Count the cancellable sources (backoff timer, TX doorbell) into a __block atomic.
-     If the count is zero, release and call super in-frame and return.
+  2. Count the cancellable sources (backoff timer, TX doorbell) into an atomic countdown
+     in the driver's ivars -- the retain in step 3 is what keeps ivars alive until the last
+     handler. If the count is zero, release and call super in-frame and return.
   3. Retain `this` and the provider.
-  4. Cancel(finalize) each source. Cancel copies the block to the heap, which is why the
-     same local block can be handed to both calls -- and note that a STACK block passed to
-     Cancel and invoked later is a use-after-free, which is what an earlier `Cancel(^{ })`
-     attempt in this driver crashed on.
+  4. Cancel(finalize) each source. Cancel copies the handler block to the heap before it
+     returns, which is why the same local block can be handed to both calls.
   5. Return kIOReturnSuccess without calling super.
 
-  finalize (runs on the dispatch queue, once per cancelled source):
+  finalize (once per cancelled source; the SDK does not document which queue a cancellation
+  handler is delivered on, so the countdown uses release-acquire ordering to make the join
+  hold wherever the handlers run):
      atomically decrement; on the last one, releaseDatapath() and ReleaseResources() -- which
      is the first moment it is safe to drop the buffers, queues and pool -- then
      super::Stop(provider, SUPERDISPATCH), then release the provider and `this`.
@@ -134,6 +139,61 @@ been enabled (both happen in setInterfaceEnable(true)), and the backoff timer, a
 enabled, has never been given a WakeAtTime deadline, so it cannot fire. With no handler able
 to be in flight there is nothing to cancel and wait for.
 
+
+Measured on hardware (2026-09-03)
+---------------------------------
+
+Four teardowns were observed on the real dongle, across builds that differed only in the
+teardown code, using both a physical yank mid-traffic and a graceful terminate
+(`systemextensionsctl uninstall`) with the device still attached.
+
+WHAT WAS CONFIRMED
+
+  Stop is delivered ON the driver's Default queue. quiesceDatapath's OnQueue probe reports
+    true on the Stop path. (It reports false on the Start()-failure path, which runs on
+    Start's own thread -- do not confuse the two readings.) So the queue is serial and a
+    cancellation handler genuinely cannot run until Stop returns: blocking inside Stop to
+    wait for one would deadlock, and the deferred-super pattern is necessary, not stylistic.
+
+  The cancel/countdown machinery works. "Stop: joined all cancellations, calling super::Stop
+    now" is emitted on both the graceful and the yank path, the countdown reaches zero
+    exactly once, and resources are released before super::Stop -- which matters because the
+    interface Close inside ReleaseResources must precede it.
+
+  Both accounting identities hold exactly, including through a flood and an unplug:
+    TX dequeued == returned + lost + inFlight, and RX records == frames + dropped == enqueued.
+
+  No crash, panic or respawn on any teardown.
+
+TWO THINGS THAT WERE WRONG AND ARE NOW FIXED
+
+  Abort's forClient argument. The code passed `this`. The header allows a non-NULL value
+    only for control endpoints; these are bulk, so every Abort returned
+    kIOReturnBadArgument (0xe00002c2) and aborted nothing, on every teardown this driver has
+    ever done. The result was not checked, so it was silent. Now nullptr, and checked.
+
+  A completion log placed after super::Stop is unobservable. super can tear the process down,
+    so the line never appeared and the first run could not confirm super was reached. It is
+    now emitted immediately before super.
+
+ONE THING THAT CANNOT BE FIXED, ONLY GUARDED
+
+  The pipe completions cannot be joined. An aborted RxComplete arrives AFTER releaseDatapath
+    has released the buffers. This was measured on a build with OSAction::Cancel on rxAction
+    and txAction and on one without: cancelling the actions makes no difference, so
+    OSAction::Cancel's "after any in-flight callbacks finish" covers a callback that is
+    executing, not one still queued for delivery behind Stop on the serial queue.
+
+    Consequently the completion handlers' null guards are load-bearing, not defensive
+    decoration: releaseDatapath nulls rxBytes/txBytes before releasing the descriptors, and
+    RxComplete/TxComplete re-check for the released objects. Do not remove them on the
+    assumption that teardown has joined everything -- it has joined the dispatch sources,
+    which is what the original defect was about, but not the pipes.
+
+  A dext's os_log messages are clipped near 240 characters and messages are dropped under
+    volume: about 28% of numbered trace lines were missing during a flood, including a Diag.
+    Absence of a log line in a busy window proves nothing. The counters are therefore emitted
+    as four short lines rather than two long ones, each stating the identity it proves.
 
 Residual diagnostics
 --------------------
