@@ -162,6 +162,8 @@ endif
 # between `make` and `make TRACE=1` over an existing build/ reuses up-to-date objects and
 # silently ships the previous tracing state. The stamp file's name encodes the state, so
 # flipping the flag invalidates every object that compiles with DK_CXXFLAGS.
+# This rule precedes `all`, so pin the default goal explicitly.
+.DEFAULT_GOAL := all
 TRACE_STAMP  := $(BUILD)/.trace-$(if $(strip $(TRACE)),on,off)
 $(TRACE_STAMP):
 	@mkdir -p $(BUILD)

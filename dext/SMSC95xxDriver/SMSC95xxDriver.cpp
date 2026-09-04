@@ -316,9 +316,9 @@ initSeqResultToIOReturn(int rc)
     }
 }
 
-/* Publish one registry property to ioreg. A null value or a failure is logged and
- * otherwise ignored: a missing ioreg property must never fail an attach. The caller
- * keeps ownership of `value`. */
+/* Publish one registry property to ioreg. A null value is silently ignored and a
+ * SetProperties failure only logged: a missing ioreg property must never fail an
+ * attach. The caller keeps ownership of `value`. */
 static void
 publishProperty(SMSC95xxDriver *driver, const char *key, OSObject *value)
 {
@@ -770,9 +770,8 @@ mac_publish:
      * AFTER registerEthernetInterface, so the family may already have called
      * setInterfaceEnable(true) -- arming a receive read and enabling the packet queues -- by
      * the time either returns. Tearing down synchronously from here could then release
-     * buffers under a live handler, which is the whole hazard the Stop path was rewritten to
-     * avoid. Keeping every `goto fail` site strictly BEFORE registration is what makes the
-     * synchronous failure teardown below provably safe.
+     * buffers under a live handler. Keeping every `goto fail` site before a successful
+     * registration is what keeps the synchronous failure teardown below safe.
      *
      * Both are safe to merely log. reportLinkStatus is re-issued from
      * setInterfaceEnable(true), which is the call that actually matters (a status reported
@@ -794,11 +793,13 @@ mac_publish:
 
 fail:
     /* Synchronous teardown, unlike Stop(), and it is safe here because no handler can be in
-     * flight on this path. Every goto fail site is before registerEthernetInterface, so the
+     * flight on this path. Every goto fail site runs before the interface was successfully
+     * registered -- the last is registerEthernetInterface's own failure return -- so the
      * family has never been able to call setInterfaceEnable(true): no bulk IN read is posted
      * and no packet queue is enabled. The backoff timer, although enabled, has never been
      * given a WakeAtTime deadline, so it cannot fire either. There is nothing to cancel and
-     * wait for. Do not add a goto fail after registration without revisiting this. */
+     * wait for. Do not add a goto fail after a successful registration without revisiting
+     * this. */
     quiesceDatapath();
     ::ReleaseResources(this, provider);
     Stop(provider, SUPERDISPATCH);
@@ -813,23 +814,21 @@ fail:
  * wait for DriverKit to call the associated cancellation handler before calling the super
  * version of this method."
  *
- * Stop cannot block and wait instead. Stop is delivered ON the driver's Default queue
- * (measured: quiesceDatapath's OnQueue probe reports true here), that queue is serial, and
- * every handler below is delivered on it too -- so a cancellation handler cannot run until
- * Stop returns, and waiting for one inside Stop would deadlock. Deferring super::Stop into
- * the handler is the join.
+ * Stop cannot block and wait instead. Stop is delivered on the driver's Default queue,
+ * that queue is serial, and every handler below is delivered on it too -- so a
+ * cancellation handler cannot run until Stop returns, and waiting for one inside Stop
+ * would deadlock. Deferring super::Stop into the handler is the join.
  *
- * WHAT THE CANCELS DO AND DO NOT ACHIEVE, measured rather than assumed:
+ * What the Cancels do and do not achieve:
  *  - The backoff timer and the TX doorbell ARE genuinely joined. IODispatchSource::Cancel's
  *    handler fires after that source's in-flight callbacks complete, which is what makes it
- *    safe to release the sources and everything the datapath callbacks dereference. This is
- *    the defect the rewrite existed to fix, and it is fixed.
+ *    safe to release the sources and everything the datapath callbacks dereference.
  *  - The two pipe completions are NOT joined, by anything available here. Neither the
  *    synchronous Abort nor OSAction::Cancel prevents an aborted RxComplete from arriving
- *    after the buffers have been released -- verified on builds both with and without those
- *    action Cancels. The completion handlers' own null guards are what make that safe; see
- *    the long comment in quiesceDatapath. rxAction and txAction are still counted and
- *    cancelled below, because that is the documented way to stop a FUTURE invocation.
+ *    after the buffers have been released. The completion handlers' own null guards are
+ *    what make that safe; see the long comment in quiesceDatapath. rxAction and txAction
+ *    are still counted and cancelled below, because that is the documented way to stop a
+ *    FUTURE invocation.
  *
  * SetEnable(false) only stops future deliveries and says nothing about a handler already
  * executing, so it cannot replace any of these Cancels; see
@@ -870,7 +869,7 @@ IMPL(SMSC95xxDriver, Stop)
     /* One block, handed to every Cancel. Cancel copies it to the heap, which is what makes
      * passing the same local block to all four calls correct. */
     void (^finalize)(void) = ^{
-        /* Release-acquire so the countdown joins the handlers' effects even if the two
+        /* Release-acquire so the countdown joins the handlers' effects even if the
          * cancellation handlers are ever delivered on different queues. */
         uint32_t prior = __c11_atomic_fetch_sub(&ivars->stopCancelsPending, 1U,
                                                 __ATOMIC_ACQ_REL);
@@ -892,8 +891,7 @@ IMPL(SMSC95xxDriver, Stop)
         Diag("Stop: final cancellation handler -- releasing resources and calling super");
         ::ReleaseResources(self, prov);
         /* Logged BEFORE super, not after: super::Stop can tear this service down and the
-         * process with it, so a line placed after it may never be emitted -- which is
-         * precisely why the first hardware run could not confirm this point was reached. */
+         * process with it, so a line placed after it may never be emitted. */
         Log("Stop: joined all cancellations, calling super::Stop now");
         self->Stop(prov, SUPERDISPATCH);
         prov->release();
@@ -920,10 +918,9 @@ IMPL(SMSC95xxDriver, Stop)
             finalize();
         }
     }
-    /* The two pipe completions. These are what make releasing rxBuffer/txBuffer safe: the
-     * synchronous Abort above does not wait for a completion that is queued behind this
-     * Stop on the serial queue, so without these the buffers could be released while an
-     * aborted completion was still pending delivery. */
+    /* The two pipe completions. Cancelling stops any FUTURE invocation; it does not join a
+     * completion already queued for delivery behind this Stop -- the completion handlers'
+     * null guards cover that late delivery (see the comment above this function). */
     if (ivars->rxAction != nullptr) {
         kern_return_t cr = ivars->rxAction->Cancel(finalize);
         if (cr != kIOReturnSuccess) {

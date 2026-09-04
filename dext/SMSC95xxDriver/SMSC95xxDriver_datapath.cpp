@@ -324,9 +324,7 @@ SMSC95xxDriver::logDatapathCounters(const char *why)
 
 /* True for an Abort result that just means "the device or its pipe has already gone, so
  * there was nothing left to abort" -- routine when the dongle is unplugged, and observed as
- * kIOReturnNotReady on a yank. Anything else is a real refusal and must be logged: this is
- * what distinguishes a device-gone teardown from the kIOReturnBadArgument that a wrong
- * forClient argument produced on every teardown until it was fixed. */
+ * kIOReturnNotReady on a yank. Anything else is a real refusal and must stay loud. */
 static bool
 abortResultIsBenign(kern_return_t ar)
 {
@@ -339,14 +337,15 @@ abortResultIsBenign(kern_return_t ar)
         || ar == kIOReturnAborted;        /* 0x2eb already aborted       */
 }
 
-/* PHASE 1 of teardown: stop new work and join the USB pipes. Releases nothing.
+/* PHASE 1 of teardown: stop new work and abort the USB pipes. Releases nothing.
  *
  * IOService::Stop is documented to require that a driver "stop all activity and put your
  * driver in a quiescent state", cancelling in-progress asynchronous tasks and waiting for
  * their cancellation handlers before calling super. This is the half that can be done
  * synchronously: clearing the two gate flags stops new work being started, and
  * Abort(kIOUSBAbortSynchronous) is documented not to return until the aborted I/O has
- * completed, which is a real join for the pipe completions.
+ * completed -- a join for the hardware I/O, though not for the completion callbacks
+ * (see the Abort comment below).
  *
  * The dispatch sources (the backoff timer and the TX doorbell) cannot be joined here --
  * their handlers run on the same queue and only Cancel()'s handler is documented to fire
@@ -394,25 +393,22 @@ SMSC95xxDriver::quiesceDatapath(void)
           ivars->txAborted, ivars->txDeferred, ivars->txErrors);
 
     /* Abort both pipes so the hardware issues no further I/O. This stops new completions;
-     * it does NOT join the ones already pending -- read on, because that distinction was
-     * got wrong once already.
+     * it does NOT join the ones already pending.
      *
      * forClient MUST be nullptr. The header is explicit: "If NULL, all requests will be
      * aborted. Only control endpoints can specify a non-NULL value" -- and these are bulk
-     * endpoints. Passing `this` made both calls fail with kIOReturnBadArgument (0xe00002c2)
-     * on every teardown, so nothing was ever aborted at all.
+     * endpoints.
      *
      * kIOUSBAbortSynchronous is documented not to return until the aborted I/O has
      * completed, but that does NOT make it a join here: Stop runs on the same serial queue
      * that delivers the completions, so an aborted transfer's completion cannot run until
      * Stop returns.
      *
-     * THE PIPE COMPLETIONS CANNOT BE JOINED AT ALL IN THIS ARCHITECTURE, and that was
-     * measured rather than assumed. The aborted RxComplete arrives after releaseDatapath has
-     * released the buffers -- on builds with and without OSAction::Cancel on rxAction and
-     * txAction, so cancelling those actions does not change it. OSAction::Cancel's "after
-     * any in-flight callbacks finish" evidently means callbacks currently EXECUTING, not one
-     * still queued for delivery behind Stop.
+     * THE PIPE COMPLETIONS CANNOT BE JOINED AT ALL IN THIS ARCHITECTURE: an aborted
+     * RxComplete can arrive after releaseDatapath has released the buffers, and
+     * OSAction::Cancel does not prevent it -- its "after any in-flight callbacks finish"
+     * covers callbacks currently EXECUTING, not one still queued for delivery behind Stop
+     * (observed on hardware; see reference/teardown-quiescence.txt).
      *
      * So what makes that late completion safe is NOT a join, it is the guards, and they are
      * therefore load-bearing rather than belt-and-braces: releaseDatapath nulls rxBytes and
@@ -423,10 +419,10 @@ SMSC95xxDriver::quiesceDatapath(void)
      * (The actions are still cancelled: that is the documented way to stop any FUTURE
      * invocation, and it costs nothing.)
      *
-     * The result is CHECKED, because a silently failing Abort is what hid the forClient bug.
-     * abortResultIsBenign() below separates "the device is already gone, so there is nothing
-     * to abort" -- routine on an unplug -- from a real refusal like kIOReturnBadArgument,
-     * which must stay loud. */
+     * The result is CHECKED: a silently refused Abort would leave live I/O against buffers
+     * about to be released. abortResultIsBenign() above separates "the device is already
+     * gone, so there is nothing to abort" -- routine on an unplug -- from a real refusal
+     * like kIOReturnBadArgument, which must stay loud. */
     if (ivars->pipeIn != nullptr) {
         kern_return_t ar = ivars->pipeIn->Abort(kIOUSBAbortSynchronous, kIOReturnAborted,
                                                 nullptr);
@@ -564,8 +560,8 @@ SMSC95xxDriver::rearmRxRead(bool carriedData)
 {
     if (carriedData) {
         if (ivars->rxBackoffActive || ivars->rxIdleRun > 0) {
-            /* Once per episode, not per completion: the un-guarded loop's log flood was
-             * itself part of the cost being fixed. */
+            /* Once per episode, not per completion, so an idle device does not flood
+             * the log. */
             Log("RxComplete: traffic resumed after %llu empty completions%{public}s -- back "
                 "to immediate re-arming", ivars->rxIdleRun,
                 ivars->rxBackoffActive ? " and a backoff" : "");
@@ -1168,10 +1164,9 @@ IMPL(SMSC95xxDriver, RxComplete)
      * it is what a link with no traffic looks like if the host controller ever completes a
      * zero-length read at all.
      *
-     * This is the path that produced the busy loop: re-arming unconditionally here, against a
-     * device that completes the next read instantly, is a spin with no I/O wait in it. It now
-     * goes through rearmRxRead, which re-arms immediately for the first few and then hands
-     * the job to the backoff timer. */
+     * Re-arming unconditionally here would spin: a device that completes the next read
+     * instantly leaves no I/O wait in the loop. rearmRxRead re-arms immediately for the
+     * first few and then hands the job to the backoff timer. */
     if (actualByteCount == 0) {
         ivars->rxZeroLength++;
         Diag7("RxComplete: zero-length completion (#%llu) -- idle link",

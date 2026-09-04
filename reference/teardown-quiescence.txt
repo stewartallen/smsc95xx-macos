@@ -161,7 +161,7 @@ WHAT WAS CONFIRMED
     interface Close inside ReleaseResources must precede it.
 
   Both accounting identities hold exactly, including through a flood and an unplug:
-    TX dequeued == returned + lost + inFlight, and RX records == frames + dropped == enqueued.
+    TX dequeued == returned + lost + inFlight; RX records == frames + dropped, frames == enqueued.
 
   No crash, panic or respawn on any teardown.
 

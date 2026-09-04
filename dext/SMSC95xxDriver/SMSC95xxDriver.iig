@@ -60,7 +60,8 @@ public:
      *
      * Teardown is two phases because IOService::Stop requires cancelling in-flight
      * asynchronous work and waiting for its cancellation handlers BEFORE calling super:
-     *   quiesceDatapath() stops new work and joins the USB pipes (synchronous Abort);
+     *   quiesceDatapath() stops new work and synchronously aborts the USB pipes (the
+     *   completion callbacks are not joined; their null guards cover late delivery);
      *   releaseDatapath() drops the objects, and must run only once every dispatch-source
      *   cancellation handler has fired. Stop() sequences the two around its Cancel calls. */
     virtual kern_return_t setupDatapath() LOCALONLY;
