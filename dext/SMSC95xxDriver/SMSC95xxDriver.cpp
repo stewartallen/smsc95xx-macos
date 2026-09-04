@@ -627,9 +627,9 @@ mac_publish:
             ivars->macAddress[3], ivars->macAddress[4], ivars->macAddress[5],
             (unsigned int)SMSC95XX_INIT_WRITE_COUNT);
 
-        /* promiscuous=false: this driver programs no multicast filter, but PRMS is not
-         * the way to paper over that -- it would hand the stack every frame on the
-         * segment. That belongs in setPromiscuousModeEnable when it is implemented. */
+        /* promiscuous=false: the interface comes up filtering to the station address and
+         * broadcast; setPromiscuousModeEnable toggles MAC_CR.PRMS at runtime when the
+         * stack asks (tcpdump, a bridge). */
         int irc = smsc95xx_init_seq(&io, ivars->macAddress, false);
         ret = initSeqResultToIOReturn(irc);
         if (ret != kIOReturnSuccess) {
@@ -974,10 +974,35 @@ SMSC95xxDriver::SetPromiscuousModeEnable_Impl(bool enable __unused)
 IOReturn
 SMSC95xxDriver::setPromiscuousModeEnable(bool enable)
 {
-    /* Accepted but not yet applied: MAC_CR.PRMS stays clear until a read-modify-write
-     * of MAC_CR lands here. Logged so the gap stays visible rather than assumed. */
-    Log("setPromiscuousModeEnable(%{public}s) -- accepted, but MAC_CR.PRMS is not "
-        "toggled yet (Start() leaves it clear)", enable ? "true" : "false");
+    /* Read-modify-write of MAC_CR.PRMS: the surrounding bits (RXEN, TXEN, RCVOWN) were
+     * programmed by the init sequence and must be preserved. Register I/O is safe here
+     * even though this is not delivered on the driver's dispatch queue: nothing else
+     * touches the control pipe after Start(), and readRegister checks the interface and
+     * control buffer are still present. */
+    if (ivars->stopping) {
+        return kIOReturnOffline;
+    }
+
+    uint32_t macCr = 0;
+    kern_return_t kr = readRegister(SMSC95XX_REG_MAC_CR, &macCr);
+    if (kr != kIOReturnSuccess) {
+        Log("setPromiscuousModeEnable(%{public}s): MAC_CR read failed: 0x%x",
+            enable ? "true" : "false", kr);
+        return kr;
+    }
+
+    uint32_t newCr = enable ? (macCr | SMSC95XX_MAC_CR_PRMS)
+                            : (macCr & ~SMSC95XX_MAC_CR_PRMS);
+    if (newCr != macCr) {
+        kr = writeRegister(SMSC95XX_REG_MAC_CR, newCr);
+        if (kr != kIOReturnSuccess) {
+            Log("setPromiscuousModeEnable(%{public}s): MAC_CR write failed: 0x%x",
+                enable ? "true" : "false", kr);
+            return kr;
+        }
+    }
+    Log("setPromiscuousModeEnable(%{public}s): MAC_CR 0x%08x -> 0x%08x",
+        enable ? "true" : "false", macCr, newCr);
     return kIOReturnSuccess;
 }
 

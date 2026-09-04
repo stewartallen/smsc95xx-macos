@@ -90,7 +90,7 @@ public:
      * capital-S pure virtual above. */
     virtual IOReturn      setInterfaceEnable(bool enable) override;
 
-    /* The live/deprecated promiscuous pair. Accepted but not yet acted on. */
+    /* The live/deprecated promiscuous pair. The live one toggles MAC_CR.PRMS. */
     virtual kern_return_t SetPromiscuousModeEnable(bool enable) override;
     virtual IOReturn      setPromiscuousModeEnable(bool enable) override;
 
