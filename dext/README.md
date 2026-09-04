@@ -17,49 +17,76 @@ project. Every non-obvious flag has been validated on hardware and is documented
 
 ## Prerequisites
 
-This driver requires **SIP disabled** on macOS. SIP intercepts system extension loading at the kernel
-level and cannot be bypassed from userspace. **This is not production-ready; it is a development
-posture.**
+With a **paid Apple Developer account** (development signing identity, two provisioning profiles)
+the dext loads on a stock Mac: SIP enabled, Full Security, developer mode off. Verified on macOS
+26.6 (Darwin 25.6), M4 Pro. Without an account, see
+[Without a developer account](#without-a-developer-account).
 
-1. **Boot into Recovery** — restart holding the power button, select Options, then Utilities, then Terminal.
+1. **Create the App IDs and profiles** — see [Signing with a real identity](#signing-with-a-real-identity).
 
-2. **Disable SIP:**
+2. **Configure signing:** copy `.env.example` to `.env` and fill in the identity and profile paths.
+
+3. **Install:**
    ```sh
-   csrutil disable
-   reboot
+   make install
+   ```
+   No `sudo`. Approve the extension when System Settings prompts (General > Login Items &
+   Extensions > Driver Extensions) and enter your password — that approval completes the
+   activation.
+
+4. **Verify the security posture** — a stale value in any of these invalidates a load result:
+   ```sh
+   csrutil status                                                      # "enabled"
+   nvram boot-args                                                     # "data was not found"
+   plutil -p /Library/SystemExtensions/db.plist | grep developerMode   # false
    ```
 
-3. **Enable developer mode:**
-   ```sh
-   sudo systemextensionsctl developer on
-   ```
-
-4. **Verify the prerequisites:**
-   ```sh
-   csrutil status   # should report "disabled"
-   nvram boot-args  # should report "data was not found" — see below
-   ```
-
-### No AMFI boot-arg is needed
+### No AMFI boot-arg, no SIP change
 
 Earlier revisions of this driver required `sudo nvram boot-args="amfi_get_out_of_my_way=0x1"`,
 because an ad-hoc signature cannot authorise the restricted entitlements the driver and its
-installer claim. That boot-arg disables code-signing entitlement validation **machine-wide**, not
-just for this driver — it is a serious security regression, and it breaks unrelated software that
-relies on entitlement validation (JDKs and .NET runtimes were both affected here).
-
-It is no longer required. Signing with a real Apple Development identity plus embedded
-provisioning profiles authorises the entitlements properly, and the driver loads with AMFI
-enforcing. See [Signing with a real identity](#signing-with-a-real-identity). If you still have the
-boot-arg set from an earlier revision, remove it:
+installer claim. Signing with a real Apple Development identity plus embedded provisioning profiles
+authorises them properly, and the driver loads with AMFI enforcing. If you still have the boot-arg
+set from an earlier revision, remove it:
 
 ```sh
 sudo nvram -d boot-args   # then reboot
 ```
 
-SIP must still be **disabled**: a development-signed dext requires it, and only notarised
-distribution lifts that requirement. SIP is a separate mechanism from AMFI, and disabling it does
-not disable entitlement validation.
+SIP does **not** need to be disabled either: a development-signed, profile-backed dext in
+`/Applications` loads with SIP enabled and Full Security. `systemextensionsctl developer` is not
+part of this flow — it refuses to run while SIP is on. What limits where this build loads is the
+provisioning profile, not SIP or AMFI; see [Not distributable](#not-distributable).
+
+### Without a developer account
+
+Without a paid account an ad-hoc signature cannot authorise the restricted entitlements, so you
+disable the entitlement check instead: **reduced security plus the AMFI boot-arg**.
+
+```sh
+# 1. Recovery (hold the power button, Options, Utilities, Terminal):
+csrutil disable            # also drops the Mac to Reduced Security, which is what
+                           # permits setting boot-args at all on Apple Silicon
+reboot
+
+# 2. Back in macOS, set the boot-arg, then reboot again so it takes effect:
+sudo nvram boot-args="amfi_get_out_of_my_way=0x1"
+reboot
+
+# 3. Build and install with no .env at all — both bundles come out ad-hoc signed:
+make install
+```
+
+Do not run `systemextensionsctl developer on`: it only relaxes the `/Applications` location check,
+which `make install` already satisfies, and it does not survive a reboot.
+
+**Warning:** `amfi_get_out_of_my_way=0x1` disables code-signing entitlement validation
+**machine-wide**, not just for this driver, and it breaks unrelated software that depends on it —
+JDKs and .NET runtimes were both affected on this machine.
+
+This is the path the project itself used before 2026-08-30; the steps have not been re-verified
+since the switch to signing. If they fail, check `nvram boot-args` and `csrutil status` first —
+both silently revert with an OS update or a security-policy change — then see Debugging, below.
 
 ---
 
@@ -82,8 +109,8 @@ Builds `build/com.github.stewartallen.smsc95xx.driver.dext` and
 - Signs both bundles with full entitlements
 
 With no `.env` and no arguments both bundles are **ad-hoc** signed, which does not authorise their
-restricted entitlements — such a build only loads with the AMFI boot-arg, and is not the supported
-path. Create `dext/.env` from `.env.example` to sign properly; see
+restricted entitlements — such a build only loads with the AMFI boot-arg, which cannot be set on a
+Mac in Full Security. Create `dext/.env` from `.env.example` to sign properly; see
 [Signing with a real identity](#signing-with-a-real-identity).
 
 **Build artifacts are placed in `build/`, not in the source tree or Xcode default locations.**
@@ -91,7 +118,7 @@ path. Create `dext/.env` from `.env.example` to sign properly; see
 ### `make install` — stage and activate the dext
 
 ```sh
-sudo make install
+make install
 ```
 
 Copies the installer app to `/Applications` and runs it to activate the dext. On completion:
@@ -99,8 +126,10 @@ Copies the installer app to `/Applications` and runs it to activate the dext. On
 - `ioreg` will show a matching `IOUserService` under the device node
 - Kernel logs will show matching and `Start()` messages
 
-This requires `sudo` because system extensions can only be activated from an app in
-`/Applications`, which requires elevated privilege to write.
+No `sudo` — an admin user can write `/Applications` directly. Activation is authorised
+interactively: approve the extension when System Settings prompts (General > Login Items &
+Extensions > Driver Extensions) and enter your password. The activation is not complete until you
+do; the `make` target returning is not the finish line.
 
 ### `make status` — check if the dext is loaded and matched
 
@@ -121,11 +150,12 @@ missing entitlements. Check kernel logs first (see Debugging, below).
 ### `make uninstall` — deactivate and remove the dext
 
 ```sh
-sudo make uninstall
+make uninstall
 ```
 
-Deactivates the dext and removes the installer app from `/Applications`. Kernel may take a few
-seconds to fully tear down the driver after deactivation.
+Deactivates the dext and removes the installer app from `/Applications`. No `sudo`, but expect a
+password prompt. Kernel may take a few seconds to fully tear down the driver after deactivation;
+the installer reports `OK: completes after reboot` when teardown is deferred.
 
 ### `make clean` — remove all build artifacts
 
@@ -326,7 +356,7 @@ APP_PROFILE=~/Downloads/YourInstaller_macOS_Development.provisionprofile
 both are easy to write by habit and both fail confusingly. Then just:
 
 ```sh
-sudo make install
+make install
 ```
 
 The same variables can still be passed per invocation, which overrides `.env`:
@@ -831,14 +861,14 @@ driver remains active — a subtle and misleading failure mode.
 
 ## Not distributable
 
-This driver is built for **local development only**. It requires:
-- SIP disabled (security regression) — a development-signed dext will not load with SIP on
-- A development provisioning profile naming this specific Mac, so the build only loads on the
-  machines listed in the profile
+This driver loads on a stock, fully secured Mac — but only on **yours**. It requires:
+- A development provisioning profile naming a specific Mac's Provisioning UDID, so a copy of
+  someone else's build will not load on your machine; you build it yourself, with your own account
 - A `transport.usb` entitlement that a development profile forces to `idVendor: "*"`, which is far
   broader than the three devices this driver actually matches
 
-It no longer requires AMFI validation to be disabled, and it is no longer ad-hoc signed.
-
 Distribution would need a Developer ID identity, notarisation, and Apple's approval of concrete
-vid/pid values for the USB transport entitlement. That is out of scope for this project.
+vid/pid values for the USB transport entitlement. Apple grants those by request
+(<https://developer.apple.com/system-extensions/>) but scopes the grant to the company that owns
+the hardware vendor ID — `0424` belongs to Microchip and `184f` to its subsidiary K2L, not to this
+project. Building it yourself is the supported path.

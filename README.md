@@ -24,10 +24,11 @@ they are the **same device** — identical endpoints, identical initialization s
 link configuration — differing only in USB ID and MAC address. One implementation covers both;
 only the IOKit matching dictionary needs two entries.
 
-> **Status: M6 complete — measured, profiled, and done.** The DriverKit extension builds, loads with
-> SIP disabled, matches both dongles, reads the MAC from EEPROM with provenance checks, initialises
-> the chip, and carries Ethernet frames over the bulk pipes in both directions — `ping` works
-> end to end across the T1S segment (see [`reference/m5-datapath.txt`](reference/m5-datapath.txt)).
+> **Status: M6 complete — measured, profiled, and done.** The DriverKit extension builds, loads on
+> a stock Mac with SIP enabled, matches both dongles, reads the MAC from EEPROM with provenance
+> checks, initialises the chip, and carries Ethernet frames over the bulk pipes in both
+> directions — `ping` works end to end across the T1S segment (see
+> [`reference/m5-datapath.txt`](reference/m5-datapath.txt)).
 > TCP fills 75–85% of what the half-duplex wire allows, paced UDP at 9 Mbit/s is lossless both
 > ways, `tcpdump` works via the BPF tap, and a CPU profile under line-rate load shows the driver
 > costing 4.5–8% of one efficiency core, almost all of it DriverKit RPC machinery rather than
@@ -264,16 +265,15 @@ with `kIOUserNetworkMediaOptionHalfDuplex` is the honest approximation.
   `com.apple.developer.driverkit.transport.usb`,
   `com.apple.developer.driverkit.family.networking`
 
-Those last two are not self-serve — Apple grants them by request. This project is therefore
-built for **local development with reduced security**, not for distribution:
+**With an Apple Developer account:** sign with the *development* variant of those entitlements
+(self-serve on any paid account) and the dext loads on a stock Mac — SIP enabled, Full Security,
+no boot-args. A development profile only authorises the Macs listed in it, so you build with your
+own account rather than downloading a binary; see
+[Not distributable](dext/README.md#not-distributable).
 
-```sh
-# one-time, from Recovery on Apple Silicon: set Reduced Security
-csrutil disable
-systemextensionsctl developer on
-```
-
-Getting these entitlements approved for public distribution is out of scope.
+**Without one:** build ad-hoc signed and disable entitlement validation instead — `csrutil disable`
+plus `boot-args="amfi_get_out_of_my_way=0x1"`. This is a machine-wide security regression; steps
+and warnings in [Without a developer account](dext/README.md#without-a-developer-account).
 
 ---
 
