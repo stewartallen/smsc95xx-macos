@@ -24,13 +24,16 @@ they are the **same device** — identical endpoints, identical initialization s
 link configuration — differing only in USB ID and MAC address. One implementation covers both;
 only the IOKit matching dictionary needs two entries.
 
-> **Status: M5 complete — the driver moves frames.** The DriverKit extension builds, loads with
+> **Status: M6 complete — measured, profiled, and done.** The DriverKit extension builds, loads with
 > SIP disabled, matches both dongles, reads the MAC from EEPROM with provenance checks, initialises
 > the chip, and carries Ethernet frames over the bulk pipes in both directions — `ping` works
 > end to end across the T1S segment (see [`reference/m5-datapath.txt`](reference/m5-datapath.txt)).
-> One USB transfer is outstanding per direction and every frame is copied once, so M5 is about
-> correctness, not throughput; a descriptor ring and BPF-tap throughput work are M6. See the
-> [milestones](#milestones) below for the full state.
+> TCP fills 75–85% of what the half-duplex wire allows, paced UDP at 9 Mbit/s is lossless both
+> ways, `tcpdump` works via the BPF tap, and a CPU profile under line-rate load shows the driver
+> costing 4.5–8% of one efficiency core, almost all of it DriverKit RPC machinery rather than
+> anything in this repo (see [`reference/m6-throughput.txt`](reference/m6-throughput.txt)). The
+> descriptor ring and TX aggregation M5 left as the upgrade path are deliberately not implemented —
+> the profile is the evidence they buy nothing at 10 Mb/s. See the [milestones](#milestones) below.
 
 ---
 
@@ -280,8 +283,12 @@ Both ends of the link terminate on equipment we control, so the wire can be exer
 end-to-end:
 
 ```
-Mac ── USB ── MACH dongle (LAN9500A) ── T1S ── media converter ── Ethernet ── Raspberry Pi
+Mac ── USB ── MACH dongle (LAN9500A) ── terminated T1S cable ── EVB dongle ── USB ── Raspberry Pi
 ```
+
+Both ends are LAN9500A-based, the segment runs CSMA/CD with exactly two nodes (no PLCA),
+and either dongle can sit on either host — the M5 datapath work ran with the dongles
+swapped relative to the diagram above.
 
 The Pi doubles as the **reference implementation host**: with the dongle plugged into it,
 Linux's `smsc95xx` drives the hardware correctly, and `usbmon` captures exactly how. That is
@@ -310,10 +317,16 @@ entirely and also give byte-exact control for validating TX/RX framing.
 | M3 | Dext loads and matches the device in `ioreg` — **done** |
 | M4 | Interface appears in `ifconfig` with the EEPROM MAC — **done** |
 | M5 | Frames cross the T1S link to the Pi — also splits the driver in two — **done** |
-| M6 | `tcpdump` works via the BPF tap; throughput measured |
+| M6 | `tcpdump` works via the BPF tap; throughput measured and profiled — **done** |
 
-Throughput expectations should stay modest: the segment is 10 Mb/s half-duplex, and the media
-converter rate-adapts from 100BASE-TX, so loss under load is expected.
+M6's measured result ([`reference/m6-throughput.txt`](reference/m6-throughput.txt)): TCP at
+7.2–7.9 Mbit/s (75–85% of the half-duplex wire ceiling), paced UDP at 9 Mbit/s with zero loss
+both ways, and 4.5–8% of one efficiency core at full line rate — almost all of it DriverKit
+RPC machinery, with the driver's own code under 2% and the per-frame copy under 1%. The
+descriptor ring (`AsyncIOBundled`) and TX aggregation that M5 left as the upgrade path are
+deliberately not implemented: the profile is the evidence they would buy nothing at 10 Mb/s.
+The per-packet cost (~50–80 µs of dext CPU) is the number that says a ring becomes necessary
+if this driver is ever pointed at 100 Mb/s hardware.
 
 **M5 split the driver in two.** `SMSC95xxUSBDevice` matches `IOUSBHostDevice` and does nothing but
 select configuration 1; `SMSC95xxDriver` matches the resulting `IOUSBHostInterface` and owns the pipes
@@ -354,6 +367,8 @@ tools/        decode-usbmon.py        turn a usbmon pcap into a named register t
               inspect-profile/        show what a provisioning profile grants
               probe-entitlements/     measure which entitlement shape a profile authorises
               dsc-disasm/             disassemble a framework from the dyld shared cache
+              aggregate-time-profile.py  turn an xctrace Time Profiler capture into text
+                                      (self-weight table + flame tree; no root needed)
 ```
 
 ### Device matching

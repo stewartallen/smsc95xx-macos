@@ -1,0 +1,243 @@
+# M6 evidence: throughput measured, the BPF tap verified, and a CPU profile of the
+# driver under line-rate load
+#
+# date:    2026-09-03 22:15-22:40 PDT
+# system:  macOS 26.6.2 build 25G83, Apple Silicon Mac mini
+# posture: SIP disabled, systemextensionsctl developer on, AMFI enforcing (Apple
+#          Development signing + provisioning profile, no boot-args)
+# dext:    com.github.stewartallen.smsc95xx.driver 2.36/56, normal build -- TRACE off,
+#          so none of the DIAG5/6/7 instrumentation is compiled in
+# devices: MACH 10BASET1S-USB-IF (0424:9905) on the Mac as en12,
+#          EVB-LAN8670-USB (184f:0051) on the Pi as eth1 (Linux smsc95xx)
+#
+# VERDICT: at 10 Mb/s the one-transfer-in-flight datapath is not a bottleneck and is
+# nowhere near one. TCP fills 75-85% of what half-duplex CSMA/CD allows, paced UDP at
+# 9 Mb/s is lossless in both directions, and the driver costs 4.5% (TX-heavy) to 8%
+# (RX-heavy) of one efficiency core at full line rate, with 0.0% at idle. The M6 upgrade
+# path that M5 left open -- an AsyncIOBundled descriptor ring and TX aggregation -- is
+# deliberately NOT implemented: the profile shows it would optimise DriverKit RPC
+# machinery that only matters at ~10x this frame rate.
+
+
+=======================================================================
+0. THE TEST RIG
+=======================================================================
+
+    Mac ── USB ── MACH 10BASET1S-USB-IF ── terminated T1S cable ──
+                             EVB-LAN8670-USB ── USB ── Raspberry Pi 4
+
+No PLCA. The segment runs CSMA/CD with exactly two nodes. (The dongles have swapped
+hosts since reference/m5-datapath.txt; both ends are LAN9500A-based and there is no
+media converter in the path.)
+
+    Mac  en12  fc:61:79:90:04:56  192.168.90.1/24  this driver, 2.36/56
+    Pi   eth1  9c:95:6e:b5:9b:62  192.168.90.2/24  Linux smsc95xx
+
+    Mac media: autoselect (10baseT/UTP <half-duplex>), status: active
+
+iperf3 server on the Pi (`iperf3 -s -D`), client on the Mac. "TX" and "RX" below name
+the direction of the data stream relative to this driver.
+
+
+=======================================================================
+1. THROUGHPUT
+=======================================================================
+
+TCP, 20 s runs:
+
+    Mac -> Pi (our TX)   7.18 Mbit/s   17.1 MB     17 retransmits at the Mac
+    Pi -> Mac (our RX)   7.86 Mbit/s   18.8 MB    515 retransmits at the Pi
+
+TCP, 45 s runs (the profiled ones, section 3):
+
+    Mac -> Pi            7.01 Mbit/s   37.6 MB    104 retransmits at the Mac
+    Pi -> Mac            7.85 Mbit/s   42.1 MB   1254 retransmits at the Pi
+
+UDP paced at 9 Mb/s, 10 s runs:
+
+    Mac -> Pi            9.00 Mbit/s   0/7772 lost (0%)   jitter 0.048 ms
+    Pi -> Mac            9.00 Mbit/s   0/7771 lost (0%)   jitter 0.033 ms
+
+Reading: after Ethernet framing overhead the wire ceiling for TCP goodput on a 10 Mb/s
+half-duplex segment is roughly 8.5-9 Mbit/s, so TCP lands at 75-85% of ceiling in both
+directions, and paced UDP reaches 90% of raw line rate with zero loss either way.
+
+The UDP runs double as a control: they refute the hypothesis that the single
+outstanding TX transfer caps throughput. The TX path sustains a paced 9.00 Mbit/s
+(~765 full-size frames/s) without dropping a single datagram, so the TCP numbers are
+TCP-vs-the-segment, not a driver ceiling.
+
+Where the TCP retransmits come from is NOT established. Every counter that exists is
+clean on both ends after all runs -- Mac `netstat -I en12`: 0 Ierrs, 0 Oerrs, 0 Coll;
+Pi `ip -s link` eth1: 0 errors/dropped/collisions both directions; Pi `tc -s qdisc`
+fq_codel: 0 dropped, 0 overlimits; and this driver logged no RX drops (every drop
+reason has a first-occurrences log budget, so silence means zero). Two hypotheses fit
+the evidence, and no counter exists that can separate them: loss on the CSMA/CD segment
+under bidirectional data+ACK contention (absent from unidirectional paced UDP), and
+silent RX-FIFO discard inside a LAN9500A under burst (the chip exposes no drop
+counter; Linux smsc95xx reads none either). The asymmetry -- ~10-30x more retransmits
+when the Pi sends -- is real but unexplained. Loss under TCP load is within
+expectations for this segment and does not gate the milestone.
+
+
+=======================================================================
+2. WHAT THE DRIVER COSTS
+=======================================================================
+
+The dext is two userspace processes: the device-level SMSC95xxUSBDevice and the
+interface-level SMSC95xxDriver that owns the datapath.
+
+Idle (link up, no traffic): both at 0.0% CPU. Accumulated CPU over the ~25 minutes
+since attach: 0.01 s + 0.08 s. Nothing polls, nothing spins.
+
+Under load, only the interface driver moves; the device-level process stays at
+exactly zero. Measured two independent ways, which agree:
+
+                          cputime delta / wall     xctrace sample weight
+    TX-heavy (Mac->Pi)    0.90 s / 20 s = 4.5%     1375 ms / 30.6 s = 4.5%
+    RX-heavy (Pi->Mac)    1.62 s / 20 s = 8.1%     2391 ms / 30.6 s = 7.8%
+
+...of one core (the samples landed on E cores). Rough per-packet arithmetic from the
+45 s runs, counting data frames and the ACKs flowing the other way (~870-980 pkt/s):
+about 50 us of dext CPU per packet TX-heavy, about 80 us RX-heavy.
+
+Scope caveat: this measures the dext processes only. The kernel-side work done on the
+driver's behalf (XHCI interrupts, IOUSBHostFamily, the Skywalk queues) is not in these
+numbers; measuring it needs root (powermetrics) and was not part of this pass.
+
+
+=======================================================================
+3. WHERE THE CYCLES GO
+=======================================================================
+
+Method, reproducible without root:
+
+    xctrace record --template 'Time Profiler' --attach <pid of SMSC95xxDriver> \
+        --time-limit 30s --output m6.trace          # during a 45 s iperf3 run
+    tools/aggregate-time-profile.py m6.trace
+
+(`sample` refuses to attach to a _driverkit-owned process without sudo; xctrace
+attaches fine. xcode-select pointed at CommandLineTools, so xctrace needed its full
+Xcode path.)
+
+Self weight by leaf function, RX-heavy run (TX-heavy is the same shape):
+
+    31.4%  [libsystem_kernel]   mach_msg2_trap
+    29.0%  [libsystem_pthread]  start_wqthread          (worker-thread wake/park churn)
+     8.3%  [libsystem_kernel]   madvise                 (allocator page churn)
+     7.2%  [DriverKit]          iokit_user_client_trap
+     4.8%  [libsystem_malloc]   _xzm_xzone_malloc_freelist_outlined
+     0.9%  [libsystem_platform] _platform_memmove       <- ALL data copying
+     0.5%  [driver]             SMSC95xxDriver::RxComplete_Impl
+     0.5%  [driver]             SMSC95xxDriver::_Dispatch
+       ... everything else under 0.5%
+
+TX-heavy: mach_msg2_trap 35.1%, start_wqthread 26.2%, iokit_user_client_trap 7.9%,
+madvise 6.5%, malloc 3.6%; the driver's own hottest symbol is txSubmitPacket at 1.0%
+and memmove is 0.7%.
+
+The hottest single application stack in each direction (19.9% RX, 24.4% TX) is the
+completion handler synchronously arming the next transfer -- exactly the
+one-in-flight design doing its job:
+
+    ...dispatch machinery...
+    SMSC95xxDriver::RxComplete_Impl          (TX: TxComplete_Impl)
+    SMSC95xxDriver::rearmRxRead / armRxRead  (TX: txDrainSubmission / txSubmitPacket)
+    IOUSBHostPipe::AsyncIO
+    ...InvokeRemote -> mach_msg2_internal -> mach_msg2_trap
+
+Reading: roughly two thirds of all on-CPU time is mach messaging plus dispatch
+worker-thread wake/park; another ~12% is allocator traffic (the DriverKit runtime
+allocates per RPC -- OSObjectCopyIn, block copies -- and madvise is free() giving
+pages back). The driver's own code totals ~1.5%, and moving the actual bytes at 10
+Mb/s costs under 1%. The per-frame unit of cost is the DriverKit RPC round-trip
+(completion in, AsyncIO submit out), not anything in this repo's code.
+
+This is what makes the descope decision safe in both directions: nothing in the
+driver's own code is worth optimising, and the only lever that would matter --
+fewer RPCs per frame via AsyncIOBundled rings and TX aggregation -- attacks overhead
+that totals 4.5-8% of one E core at the line rate this hardware will ever see. The
+RX side already amortises: one 4096-byte bulk-IN transfer carries multiple
+back-to-back frames when HW_CFG.MEF is set (SMSC95xxDriver_datapath.cpp). If this
+driver were ever pointed at 100 Mb/s hardware, the ~50-80 us of dext CPU per packet
+is the number that says the ring becomes mandatory (10x the frame rate would want
+most of a core); at 10 Mb/s it buys nothing.
+
+
+=======================================================================
+4. THE BPF TAP
+=======================================================================
+
+tcpdump on en12 (unprivileged; the user is in access_bpf) during a ping to the Pi:
+
+    $ tcpdump -i en12 -c 6 -n -e
+    listening on en12, link-type EN10MB (Ethernet)
+    22:35:53.550058 fc:61:79:90:04:56 > 9c:95:6e:b5:9b:62, ethertype IPv4 (0x0800),
+        length 98: 192.168.90.1 > 192.168.90.2: ICMP echo request, id 59666, seq 1
+    22:35:53.550912 9c:95:6e:b5:9b:62 > fc:61:79:90:04:56, ethertype IPv4 (0x0800),
+        length 98: 192.168.90.2 > 192.168.90.1: ICMP echo reply, id 59666, seq 1
+    ...
+    6 packets captured, 6 packets received by filter
+
+Both directions, correct MACs, correct ethertype, correct lengths. Promiscuous
+capture (tcpdump without -p, MAC_CR.PRMS toggling) was hardware-validated separately
+during the 2.36/56 pass; this closes the milestone's tcpdump criterion for the
+normal-filtering case as well.
+
+
+=======================================================================
+5. APPENDIX: THE RX-HEAVY FLAME TREE
+=======================================================================
+
+tools/aggregate-time-profile.py output for the RX-heavy capture, verbatim. The
+TX-heavy tree is the same shape with the roles swapped (TxComplete_Impl 35.9%
+carrying txDrainSubmission > txSubmitPacket > AsyncIO at 24.4%). Two details worth
+noticing: 19.9% of ALL on-CPU time is the single mach trap that submits the next RX
+read, and at steady state TX submission chains off TxComplete rather than
+TxDataAvailable -- the queue always holds a next packet by the time the previous
+transfer completes, so TxDataAvailable only ever kicks the first frame of a burst.
+
+== flame tree, root->leaf (nodes under 1.5% pruned) ==
+ 70.8% █████████████████        ├─ start_wqthread
+ 70.8% █████████████████        │  └─ _pthread_wqthread
+ 70.4% █████████████████        │     └─ _dispatch_workloop_worker_thread
+ 61.6% ███████████████          │        ├─ _dispatch_root_queue_drain_deferred_wlh
+ 61.3% ███████████████          │        │  └─ _dispatch_workloop_invoke
+ 60.5% ███████████████          │        │     └─ _dispatch_lane_invoke > _dispatch_lane_serial_drain
+ 60.3% ██████████████           │        │        └─ _dispatch_mach_invoke
+ 59.5% ██████████████           │        │           └─ _dispatch_lane_serial_drain > _dispatch_mach_msg_invoke
+ 49.5% ████████████             │        │              ├─ uiomachchannel
+ 49.1% ████████████             │        │              │  └─ uiomessage
+ 48.6% ████████████             │        │              │     └─ Server
+ 47.4% ███████████              │        │              │        └─ OSMetaClassBase::Invoke
+ 46.6% ███████████              │        │              │           └─ IODispatchQueue::DispatchSync_f
+ 46.0% ███████████              │        │              │              └─ block in OSMetaClassBase::Invoke > SMSC95xxDriver::Dispatch > SMSC95xxDriver::_Dispatch
+ 32.7% ████████                 │        │              │                 ├─ IOUSBHostPipe::CompleteAsyncIO_Invoke
+ 28.0% ███████                  │        │              │                 │  ├─ SMSC95xxDriver::RxComplete_Impl
+ 20.8% █████                    │        │              │                 │  │  ├─ SMSC95xxDriver::rearmRxRead > SMSC95xxDriver::armRxRead > IOUSBHostPipe::AsyncIO > OSMetaClassBase::Invoke
+ 20.4% █████                    │        │              │                 │  │  │  └─ IOUSBHostPipe::Dispatch > OSObject::_Dispatch > OSMetaClassBase::Dispatch > InvokeRemote
+ 19.9% █████                    │        │              │                 │  │  │     └─ mach_msg2_internal > mach_msg2_trap
+  4.2% █                        │        │              │                 │  │  ├─ deliverPacket > IOUserNetworkPacketQueue::enqueuePackets > IOUserNetworkPacketQueue::EnqueuePackets
+  3.9% █                        │        │              │                 │  │  │  └─ IODataQueueDispatchSource::DataAvailable > OSMetaClassBase::Invoke
+  3.8% █                        │        │              │                 │  │  │     └─ iokit_user_client_trap
+  1.8%                          │        │              │                 │  │  └─ (other)
+  4.4% █                        │        │              │                 │  └─ SMSC95xxDriver::TxComplete_Impl
+  3.8% █                        │        │              │                 │     └─ txReturnPacket > IOUserNetworkPacketQueue::enqueuePackets > IOUserNetworkPacketQueue::EnqueuePackets
+  3.5% █                        │        │              │                 │        └─ IODataQueueDispatchSource::DataAvailable > OSMetaClassBase::Invoke
+  3.4% █                        │        │              │                 │           └─ iokit_user_client_trap
+ 12.6% ███                      │        │              │                 └─ IODataQueueDispatchSource::DataAvailable_Invoke > SMSC95xxDriver::TxDataAvailable_Impl
+ 12.5% ███                      │        │              │                    └─ txDrainSubmission
+ 11.8% ███                      │        │              │                       └─ txSubmitPacket
+ 11.6% ███                      │        │              │                          └─ IOUSBHostPipe::AsyncIO > OSMetaClassBase::Invoke
+ 11.4% ███                      │        │              │                             └─ IOUSBHostPipe::Dispatch > OSObject::_Dispatch > OSMetaClassBase::Dispatch > InvokeRemote
+ 11.3% ███                      │        │              │                                └─ mach_msg2_internal > mach_msg2_trap
+  9.7% ██                       │        │              └─ dispatch_release
+  9.5% ██                       │        │                 └─ _dispatch_dispose
+  9.2% ██                       │        │                    └─ _xzm_free
+  8.3% ██                       │        │                       └─ <deduplicated_symbol> > madvise
+  8.6% ██                       │        └─ _dispatch_event_loop_merge
+  7.7% ██                       │           └─ _dispatch_mach_merge_msg
+  6.5% ██                       │              └─ dispatch_mach_msg_create
+  6.4% ██                       │                 └─ _os_object_alloc_realized
+  5.2% █                        │                    └─ _xzm_xzone_malloc_freelist_outlined
+ 29.0% ███████                  ├─ _pthread_atomic_xchg_uint32_relaxed > start_wqthread
