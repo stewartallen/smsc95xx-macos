@@ -310,9 +310,9 @@ SMSC95xxDriver::logDatapathCounters(const char *why)
         ivars->txCompletions, ivars->txFrames, ivars->txBytesSent, ivars->txRejected,
         ivars->txSubmitFailures, ivars->txErrors, ivars->txStalls, ivars->txAborted);
 
-    Log("counters at %{public}s -- RX accounting: records %llu = frames %llu + dropped %llu, "
-        "and frames = enqueued %llu  (identities must hold)",
-        why, ivars->rxRecords, ivars->rxFrames, ivars->rxDropped, ivars->rxEnqueued);
+    Log("counters at %{public}s -- RX accounting: records %llu = frames %llu + dropped %llu  "
+        "(identity must hold)",
+        why, ivars->rxRecords, ivars->rxFrames, ivars->rxDropped);
     Log("counters at %{public}s -- RX detail: completions %llu errors %llu zeroLen %llu "
         "zeroRec %llu arms %llu armFail %llu bytes %llu enqFail %llu lost %llu "
         "fromSubmitQ %llu submitQEmpty %llu poolFail %llu",
@@ -1115,9 +1115,9 @@ IMPL(SMSC95xxDriver, RxComplete)
     }
 
     Diag7("RxComplete #%llu: status 0x%x, %u bytes, ts %llu (rxRunning=%{public}s, "
-          "frames=%llu dropped=%llu enqueued=%llu)", ivars->rxCompletions, status,
+          "frames=%llu dropped=%llu)", ivars->rxCompletions, status,
           actualByteCount, completionTimestamp, ivars->rxRunning ? "true" : "false",
-          ivars->rxFrames, ivars->rxDropped, ivars->rxEnqueued);
+          ivars->rxFrames, ivars->rxDropped);
 
     /* EXIT 1: aborted at teardown. Both teardown paths clear rxRunning before the pipe is
      * aborted, so aborted-with-rxRunning-false is the teardown case: nothing has been
@@ -1363,12 +1363,11 @@ IMPL(SMSC95xxDriver, RxComplete)
             /* Delivered immediately rather than batched: see deliverPacket. The packet is
              * either the stack's now or back in the pool; either way it is accounted for
              * before the next record is decoded, so no exit from this loop can leak it.
-             * rxFrames counts only delivered frames, so the accounting identities hold:
-             * records == frames + dropped, and frames == enqueued. */
+             * rxFrames counts only delivered frames, so the accounting identity holds:
+             * records == frames + dropped. */
             if (deliverPacket(ivars, packet, fromSubmitQueue)) {
                 delivered++;
                 ivars->rxFrames++;
-                ivars->rxEnqueued++;
             } else {
                 ivars->rxDropped++;
                 dropped++;

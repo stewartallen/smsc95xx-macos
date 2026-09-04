@@ -163,14 +163,13 @@ struct SMSC95xxDriver_IVars {
     uint64_t                  txAborted;            /* completions with kIOReturnAborted   */
     uint64_t                  txDeferred;           /* drains that stopped on txInFlight   */
     /* RX counters, not state: they exist so a single log line can say how far the receive
-     * path got. records == frames + dropped, and frames == enqueued, are the identities. */
+     * path got. records == frames + dropped is the identity. */
     uint64_t                  rxCompletions;        /* RxComplete callbacks, all statuses  */
     uint64_t                  rxCompletionErrors;   /* completions with a failure status   */
     uint64_t                  rxZeroLength;         /* successful completions of 0 bytes   */
     uint64_t                  rxByteCount;          /* bytes delivered by the bulk IN pipe */
     uint64_t                  rxRecords;            /* status-word records decoded         */
     uint64_t                  rxZeroRecords;        /* transfers with bytes but no records */
-    uint64_t                  rxEnqueued;           /* packets accepted by the stack       */
     uint64_t                  rxEnqueueFailures;    /* enqueuePackets calls that failed    */
     /* rxSubmitDequeued vs rxSubmitEmpty is the load-bearing pair: it says whether the stack
      * supplies receive buffers on the RX submission queue at all, which is the difference
