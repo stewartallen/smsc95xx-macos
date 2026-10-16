@@ -1,0 +1,4 @@
+# Local provisioning profiles referenced from .env; never committed. Only .keep is
+# tracked, so the directory exists on checkout.
+profiles/*
+!profiles/.keep

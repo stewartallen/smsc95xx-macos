@@ -24,7 +24,8 @@ the dext loads on a stock Mac: SIP enabled, Full Security, developer mode off. V
 
 1. **Create the App IDs and profiles** — see [Signing with a real identity](#signing-with-a-real-identity).
 
-2. **Configure signing:** copy `.env.example` to `.env` and fill in the identity and profile paths.
+2. **Configure signing:** put the two downloaded profiles in `dext/profiles/`, copy `.env.example` to
+   `.env`, and fill in the identity and profile paths.
 
 3. **Install:**
    ```sh
@@ -339,17 +340,22 @@ granted entitlements are what identify it.
 ### Building signed
 
 Signing configuration lives in `dext/.env`, which is **gitignored** — it names a person and points
-at files that must never be committed. Copy the template and fill it in:
+at files that must never be committed. Put the two downloaded profiles in `dext/profiles/`, whose
+contents are also gitignored, so the build does not depend on whatever happens to be in
+`~/Downloads`. Then copy the template and fill it in:
 
 ```sh
+mv ~/Downloads/*.provisionprofile profiles/
 cp .env.example .env
 ```
 
 ```sh
 SIGN_ID=Apple Development: you@example.com (XXXXXXXXXX)
-DEXT_PROFILE=~/Downloads/YourDriver_DriverKit_Development.provisionprofile
-APP_PROFILE=~/Downloads/YourInstaller_macOS_Development.provisionprofile
+DEXT_PROFILE=profiles/YourDriver_DriverKit_Development.provisionprofile
+APP_PROFILE=profiles/YourInstaller_macOS_Development.provisionprofile
 ```
+
+Relative paths in `.env` are resolved from `dext/`, where `make` runs.
 
 `.env` is read by `make`, not by a shell, so values are taken literally — **do not quote them**, and
 `$VAR` is not expanded. The Makefile strips stray quotes and expands a leading `~/` anyway, because
