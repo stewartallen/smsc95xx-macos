@@ -124,9 +124,10 @@ datasheet; both come from the captured trace.
 are just setting `PHY_RST` (bit 4). Do not hardcode the literal value.
 
 **The MAC in the captured trace is wrong, and the EEPROM signature is the only way to tell.**
-The MACH unit's chip performs a power-on EEPROM auto-load that sometimes fails. When it fails the
+The MACH unit's chip performs a power-on EEPROM auto-load that sometimes failed on STM32 firmware
+1.1 (fixed in 1.2, see below). When it failed the
 device presents `0x9E00` with no strings, EEPROM offset 0 reads `0x4A`, and the MAC reads
-`4a:f8:f8:c2:c2:f2`. When it succeeds the device presents **`0x9905`** with strings, offset 0 reads
+`4a:f8:f8:c2:c2:f2`. When it succeeded the device presented **`0x9905`** with strings, offset 0 read
 the valid **`0xA5`** signature, and the MAC reads **`fc:61:79:90:04:56`** — identically on 10/10
 reads.
 
@@ -144,6 +145,14 @@ configuring `eth1` with the mis-clocked address.
 device in different auto-load states, so matching on `idProduct` matches EEPROM contents rather
 than silicon and must accept both. Full analysis in
 [`tools/smsc95xx-probe/README.md`](tools/smsc95xx-probe/README.md).
+
+**Firmware 1.2 (2026-10-16) closed the auto-load failure.** After MACH's STM32 firmware 1.2 update,
+13 of 13 attaches loaded the EEPROM (`LOADED` set, `0xA5`, `0x9905` with strings), and the full
+512-byte image, read with a one-off diagnostic build that is not in this tree, was byte-identical
+on every read and is a complete, well-formed MACH image. Its MAC field now holds
+`00:80:0f:95:04:00` while the STM32 control channel still reports `fc:61:79:90:04:56` — a changed
+field, not a mis-read, and a vendor-side question that has been raised with MACH. The driver's gate
+is unchanged and correct: it accepts a validly loaded image and serves the MAC it holds.
 
 ### Verified initialization sequence
 
@@ -405,10 +414,12 @@ also specify `idProduct` or `idProductArray`, plus `bConfigurationValue` and `bI
 `--debug --info`. All 121 of Apple's own `IOUSBHostInterface` personalities were surveyed and
 none uses `idVendor` without a product key — see `reference/m5-interface-matching.txt`.
 
-**`0x0424:0x9905` vs `0x9E00`:** On this hardware unit the EEPROM auto-load sometimes fails
-(cause not established). When it succeeds (normal case), the device reports `0x9905` with
-strings; when it fails, it reports the generic LAN9500A default `0x9E00` without strings. Both
-are the same physical chip, so the driver must match both IDs. The normal state is `0x9905`.
+**`0x0424:0x9905` vs `0x9E00`:** On this hardware unit the EEPROM auto-load sometimes failed on
+STM32 firmware 1.1 (cause not established; not seen on firmware 1.2). When it succeeds (normal
+case), the device reports `0x9905` with strings; when it failed, it reported the generic LAN9500A
+default `0x9E00` without strings. Both are the same physical chip, so the driver must match both
+IDs. The normal state is `0x9905`, and on firmware 1.2 the only one observed; `0x9E00` stays
+matched because a 1.1 unit may exist and the second personality costs nothing.
 See `README.md` "The MAC in the captured trace is wrong, and the EEPROM signature is the only
 way to tell" for full analysis.
 

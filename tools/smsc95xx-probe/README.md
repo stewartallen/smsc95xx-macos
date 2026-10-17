@@ -17,7 +17,8 @@ make test       # runs unit tests for the pure protocol layer (no hardware)
 ./smsc95xx-probe --device 0424:9e00 id
 ```
 
-**Note:** On the MACH SYSTEMS dongle in its `0424:9e00` (EEPROM auto-load failed) state, the
+**Note:** On a MACH SYSTEMS dongle with STM32 firmware 1.1, in its `0424:9e00` (EEPROM auto-load
+failed) state, the
 `./smsc95xx-probe eeprom` and `./smsc95xx-probe all` commands exit with code 1. The read does
 not fail electrically — it returns a systematically mis-clocked image whose offset-0 byte is
 `0x4A` instead of the `0xA5` signature and whose MAC reads as `4a:f8:f8:c2:c2:f2`, so the probe
@@ -97,8 +98,8 @@ Status word `0x00402420` (little-endian) decodes as:
 
 ### The MACH unit has two distinct EEPROM states, and only one is trustworthy
 
-The chip performs a power-on EEPROM auto-load. On this unit it sometimes succeeds and sometimes
-fails, and the device presents differently in each case:
+The chip performs a power-on EEPROM auto-load. On this unit, with STM32 firmware 1.1, it sometimes
+succeeded and sometimes failed, and the device presented differently in each case:
 
 | | auto-load **succeeded** | auto-load **failed** |
 |---|---|---|
@@ -113,6 +114,11 @@ fails, and the device presents differently in each case:
 
 **The real MAC is `fc:61:79:90:04:56`.** It sits behind a valid `0xA5` signature, is
 globally-administered, and reads identically every time.
+
+**Firmware 1.2 (2026-10-16):** the table above describes STM32 firmware 1.1. After the vendor's
+1.2 update the failed state was not seen in 13 attaches and the image was byte-identical on every
+full read, but its MAC field had changed to `00:80:0f:95:04:00` while the STM32 control channel
+still reported `fc:61:79:90:04:56`. A changed field, not a mis-read; raised with the vendor.
 
 ### The failed-state read is a systematic mis-clock, not noise
 

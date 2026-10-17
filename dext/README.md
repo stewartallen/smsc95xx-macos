@@ -775,9 +775,11 @@ checks out. `Start()` requires both signals and refuses if either fails —
 Only then is the address read, and it must additionally pass the plausibility predicate
 (`smsc95xx_mac_plausible()` in `common/`, shared with the probe and unit-tested).
 
-On this hardware unit the EEPROM auto-load sometimes fails. *Why* it fails is not established — it has
-not been instrumented, and no capture in `reference/` tests any particular cause, so treat any timing
-or signal-integrity story as a hypothesis.
+On this hardware unit the EEPROM auto-load sometimes failed on STM32 firmware 1.1. *Why* was never
+established — it was not instrumented, and no capture in `reference/` tests any particular cause, so
+treat any timing or signal-integrity story as a hypothesis. On firmware 1.2 (2026-10-16) the failed
+state was not seen in 13 attaches and the loaded image was byte-identical on every full read. The
+gate stays exactly as it is.
 When it fails, EEPROM reads return systematically mis-clocked data: each byte appears twice, shifted
 left by 1 bit. The mis-read is **stable** — re-reading confirms it, and pattern checks pass it
 (valid OUI, not all-ones, not all-zeros). Only the provenance check works: read `LOADED` and the
@@ -794,7 +796,10 @@ signature.
 - EEPROM offset 0 reads `0xA5`
 - Both provenance checks pass, the address is read, and it is published to the IOKit registry
   (nothing is written to the hardware in M3 — no `ADDRL`/`ADDRH` write, and no network interface exists yet)
-- MAC is `fc:61:79:90:04:56` (identical across 10 reads)
+- MAC was `fc:61:79:90:04:56` on firmware 1.1 (identical across 10 reads). On firmware 1.2 the
+  image's MAC field reads `00:80:0f:95:04:00` while the STM32 control channel still reports
+  `fc:61:79:90:04:56`; the driver serves what the validly loaded image holds, which is correct.
+  The vendor has been informed.
 
 The Linux in-tree `smsc95xx` driver checks neither the `LOADED` bit nor the signature, and
 `reference/mach-init-sequence.txt` shows it configuring `eth1` with the mis-clocked address

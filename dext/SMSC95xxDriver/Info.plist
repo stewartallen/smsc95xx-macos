@@ -16,13 +16,13 @@
 	<key>CFBundlePackageType</key>
 	<string>DEXT</string>
 	<key>CFBundleShortVersionString</key>
-	<string>2.36</string>
+	<string>2.38</string>
 	<key>CFBundleSupportedPlatforms</key>
 	<array>
 		<string>DriverKit</string>
 	</array>
 	<key>CFBundleVersion</key>
-	<string>56</string>
+	<string>58</string>
 	<key>IOKitPersonalities</key>
 	<dict>
 		<key>EVB ethernet interface</key>
